@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.organizations.model.CreateAccountStatus;
 import io.github.hectorvent.floci.services.organizations.model.OrgAccount;
+import io.github.hectorvent.floci.services.organizations.model.OrgPolicy;
 import io.github.hectorvent.floci.services.organizations.model.OrgRoot;
 import io.github.hectorvent.floci.services.organizations.model.Organization;
 import io.github.hectorvent.floci.services.organizations.model.OrganizationalUnit;
@@ -65,6 +66,18 @@ public class OrganizationsJsonHandler {
             case "UpdateOrganizationalUnit" -> handleUpdateOrganizationalUnit(request, account);
             case "DeleteOrganizationalUnit" -> handleDeleteOrganizationalUnit(request, account);
             case "ListOrganizationalUnitsForParent" -> handleListOrganizationalUnitsForParent(request, account);
+            case "CreatePolicy" -> handleCreatePolicy(request, account);
+            case "DescribePolicy" -> handleDescribePolicy(request, account);
+            case "UpdatePolicy" -> handleUpdatePolicy(request, account);
+            case "DeletePolicy" -> handleDeletePolicy(request, account);
+            case "ListPolicies" -> handleListPolicies(request, account);
+            case "AttachPolicy" -> handleAttachPolicy(request, account);
+            case "DetachPolicy" -> handleDetachPolicy(request, account);
+            case "ListPoliciesForTarget" -> handleListPoliciesForTarget(request, account);
+            case "ListTargetsForPolicy" -> handleListTargetsForPolicy(request, account);
+            case "EnablePolicyType" -> handleEnablePolicyType(request, account);
+            case "DisablePolicyType" -> handleDisablePolicyType(request, account);
+            case "DescribeEffectivePolicy" -> handleDescribeEffectivePolicy(request, account);
             case "TagResource" -> handleTagResource(request, account);
             case "UntagResource" -> handleUntagResource(request, account);
             case "ListTagsForResource" -> handleListTagsForResource(request, account);
@@ -195,6 +208,87 @@ public class OrganizationsJsonHandler {
         return paged(request, ous, "OrganizationalUnits", this::ouNode);
     }
 
+    // ---------------------------------------------------------------- policies
+
+    private Response handleCreatePolicy(JsonNode request, String account) {
+        OrgPolicy policy = service.createPolicy(account,
+                text(request, "Name"),
+                request.path("Description").asText(null),
+                text(request, "Type"),
+                text(request, "Content"),
+                parseTags(request.path("Tags")));
+        return ok(mapper.createObjectNode().<ObjectNode>set("Policy", policyNode(policy)));
+    }
+
+    private Response handleDescribePolicy(JsonNode request, String account) {
+        OrgPolicy policy = service.describePolicy(account, text(request, "PolicyId"));
+        return ok(mapper.createObjectNode().<ObjectNode>set("Policy", policyNode(policy)));
+    }
+
+    private Response handleUpdatePolicy(JsonNode request, String account) {
+        OrgPolicy policy = service.updatePolicy(account,
+                text(request, "PolicyId"),
+                request.path("Name").asText(null),
+                request.hasNonNull("Description") ? request.path("Description").asText() : null,
+                request.path("Content").asText(null));
+        return ok(mapper.createObjectNode().<ObjectNode>set("Policy", policyNode(policy)));
+    }
+
+    private Response handleDeletePolicy(JsonNode request, String account) {
+        service.deletePolicy(account, text(request, "PolicyId"));
+        return empty();
+    }
+
+    private Response handleListPolicies(JsonNode request, String account) {
+        List<OrgPolicy> policies = service.listPolicies(account, text(request, "Filter"));
+        return paged(request, policies, "Policies", this::policySummaryNode);
+    }
+
+    private Response handleAttachPolicy(JsonNode request, String account) {
+        service.attachPolicy(account, text(request, "PolicyId"), text(request, "TargetId"));
+        return empty();
+    }
+
+    private Response handleDetachPolicy(JsonNode request, String account) {
+        service.detachPolicy(account, text(request, "PolicyId"), text(request, "TargetId"));
+        return empty();
+    }
+
+    private Response handleListPoliciesForTarget(JsonNode request, String account) {
+        List<OrgPolicy> policies = service.listPoliciesForTarget(account,
+                text(request, "TargetId"), text(request, "Filter"));
+        return paged(request, policies, "Policies", this::policySummaryNode);
+    }
+
+    private Response handleListTargetsForPolicy(JsonNode request, String account) {
+        List<OrganizationsService.TargetRef> targets =
+                service.listTargetsForPolicy(account, text(request, "PolicyId"));
+        return paged(request, targets, "Targets", this::targetRefNode);
+    }
+
+    private Response handleEnablePolicyType(JsonNode request, String account) {
+        OrgRoot root = service.enablePolicyType(account,
+                text(request, "RootId"), text(request, "PolicyType"));
+        return ok(mapper.createObjectNode().<ObjectNode>set("Root", rootNode(root)));
+    }
+
+    private Response handleDisablePolicyType(JsonNode request, String account) {
+        OrgRoot root = service.disablePolicyType(account,
+                text(request, "RootId"), text(request, "PolicyType"));
+        return ok(mapper.createObjectNode().<ObjectNode>set("Root", rootNode(root)));
+    }
+
+    private Response handleDescribeEffectivePolicy(JsonNode request, String account) {
+        OrganizationsService.EffectivePolicy effective = service.describeEffectivePolicy(account,
+                text(request, "PolicyType"), request.path("TargetId").asText(null));
+        ObjectNode node = mapper.createObjectNode();
+        node.put("PolicyContent", effective.policyContent());
+        node.put("LastUpdatedTimestamp", effective.lastUpdatedTimestamp());
+        node.put("TargetId", effective.targetId());
+        node.put("PolicyType", effective.policyType());
+        return ok(mapper.createObjectNode().<ObjectNode>set("EffectivePolicy", node));
+    }
+
     // ---------------------------------------------------------------- tagging
 
     private Response handleTagResource(JsonNode request, String account) {
@@ -288,6 +382,33 @@ public class OrganizationsJsonHandler {
 
     private ObjectNode policyTypeNode(PolicyTypeSummary type) {
         return mapper.createObjectNode().put("Type", type.getType()).put("Status", type.getStatus());
+    }
+
+    private ObjectNode policySummaryNode(OrgPolicy policy) {
+        ObjectNode node = mapper.createObjectNode();
+        node.put("Id", policy.getId());
+        node.put("Arn", policy.getArn());
+        node.put("Name", policy.getName());
+        node.put("Description", policy.getDescription());
+        node.put("Type", policy.getType());
+        node.put("AwsManaged", policy.isAwsManaged());
+        return node;
+    }
+
+    private ObjectNode policyNode(OrgPolicy policy) {
+        ObjectNode node = mapper.createObjectNode();
+        node.set("PolicySummary", policySummaryNode(policy));
+        node.put("Content", policy.getContent());
+        return node;
+    }
+
+    private ObjectNode targetRefNode(OrganizationsService.TargetRef target) {
+        ObjectNode node = mapper.createObjectNode();
+        node.put("TargetId", target.targetId());
+        node.put("Arn", target.arn());
+        node.put("Name", target.name());
+        node.put("Type", target.type());
+        return node;
     }
 
     private ObjectNode nodeRefNode(OrganizationsService.NodeRef ref) {

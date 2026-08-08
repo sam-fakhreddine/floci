@@ -44,9 +44,21 @@ ID against any other emulated service.
 | `UpdateOrganizationalUnit` | Renames an OU |
 | `DeleteOrganizationalUnit` | Deletes an empty OU |
 | `ListOrganizationalUnitsForParent` | Lists the OUs directly under a root or OU |
-| `TagResource` | Adds or overwrites tags on a root, OU, or account |
-| `UntagResource` | Removes tags from a root, OU, or account |
-| `ListTagsForResource` | Returns the tags on a root, OU, or account |
+| `CreatePolicy` | Creates a policy of any of the four types |
+| `DescribePolicy` | Returns one policy with its content |
+| `UpdatePolicy` | Updates a policy's name, description, or content |
+| `DeletePolicy` | Deletes a detached, customer-managed policy |
+| `ListPolicies` | Lists policies of one type |
+| `AttachPolicy` | Attaches a policy to a root, OU, or account |
+| `DetachPolicy` | Detaches a policy; the last SCP on a target can't be detached |
+| `ListPoliciesForTarget` | Lists policies of one type attached to a target |
+| `ListTargetsForPolicy` | Lists the roots, OUs, and accounts a policy is attached to |
+| `EnablePolicyType` | Enables a policy type on the root; enabling SCPs attaches FullAWSAccess everywhere |
+| `DisablePolicyType` | Disables a policy type and detaches all policies of that type |
+| `DescribeEffectivePolicy` | Merges the inherited policy chain for the non-SCP types |
+| `TagResource` | Adds or overwrites tags on a root, OU, account, or policy |
+| `UntagResource` | Removes tags from a root, OU, account, or policy |
+| `ListTagsForResource` | Returns the tags on a root, OU, account, or policy |
 <!-- floci:actions:end -->
 
 ## Configuration
