@@ -2378,6 +2378,9 @@ public class CloudFormationResourceProvisioner {
         }
         ssmService.putParameter(name, value, type, null, true, region);
         r.setPhysicalId(name);
+        r.getAttributes().put("Name", name);
+        r.getAttributes().put("Type", type);
+        r.getAttributes().put("Value", value);
     }
 
     // ── KMS ───────────────────────────────────────────────────────────────────
