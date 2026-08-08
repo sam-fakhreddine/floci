@@ -18,7 +18,9 @@ data/
 CLAUDE.md
 GEMINI.md
 COPILOT.md
-.claude
+.claude/*
+!.claude/settings.json
+!.claude/hooks/
 
 posts
 local
