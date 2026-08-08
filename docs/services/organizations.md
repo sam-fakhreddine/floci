@@ -44,6 +44,24 @@ ID against any other emulated service.
 | `UpdateOrganizationalUnit` | Renames an OU |
 | `DeleteOrganizationalUnit` | Deletes an empty OU |
 | `ListOrganizationalUnitsForParent` | Lists the OUs directly under a root or OU |
+| `InviteAccountToOrganization` | Opens an INVITE handshake for an account (by 12-digit ID) |
+| `AcceptHandshake` | Invitee accepts; INVITE joins the org, APPROVE_ALL_FEATURES counts toward migration |
+| `DeclineHandshake` | Invitee declines an open handshake |
+| `CancelHandshake` | The management account cancels an open handshake it originated |
+| `DescribeHandshake` | Returns one handshake; parties only |
+| `ListHandshakesForAccount` | Lists handshakes the calling account is a party to |
+| `ListHandshakesForOrganization` | Lists the organization's handshakes (management account only) |
+| `EnableAllFeatures` | Starts the ALL-features migration; finalizes once every member approves |
+| `RegisterDelegatedAdministrator` | Marks a member account delegated admin for a service principal |
+| `DeregisterDelegatedAdministrator` | Removes a delegated-administrator registration |
+| `ListDelegatedAdministrators` | Lists delegated-admin accounts, optionally for one service |
+| `ListDelegatedServicesForAccount` | Lists the service principals an account administers |
+| `EnableAWSServiceAccess` | Enables trusted access for a service principal |
+| `DisableAWSServiceAccess` | Disables trusted access and revokes its delegated admins |
+| `ListAWSServiceAccessForOrganization` | Lists service principals with trusted access |
+| `PutResourcePolicy` | Creates or updates the organization's resource policy |
+| `DescribeResourcePolicy` | Returns the organization's resource policy |
+| `DeleteResourcePolicy` | Deletes the organization's resource policy |
 | `CreatePolicy` | Creates a policy of any of the four types |
 | `DescribePolicy` | Returns one policy with its content |
 | `UpdatePolicy` | Updates a policy's name, description, or content |

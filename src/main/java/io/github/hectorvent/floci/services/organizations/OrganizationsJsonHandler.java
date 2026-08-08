@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.organizations.model.CreateAccountStatus;
+import io.github.hectorvent.floci.services.organizations.model.Handshake;
 import io.github.hectorvent.floci.services.organizations.model.OrgAccount;
 import io.github.hectorvent.floci.services.organizations.model.OrgPolicy;
 import io.github.hectorvent.floci.services.organizations.model.OrgRoot;
@@ -66,6 +67,24 @@ public class OrganizationsJsonHandler {
             case "UpdateOrganizationalUnit" -> handleUpdateOrganizationalUnit(request, account);
             case "DeleteOrganizationalUnit" -> handleDeleteOrganizationalUnit(request, account);
             case "ListOrganizationalUnitsForParent" -> handleListOrganizationalUnitsForParent(request, account);
+            case "InviteAccountToOrganization" -> handleInviteAccountToOrganization(request, account);
+            case "AcceptHandshake" -> handleAcceptHandshake(request, account);
+            case "DeclineHandshake" -> handleDeclineHandshake(request, account);
+            case "CancelHandshake" -> handleCancelHandshake(request, account);
+            case "DescribeHandshake" -> handleDescribeHandshake(request, account);
+            case "ListHandshakesForAccount" -> handleListHandshakesForAccount(request, account);
+            case "ListHandshakesForOrganization" -> handleListHandshakesForOrganization(request, account);
+            case "EnableAllFeatures" -> handleEnableAllFeatures(account);
+            case "RegisterDelegatedAdministrator" -> handleRegisterDelegatedAdministrator(request, account);
+            case "DeregisterDelegatedAdministrator" -> handleDeregisterDelegatedAdministrator(request, account);
+            case "ListDelegatedAdministrators" -> handleListDelegatedAdministrators(request, account);
+            case "ListDelegatedServicesForAccount" -> handleListDelegatedServicesForAccount(request, account);
+            case "EnableAWSServiceAccess" -> handleEnableAwsServiceAccess(request, account);
+            case "DisableAWSServiceAccess" -> handleDisableAwsServiceAccess(request, account);
+            case "ListAWSServiceAccessForOrganization" -> handleListAwsServiceAccess(request, account);
+            case "PutResourcePolicy" -> handlePutResourcePolicy(request, account);
+            case "DescribeResourcePolicy" -> handleDescribeResourcePolicy(account);
+            case "DeleteResourcePolicy" -> handleDeleteResourcePolicy(account);
             case "CreatePolicy" -> handleCreatePolicy(request, account);
             case "DescribePolicy" -> handleDescribePolicy(request, account);
             case "UpdatePolicy" -> handleUpdatePolicy(request, account);
@@ -109,6 +128,7 @@ public class OrganizationsJsonHandler {
         CreateAccountStatus status = service.createAccount(account,
                 request.path("Email").asText(null),
                 request.path("AccountName").asText(null),
+                request.path("RoleName").asText(null),
                 parseTags(request.path("Tags")),
                 govCloud);
         return ok(mapper.createObjectNode().<ObjectNode>set("CreateAccountStatus", statusNode(status)));
@@ -206,6 +226,125 @@ public class OrganizationsJsonHandler {
         List<OrganizationalUnit> ous =
                 service.listOrganizationalUnitsForParent(account, text(request, "ParentId"));
         return paged(request, ous, "OrganizationalUnits", this::ouNode);
+    }
+
+    // ---------------------------------------------------------------- handshakes
+
+    private Response handleInviteAccountToOrganization(JsonNode request, String account) {
+        JsonNode target = request.path("Target");
+        Handshake handshake = service.inviteAccountToOrganization(account,
+                target.path("Id").asText(null),
+                target.path("Type").asText("ACCOUNT"),
+                request.path("Notes").asText(null));
+        return ok(mapper.createObjectNode().<ObjectNode>set("Handshake", handshakeNode(handshake)));
+    }
+
+    private Response handleAcceptHandshake(JsonNode request, String account) {
+        Handshake handshake = service.acceptHandshake(account, text(request, "HandshakeId"));
+        return ok(mapper.createObjectNode().<ObjectNode>set("Handshake", handshakeNode(handshake)));
+    }
+
+    private Response handleDeclineHandshake(JsonNode request, String account) {
+        Handshake handshake = service.declineHandshake(account, text(request, "HandshakeId"));
+        return ok(mapper.createObjectNode().<ObjectNode>set("Handshake", handshakeNode(handshake)));
+    }
+
+    private Response handleCancelHandshake(JsonNode request, String account) {
+        Handshake handshake = service.cancelHandshake(account, text(request, "HandshakeId"));
+        return ok(mapper.createObjectNode().<ObjectNode>set("Handshake", handshakeNode(handshake)));
+    }
+
+    private Response handleDescribeHandshake(JsonNode request, String account) {
+        Handshake handshake = service.describeHandshake(account, text(request, "HandshakeId"));
+        return ok(mapper.createObjectNode().<ObjectNode>set("Handshake", handshakeNode(handshake)));
+    }
+
+    private Response handleListHandshakesForAccount(JsonNode request, String account) {
+        List<Handshake> handshakes = service.listHandshakesForAccount(account,
+                request.path("Filter").path("ActionType").asText(null));
+        return paged(request, handshakes, "Handshakes", this::handshakeNode);
+    }
+
+    private Response handleListHandshakesForOrganization(JsonNode request, String account) {
+        List<Handshake> handshakes = service.listHandshakesForOrganization(account,
+                request.path("Filter").path("ActionType").asText(null));
+        return paged(request, handshakes, "Handshakes", this::handshakeNode);
+    }
+
+    private Response handleEnableAllFeatures(String account) {
+        Handshake handshake = service.enableAllFeatures(account);
+        return ok(mapper.createObjectNode().<ObjectNode>set("Handshake", handshakeNode(handshake)));
+    }
+
+    // ---------------------------------------------------------------- delegated administrators
+
+    private Response handleRegisterDelegatedAdministrator(JsonNode request, String account) {
+        service.registerDelegatedAdministrator(account,
+                text(request, "AccountId"), text(request, "ServicePrincipal"));
+        return empty();
+    }
+
+    private Response handleDeregisterDelegatedAdministrator(JsonNode request, String account) {
+        service.deregisterDelegatedAdministrator(account,
+                text(request, "AccountId"), text(request, "ServicePrincipal"));
+        return empty();
+    }
+
+    private Response handleListDelegatedAdministrators(JsonNode request, String account) {
+        List<OrgAccount> admins = service.listDelegatedAdministrators(account,
+                request.path("ServicePrincipal").asText(null));
+        return paged(request, admins, "DelegatedAdministrators", this::delegatedAdministratorNode);
+    }
+
+    private Response handleListDelegatedServicesForAccount(JsonNode request, String account) {
+        Map<String, Double> services =
+                service.listDelegatedServicesForAccount(account, text(request, "AccountId"));
+        ObjectNode response = mapper.createObjectNode();
+        ArrayNode array = response.putArray("DelegatedServices");
+        services.forEach((principal, enabled) -> array.addObject()
+                .put("ServicePrincipal", principal)
+                .put("DelegationEnabledDate", enabled));
+        return ok(response);
+    }
+
+    // ---------------------------------------------------------------- AWS service access
+
+    private Response handleEnableAwsServiceAccess(JsonNode request, String account) {
+        service.enableAwsServiceAccess(account, text(request, "ServicePrincipal"));
+        return empty();
+    }
+
+    private Response handleDisableAwsServiceAccess(JsonNode request, String account) {
+        service.disableAwsServiceAccess(account, text(request, "ServicePrincipal"));
+        return empty();
+    }
+
+    private Response handleListAwsServiceAccess(JsonNode request, String account) {
+        Map<String, Double> principals = service.listAwsServiceAccessForOrganization(account);
+        ObjectNode response = mapper.createObjectNode();
+        ArrayNode array = response.putArray("EnabledServicePrincipals");
+        principals.forEach((principal, enabled) -> array.addObject()
+                .put("ServicePrincipal", principal)
+                .put("DateEnabled", enabled));
+        return ok(response);
+    }
+
+    // ---------------------------------------------------------------- resource policy
+
+    private Response handlePutResourcePolicy(JsonNode request, String account) {
+        OrganizationsService.ResourcePolicy policy = service.putResourcePolicy(account,
+                text(request, "Content"), parseTags(request.path("Tags")));
+        return ok(mapper.createObjectNode().<ObjectNode>set("ResourcePolicy", resourcePolicyNode(policy)));
+    }
+
+    private Response handleDescribeResourcePolicy(String account) {
+        OrganizationsService.ResourcePolicy policy = service.describeResourcePolicy(account);
+        return ok(mapper.createObjectNode().<ObjectNode>set("ResourcePolicy", resourcePolicyNode(policy)));
+    }
+
+    private Response handleDeleteResourcePolicy(String account) {
+        service.deleteResourcePolicy(account);
+        return empty();
     }
 
     // ---------------------------------------------------------------- policies
@@ -408,6 +547,47 @@ public class OrganizationsJsonHandler {
         node.put("Arn", target.arn());
         node.put("Name", target.name());
         node.put("Type", target.type());
+        return node;
+    }
+
+    private ObjectNode handshakeNode(Handshake handshake) {
+        ObjectNode node = mapper.createObjectNode();
+        node.put("Id", handshake.getId());
+        node.put("Arn", handshake.getArn());
+        ArrayNode parties = node.putArray("Parties");
+        parties.addObject().put("Id", handshake.getOrgId()).put("Type", "ORGANIZATION");
+        parties.addObject().put("Id", handshake.getTargetAccountId()).put("Type", "ACCOUNT");
+        node.put("State", handshake.effectiveState(OrganizationsService.now()));
+        node.put("RequestedTimestamp", handshake.getRequestedTimestamp());
+        node.put("ExpirationTimestamp", handshake.getExpirationTimestamp());
+        node.put("Action", handshake.getAction());
+        ArrayNode resources = node.putArray("Resources");
+        resources.addObject().put("Value", handshake.getOrgId()).put("Type", "ORGANIZATION");
+        resources.addObject().put("Value", handshake.getTargetAccountId()).put("Type", "ACCOUNT");
+        if (handshake.getNotes() != null) {
+            resources.addObject().put("Value", handshake.getNotes()).put("Type", "NOTES");
+        }
+        if (handshake.getParentHandshakeId() != null) {
+            resources.addObject().put("Value", handshake.getParentHandshakeId())
+                    .put("Type", "PARENT_HANDSHAKE");
+        }
+        return node;
+    }
+
+    private ObjectNode delegatedAdministratorNode(OrgAccount account) {
+        ObjectNode node = accountNode(account);
+        account.getDelegatedServices().values().stream()
+                .min(Double::compareTo)
+                .ifPresent(first -> node.put("DelegationEnabledDate", first));
+        return node;
+    }
+
+    private ObjectNode resourcePolicyNode(OrganizationsService.ResourcePolicy policy) {
+        ObjectNode node = mapper.createObjectNode();
+        ObjectNode summary = node.putObject("ResourcePolicySummary");
+        summary.put("Id", policy.id());
+        summary.put("Arn", policy.arn());
+        node.put("Content", policy.content());
         return node;
     }
 

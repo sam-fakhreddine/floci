@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.organizations.model.CreateAccountStatus;
+import io.github.hectorvent.floci.services.organizations.model.Handshake;
 import io.github.hectorvent.floci.services.organizations.model.OrgAccount;
 import io.github.hectorvent.floci.services.organizations.model.OrgPolicy;
 import io.github.hectorvent.floci.services.organizations.model.OrgRoot;
@@ -31,8 +32,8 @@ class OrganizationsServiceTest {
     void setUp() {
         accountStore = backend();
         service = new OrganizationsService(
-                backend(), accountStore, backend(), backend(), backend(), backend(),
-                new com.fasterxml.jackson.databind.ObjectMapper());
+                backend(), accountStore, backend(), backend(), backend(), backend(), backend(),
+                new com.fasterxml.jackson.databind.ObjectMapper(), null);
     }
 
     private static <V> AccountAwareStorageBackend<V> backend() {
@@ -72,7 +73,7 @@ class OrganizationsServiceTest {
     @Test
     void memberAccountCannotCreateItsOwnOrganization() {
         service.createOrganization(MGMT, null);
-        String member = service.createAccount(MGMT, "member@example.com", "Member", null, false)
+        String member = service.createAccount(MGMT, "member@example.com", "Member", null, null, false)
                 .getAccountId();
         AwsException e = assertThrows(AwsException.class, () -> service.createOrganization(member, "ALL"));
         assertEquals("AlreadyInOrganizationException", e.getErrorCode());
@@ -81,7 +82,7 @@ class OrganizationsServiceTest {
     @Test
     void deleteOrganizationRequiresEmptyOrganization() {
         service.createOrganization(MGMT, null);
-        String member = service.createAccount(MGMT, "member@example.com", "Member", null, false)
+        String member = service.createAccount(MGMT, "member@example.com", "Member", null, null, false)
                 .getAccountId();
 
         AwsException e = assertThrows(AwsException.class, () -> service.deleteOrganization(MGMT));
@@ -99,7 +100,7 @@ class OrganizationsServiceTest {
     void createAccountStoresRecordInManagementNamespace() {
         service.createOrganization(MGMT, null);
         CreateAccountStatus status =
-                service.createAccount(MGMT, "member@example.com", "Member", Map.of("team", "dev"), false);
+                service.createAccount(MGMT, "member@example.com", "Member", null, Map.of("team", "dev"), false);
 
         assertEquals("SUCCEEDED", status.getState());
         String member = status.getAccountId();
@@ -113,7 +114,7 @@ class OrganizationsServiceTest {
     @Test
     void memberAccountResolvesItsOrganization() {
         Organization org = service.createOrganization(MGMT, null);
-        String member = service.createAccount(MGMT, "member@example.com", "Member", null, false)
+        String member = service.createAccount(MGMT, "member@example.com", "Member", null, null, false)
                 .getAccountId();
 
         Organization resolved = service.describeOrganization(member);
@@ -123,18 +124,18 @@ class OrganizationsServiceTest {
     @Test
     void managementOnlyOperationsRejectMemberCallers() {
         service.createOrganization(MGMT, null);
-        String member = service.createAccount(MGMT, "member@example.com", "Member", null, false)
+        String member = service.createAccount(MGMT, "member@example.com", "Member", null, null, false)
                 .getAccountId();
 
         AwsException e = assertThrows(AwsException.class,
-                () -> service.createAccount(member, "x@example.com", "X", null, false));
+                () -> service.createAccount(member, "x@example.com", "X", null, null, false));
         assertEquals("AccessDeniedException", e.getErrorCode());
     }
 
     @Test
     void closeAccountSuspendsAndProtectsManagement() {
         service.createOrganization(MGMT, null);
-        String member = service.createAccount(MGMT, "member@example.com", "Member", null, false)
+        String member = service.createAccount(MGMT, "member@example.com", "Member", null, null, false)
                 .getAccountId();
 
         service.closeAccount(MGMT, member);
@@ -150,7 +151,7 @@ class OrganizationsServiceTest {
     @Test
     void leaveOrganizationRemovesMemberButNotManagement() {
         service.createOrganization(MGMT, null);
-        String member = service.createAccount(MGMT, "member@example.com", "Member", null, false)
+        String member = service.createAccount(MGMT, "member@example.com", "Member", null, null, false)
                 .getAccountId();
 
         service.leaveOrganization(member);
@@ -165,7 +166,7 @@ class OrganizationsServiceTest {
     void createAccountStatusIsQueryable() {
         service.createOrganization(MGMT, null);
         CreateAccountStatus status =
-                service.createAccount(MGMT, "member@example.com", "Member", null, false);
+                service.createAccount(MGMT, "member@example.com", "Member", null, null, false);
 
         CreateAccountStatus described = service.describeCreateAccountStatus(MGMT, status.getId());
         assertEquals(status.getAccountId(), described.getAccountId());
@@ -212,7 +213,7 @@ class OrganizationsServiceTest {
         service.createOrganization(MGMT, null);
         String rootId = service.listRoots(MGMT).get(0).getId();
         String ouId = service.createOrganizationalUnit(MGMT, rootId, "workloads", null).getId();
-        String member = service.createAccount(MGMT, "member@example.com", "Member", null, false)
+        String member = service.createAccount(MGMT, "member@example.com", "Member", null, null, false)
                 .getAccountId();
 
         service.moveAccount(MGMT, member, rootId, ouId);
@@ -258,7 +259,7 @@ class OrganizationsServiceTest {
         service.createOrganization(MGMT, null);
         String rootId = service.listRoots(MGMT).get(0).getId();
         String ouId = service.createOrganizationalUnit(MGMT, rootId, "workloads", null).getId();
-        String member = service.createAccount(MGMT, "member@example.com", "Member", null, false)
+        String member = service.createAccount(MGMT, "member@example.com", "Member", null, null, false)
                 .getAccountId();
 
         for (String resourceId : List.of(rootId, ouId, member)) {
@@ -297,7 +298,7 @@ class OrganizationsServiceTest {
         service.createOrganization(MGMT, null);
         String rootId = service.listRoots(MGMT).get(0).getId();
         String ouId = service.createOrganizationalUnit(MGMT, rootId, "workloads", null).getId();
-        String member = service.createAccount(MGMT, "member@example.com", "Member", null, false)
+        String member = service.createAccount(MGMT, "member@example.com", "Member", null, null, false)
                 .getAccountId();
 
         assertEquals(1, service.listPoliciesForTarget(MGMT, ouId, "SERVICE_CONTROL_POLICY").size());
@@ -385,7 +386,7 @@ class OrganizationsServiceTest {
         service.createOrganization(MGMT, null);
         String rootId = service.listRoots(MGMT).get(0).getId();
         String ouId = service.createOrganizationalUnit(MGMT, rootId, "workloads", null).getId();
-        String member = service.createAccount(MGMT, "member@example.com", "Member", null, false)
+        String member = service.createAccount(MGMT, "member@example.com", "Member", null, null, false)
                 .getAccountId();
         service.moveAccount(MGMT, member, rootId, ouId);
         service.enablePolicyType(MGMT, rootId, "TAG_POLICY");
@@ -422,5 +423,141 @@ class OrganizationsServiceTest {
                 "SERVICE_CONTROL_POLICY", DENY_S3, null).getId();
         service.tagResource(MGMT, policyId, Map.of("env", "test"));
         assertEquals("test", service.tagsForResource(MGMT, policyId).get("env"));
+    }
+
+    // ---------------------------------------------------------------- handshakes
+
+    private static final String OUTSIDER = "222222222222";
+
+    @Test
+    void inviteAcceptFlowAddsMemberWithInvitedJoinMethod() {
+        service.createOrganization(MGMT, null);
+        Handshake invite = service.inviteAccountToOrganization(MGMT, OUTSIDER, "ACCOUNT", "welcome");
+        assertEquals("OPEN", invite.getState());
+        assertEquals("INVITE", invite.getAction());
+
+        // Repeat invite while one is open is rejected.
+        AwsException duplicate = assertThrows(AwsException.class,
+                () -> service.inviteAccountToOrganization(MGMT, OUTSIDER, "ACCOUNT", null));
+        assertEquals("DuplicateHandshakeException", duplicate.getErrorCode());
+
+        // Only the invited account can accept.
+        AwsException wrongCaller = assertThrows(AwsException.class,
+                () -> service.acceptHandshake("333333333333", invite.getId()));
+        assertEquals("AccessDeniedException", wrongCaller.getErrorCode());
+
+        Handshake accepted = service.acceptHandshake(OUTSIDER, invite.getId());
+        assertEquals("ACCEPTED", accepted.getState());
+        assertEquals("INVITED", service.describeAccount(MGMT, OUTSIDER).getJoinedMethod());
+
+        // The new member resolves the organization like any other member.
+        assertEquals(service.describeOrganization(MGMT).getId(),
+                service.describeOrganization(OUTSIDER).getId());
+    }
+
+    @Test
+    void declineAndCancelTransitions() {
+        service.createOrganization(MGMT, null);
+        Handshake invite = service.inviteAccountToOrganization(MGMT, OUTSIDER, "ACCOUNT", null);
+        Handshake declined = service.declineHandshake(OUTSIDER, invite.getId());
+        assertEquals("DECLINED", declined.getState());
+
+        AwsException alreadyTerminal = assertThrows(AwsException.class,
+                () -> service.acceptHandshake(OUTSIDER, invite.getId()));
+        assertEquals("HandshakeAlreadyInStateException", alreadyTerminal.getErrorCode());
+
+        Handshake second = service.inviteAccountToOrganization(MGMT, OUTSIDER, "ACCOUNT", null);
+        assertEquals("CANCELED", service.cancelHandshake(MGMT, second.getId()).getState());
+
+        assertEquals(2, service.listHandshakesForAccount(OUTSIDER, null).size());
+        assertEquals(2, service.listHandshakesForOrganization(MGMT, "INVITE").size());
+    }
+
+    @Test
+    void enableAllFeaturesIsImmediateWithoutMembers() {
+        service.createOrganization(MGMT, "CONSOLIDATED_BILLING");
+        assertTrue(service.listRoots(MGMT).get(0).getPolicyTypes().isEmpty());
+
+        Handshake handshake = service.enableAllFeatures(MGMT);
+        assertEquals("ACCEPTED", handshake.getState());
+        assertEquals("ALL", service.describeOrganization(MGMT).getFeatureSet());
+        assertEquals("SERVICE_CONTROL_POLICY",
+                service.listRoots(MGMT).get(0).getPolicyTypes().get(0).getType());
+        // FullAWSAccess got seeded onto root and management account.
+        assertEquals(1, service.listPoliciesForTarget(MGMT,
+                service.listRoots(MGMT).get(0).getId(), "SERVICE_CONTROL_POLICY").size());
+    }
+
+    @Test
+    void enableAllFeaturesWaitsForMemberApprovals() {
+        service.createOrganization(MGMT, "CONSOLIDATED_BILLING");
+        String member = service.createAccount(MGMT, "member@example.com", "Member", null, null, false)
+                .getAccountId();
+
+        Handshake parent = service.enableAllFeatures(MGMT);
+        assertEquals("OPEN", parent.getState());
+        assertEquals("CONSOLIDATED_BILLING", service.describeOrganization(MGMT).getFeatureSet());
+
+        Handshake approval = service.listHandshakesForAccount(member, "APPROVE_ALL_FEATURES").get(0);
+        service.acceptHandshake(member, approval.getId());
+
+        assertEquals("ALL", service.describeOrganization(MGMT).getFeatureSet());
+        assertEquals("ACCEPTED", service.describeHandshake(MGMT, parent.getId()).getState());
+
+        AwsException already = assertThrows(AwsException.class, () -> service.enableAllFeatures(MGMT));
+        assertEquals("HandshakeConstraintViolationException", already.getErrorCode());
+    }
+
+    // ---------------------------------------------------------------- delegated admins and service access
+
+    @Test
+    void delegatedAdministratorLifecycle() {
+        service.createOrganization(MGMT, null);
+        String member = service.createAccount(MGMT, "member@example.com", "Member", null, null, false)
+                .getAccountId();
+
+        AwsException noAccess = assertThrows(AwsException.class, () ->
+                service.registerDelegatedAdministrator(MGMT, member, "guardduty.amazonaws.com"));
+        assertEquals("ConstraintViolationException", noAccess.getErrorCode());
+
+        service.enableAwsServiceAccess(MGMT, "guardduty.amazonaws.com");
+        service.registerDelegatedAdministrator(MGMT, member, "guardduty.amazonaws.com");
+
+        AwsException again = assertThrows(AwsException.class, () ->
+                service.registerDelegatedAdministrator(MGMT, member, "guardduty.amazonaws.com"));
+        assertEquals("AccountAlreadyRegisteredException", again.getErrorCode());
+
+        assertEquals(List.of(member),
+                service.listDelegatedAdministrators(MGMT, "guardduty.amazonaws.com").stream()
+                        .map(OrgAccount::getId).toList());
+        assertTrue(service.listDelegatedServicesForAccount(MGMT, member)
+                .containsKey("guardduty.amazonaws.com"));
+
+        // Disabling trusted access revokes the delegation.
+        service.disableAwsServiceAccess(MGMT, "guardduty.amazonaws.com");
+        assertTrue(service.listDelegatedAdministrators(MGMT, null).isEmpty());
+        assertTrue(service.listAwsServiceAccessForOrganization(MGMT).isEmpty());
+
+        AwsException notRegistered = assertThrows(AwsException.class, () ->
+                service.deregisterDelegatedAdministrator(MGMT, member, "guardduty.amazonaws.com"));
+        assertEquals("AccountNotRegisteredException", notRegistered.getErrorCode());
+    }
+
+    // ---------------------------------------------------------------- resource policy
+
+    @Test
+    void resourcePolicyLifecycle() {
+        service.createOrganization(MGMT, null);
+        AwsException none = assertThrows(AwsException.class, () -> service.describeResourcePolicy(MGMT));
+        assertEquals("ResourcePolicyNotFoundException", none.getErrorCode());
+
+        OrganizationsService.ResourcePolicy policy = service.putResourcePolicy(MGMT,
+                "{\"Version\":\"2012-10-17\",\"Statement\":[]}", null);
+        assertTrue(policy.id().startsWith("rp-"));
+        assertEquals(policy.id(), service.describeResourcePolicy(MGMT).id());
+
+        service.deleteResourcePolicy(MGMT);
+        AwsException gone = assertThrows(AwsException.class, () -> service.describeResourcePolicy(MGMT));
+        assertEquals("ResourcePolicyNotFoundException", gone.getErrorCode());
     }
 }
