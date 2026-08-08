@@ -1,11 +1,16 @@
 package io.github.hectorvent.floci.services.organizations;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.organizations.model.CreateAccountStatus;
 import io.github.hectorvent.floci.services.organizations.model.OrgAccount;
+import io.github.hectorvent.floci.services.organizations.model.OrgPolicy;
 import io.github.hectorvent.floci.services.organizations.model.OrgRoot;
 import io.github.hectorvent.floci.services.organizations.model.Organization;
 import io.github.hectorvent.floci.services.organizations.model.OrganizationalUnit;
@@ -20,6 +25,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * AWS Organizations control plane.
@@ -48,15 +54,26 @@ public class OrganizationsService {
     static final String STATUS_ACTIVE = "ACTIVE";
     static final String STATUS_SUSPENDED = "SUSPENDED";
 
+    static final String SCP_TYPE = "SERVICE_CONTROL_POLICY";
+    static final Set<String> POLICY_TYPES = Set.of(
+            SCP_TYPE, "TAG_POLICY", "BACKUP_POLICY", "AISERVICES_OPT_OUT_POLICY");
+
+    static final String FULL_AWS_ACCESS_ID = "p-FullAWSAccess";
+    static final String FULL_AWS_ACCESS_CONTENT =
+            "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
+                    + "\"Action\":\"*\",\"Resource\":\"*\"}]}";
+
     private final AccountAwareStorageBackend<Organization> organizationStore;
     private final AccountAwareStorageBackend<OrgAccount> accountStore;
     private final AccountAwareStorageBackend<OrgRoot> rootStore;
     private final AccountAwareStorageBackend<OrganizationalUnit> ouStore;
     private final AccountAwareStorageBackend<CreateAccountStatus> accountStatusStore;
+    private final AccountAwareStorageBackend<OrgPolicy> policyStore;
+    private final ObjectMapper mapper;
 
     @Inject
     @SuppressWarnings("unchecked")
-    public OrganizationsService(StorageFactory storageFactory) {
+    public OrganizationsService(StorageFactory storageFactory, ObjectMapper mapper) {
         this((AccountAwareStorageBackend<Organization>) storageFactory.create(
                         "organizations", "org-organizations.json", new TypeReference<Map<String, Organization>>() {}),
                 (AccountAwareStorageBackend<OrgAccount>) storageFactory.create(
@@ -67,19 +84,26 @@ public class OrganizationsService {
                         "organizations", "org-ous.json", new TypeReference<Map<String, OrganizationalUnit>>() {}),
                 (AccountAwareStorageBackend<CreateAccountStatus>) storageFactory.create(
                         "organizations", "org-account-statuses.json",
-                        new TypeReference<Map<String, CreateAccountStatus>>() {}));
+                        new TypeReference<Map<String, CreateAccountStatus>>() {}),
+                (AccountAwareStorageBackend<OrgPolicy>) storageFactory.create(
+                        "organizations", "org-policies.json", new TypeReference<Map<String, OrgPolicy>>() {}),
+                mapper);
     }
 
     OrganizationsService(AccountAwareStorageBackend<Organization> organizationStore,
                          AccountAwareStorageBackend<OrgAccount> accountStore,
                          AccountAwareStorageBackend<OrgRoot> rootStore,
                          AccountAwareStorageBackend<OrganizationalUnit> ouStore,
-                         AccountAwareStorageBackend<CreateAccountStatus> accountStatusStore) {
+                         AccountAwareStorageBackend<CreateAccountStatus> accountStatusStore,
+                         AccountAwareStorageBackend<OrgPolicy> policyStore,
+                         ObjectMapper mapper) {
         this.organizationStore = organizationStore;
         this.accountStore = accountStore;
         this.rootStore = rootStore;
         this.ouStore = ouStore;
         this.accountStatusStore = accountStatusStore;
+        this.policyStore = policyStore;
+        this.mapper = mapper;
     }
 
     /** The caller's organization plus which namespace owns it. */
@@ -169,6 +193,10 @@ public class OrganizationsService {
         management.setManagementAccountId(callerAccount);
         accountStore.putForAccount(callerAccount, callerAccount, management);
 
+        if ("ALL".equals(featureSet)) {
+            seedFullAwsAccess(callerAccount, List.of(rootId, callerAccount));
+        }
+
         LOG.infov("CreateOrganization: {0} (management account {1})", orgId, callerAccount);
         return org;
     }
@@ -189,6 +217,10 @@ public class OrganizationsService {
             throw new AwsException("OrganizationNotEmptyException",
                     "The organization still contains organizational units.", 400);
         }
+        if (policies(mgmt).stream().anyMatch(p -> !p.isAwsManaged())) {
+            throw new AwsException("OrganizationNotEmptyException",
+                    "The organization still contains customer-managed policies.", 400);
+        }
         for (String key : accountStore.keysForAccount(mgmt)) {
             accountStore.deleteForAccount(mgmt, key);
         }
@@ -197,6 +229,9 @@ public class OrganizationsService {
         }
         for (String key : accountStatusStore.keysForAccount(mgmt)) {
             accountStatusStore.deleteForAccount(mgmt, key);
+        }
+        for (String key : policyStore.keysForAccount(mgmt)) {
+            policyStore.deleteForAccount(mgmt, key);
         }
         organizationStore.deleteForAccount(mgmt, ORG_KEY);
         LOG.infov("DeleteOrganization: {0}", ctx.org().getId());
@@ -232,6 +267,7 @@ public class OrganizationsService {
             account.getTags().putAll(tags);
         }
         accountStore.putForAccount(mgmt, accountId, account);
+        attachFullAwsAccessIfScpEnabled(mgmt, accountId);
 
         CreateAccountStatus status = new CreateAccountStatus();
         status.setId("car-" + randomId(24));
@@ -316,6 +352,7 @@ public class OrganizationsService {
         }
         requireAccount(mgmt, accountId);
         accountStore.deleteForAccount(mgmt, accountId);
+        detachFromAllPolicies(mgmt, accountId);
         LOG.infov("Account {0} removed from organization {1}", accountId, ctx.org().getId());
     }
 
@@ -411,6 +448,7 @@ public class OrganizationsService {
             ou.getTags().putAll(tags);
         }
         ouStore.putForAccount(mgmt, ouId, ou);
+        attachFullAwsAccessIfScpEnabled(mgmt, ouId);
         LOG.infov("CreateOrganizationalUnit: {0} ({1}) under {2}", ouId, name, parentId);
         return ou;
     }
@@ -451,6 +489,7 @@ public class OrganizationsService {
                     "The OU still contains accounts or child OUs.", 400);
         }
         ouStore.deleteForAccount(mgmt, ouId);
+        detachFromAllPolicies(mgmt, ouId);
     }
 
     public List<OrganizationalUnit> listOrganizationalUnitsForParent(String callerAccount, String parentId) {
@@ -499,6 +538,9 @@ public class OrganizationsService {
         if (resourceId.startsWith("ou-")) {
             return requireOu(mgmt, resourceId).getTags();
         }
+        if (resourceId.startsWith("p-")) {
+            return requirePolicy(mgmt, resourceId).getTags();
+        }
         if (isAccountId(resourceId)) {
             return requireAccount(mgmt, resourceId).getTags();
         }
@@ -511,9 +553,458 @@ public class OrganizationsService {
             rootStore.putForAccount(mgmt, resourceId, requireRoot(mgmt, resourceId));
         } else if (resourceId.startsWith("ou-")) {
             ouStore.putForAccount(mgmt, resourceId, requireOu(mgmt, resourceId));
+        } else if (resourceId.startsWith("p-")) {
+            policyStore.putForAccount(mgmt, resourceId, requirePolicy(mgmt, resourceId));
         } else {
             accountStore.putForAccount(mgmt, resourceId, requireAccount(mgmt, resourceId));
         }
+    }
+
+    // ---------------------------------------------------------------- policies
+
+    public OrgPolicy createPolicy(String callerAccount, String name, String description,
+                                  String type, String content, Map<String, String> tags) {
+        OrgContext ctx = requireManagement(callerAccount);
+        String mgmt = ctx.managementAccount();
+        requireValidPolicyType(type);
+        if (SCP_TYPE.equals(type) && !"ALL".equals(ctx.org().getFeatureSet())) {
+            throw new AwsException("PolicyTypeNotAvailableForOrganizationException",
+                    "Service control policies require the ALL feature set.", 400);
+        }
+        if (name == null || name.isBlank()) {
+            throw new AwsException("InvalidInputException",
+                    "You provided an invalid value for Name.", 400);
+        }
+        if (policies(mgmt).stream().anyMatch(p -> type.equals(p.getType()) && name.equals(p.getName()))) {
+            throw new AwsException("DuplicatePolicyException",
+                    "A policy with the same name and type already exists.", 400);
+        }
+        validatePolicyContent(content);
+
+        OrgPolicy policy = new OrgPolicy();
+        policy.setId("p-" + randomId(8));
+        policy.setArn(policyArn(mgmt, ctx.org().getId(), type, policy.getId(), false));
+        policy.setName(name);
+        policy.setDescription(description == null ? "" : description);
+        policy.setType(type);
+        policy.setContent(content);
+        policy.setAwsManaged(false);
+        policy.setCreated(now());
+        policy.setUpdated(policy.getCreated());
+        if (tags != null) {
+            policy.getTags().putAll(tags);
+        }
+        policyStore.putForAccount(mgmt, policy.getId(), policy);
+        LOG.infov("CreatePolicy: {0} ({1}, {2})", policy.getId(), name, type);
+        return policy;
+    }
+
+    public OrgPolicy describePolicy(String callerAccount, String policyId) {
+        OrgContext ctx = resolveOrg(callerAccount);
+        return requirePolicy(ctx.managementAccount(), policyId);
+    }
+
+    public OrgPolicy updatePolicy(String callerAccount, String policyId, String name,
+                                  String description, String content) {
+        OrgContext ctx = requireManagement(callerAccount);
+        String mgmt = ctx.managementAccount();
+        OrgPolicy policy = requirePolicy(mgmt, policyId);
+        if (policy.isAwsManaged()) {
+            throw new AwsException("ConstraintViolationException",
+                    "You can't update an AWS managed policy.", 400);
+        }
+        if (name != null && !name.isBlank() && !name.equals(policy.getName())) {
+            if (policies(mgmt).stream().anyMatch(p -> !p.getId().equals(policyId)
+                    && policy.getType().equals(p.getType()) && name.equals(p.getName()))) {
+                throw new AwsException("DuplicatePolicyException",
+                        "A policy with the same name and type already exists.", 400);
+            }
+            policy.setName(name);
+        }
+        if (description != null) {
+            policy.setDescription(description);
+        }
+        if (content != null) {
+            validatePolicyContent(content);
+            policy.setContent(content);
+        }
+        policy.setUpdated(now());
+        policyStore.putForAccount(mgmt, policyId, policy);
+        return policy;
+    }
+
+    public void deletePolicy(String callerAccount, String policyId) {
+        OrgContext ctx = requireManagement(callerAccount);
+        String mgmt = ctx.managementAccount();
+        OrgPolicy policy = requirePolicy(mgmt, policyId);
+        if (policy.isAwsManaged()) {
+            throw new AwsException("ConstraintViolationException",
+                    "You can't delete an AWS managed policy.", 400);
+        }
+        if (!policy.getTargetIds().isEmpty()) {
+            throw new AwsException("PolicyInUseException",
+                    "The policy is attached to one or more targets and can't be deleted.", 400);
+        }
+        policyStore.deleteForAccount(mgmt, policyId);
+    }
+
+    public List<OrgPolicy> listPolicies(String callerAccount, String filter) {
+        OrgContext ctx = resolveOrg(callerAccount);
+        requireValidPolicyType(filter);
+        return policies(ctx.managementAccount()).stream()
+                .filter(p -> filter.equals(p.getType()))
+                .toList();
+    }
+
+    public void attachPolicy(String callerAccount, String policyId, String targetId) {
+        OrgContext ctx = requireManagement(callerAccount);
+        String mgmt = ctx.managementAccount();
+        OrgPolicy policy = requirePolicy(mgmt, policyId);
+        requireTarget(mgmt, targetId);
+        requirePolicyTypeEnabled(mgmt, policy.getType());
+        if (policy.getTargetIds().contains(targetId)) {
+            throw new AwsException("DuplicatePolicyAttachmentException",
+                    "The policy is already attached to the target.", 400);
+        }
+        policy.getTargetIds().add(targetId);
+        policyStore.putForAccount(mgmt, policyId, policy);
+    }
+
+    public void detachPolicy(String callerAccount, String policyId, String targetId) {
+        OrgContext ctx = requireManagement(callerAccount);
+        String mgmt = ctx.managementAccount();
+        OrgPolicy policy = requirePolicy(mgmt, policyId);
+        requireTarget(mgmt, targetId);
+        if (!policy.getTargetIds().contains(targetId)) {
+            throw new AwsException("PolicyNotAttachedException",
+                    "The policy is not attached to the target.", 400);
+        }
+        if (SCP_TYPE.equals(policy.getType())
+                && policiesForTarget(mgmt, targetId, SCP_TYPE).size() == 1) {
+            throw new AwsException("ConstraintViolationException",
+                    "You can't detach the last service control policy from a target.", 400);
+        }
+        policy.getTargetIds().remove(targetId);
+        policyStore.putForAccount(mgmt, policyId, policy);
+    }
+
+    public List<OrgPolicy> listPoliciesForTarget(String callerAccount, String targetId, String filter) {
+        OrgContext ctx = resolveOrg(callerAccount);
+        String mgmt = ctx.managementAccount();
+        requireTarget(mgmt, targetId);
+        requireValidPolicyType(filter);
+        return policiesForTarget(mgmt, targetId, filter);
+    }
+
+    /** An attachment target of a policy: root, OU, or account. */
+    record TargetRef(String targetId, String arn, String name, String type) {}
+
+    public List<TargetRef> listTargetsForPolicy(String callerAccount, String policyId) {
+        OrgContext ctx = resolveOrg(callerAccount);
+        String mgmt = ctx.managementAccount();
+        OrgPolicy policy = requirePolicy(mgmt, policyId);
+        List<TargetRef> targets = new ArrayList<>();
+        for (String targetId : policy.getTargetIds()) {
+            if (targetId.startsWith("r-")) {
+                rootStore.getForAccount(mgmt, targetId).ifPresent(root ->
+                        targets.add(new TargetRef(targetId, root.getArn(), root.getName(), "ROOT")));
+            } else if (targetId.startsWith("ou-")) {
+                ouStore.getForAccount(mgmt, targetId).ifPresent(ou ->
+                        targets.add(new TargetRef(targetId, ou.getArn(), ou.getName(), "ORGANIZATIONAL_UNIT")));
+            } else {
+                accountStore.getForAccount(mgmt, targetId).ifPresent(account ->
+                        targets.add(new TargetRef(targetId, account.getArn(), account.getName(), "ACCOUNT")));
+            }
+        }
+        return targets;
+    }
+
+    public OrgRoot enablePolicyType(String callerAccount, String rootId, String type) {
+        OrgContext ctx = requireManagement(callerAccount);
+        String mgmt = ctx.managementAccount();
+        OrgRoot root = requireRoot(mgmt, rootId);
+        requireValidPolicyType(type);
+        if (root.getPolicyTypes().stream().anyMatch(t -> type.equals(t.getType()))) {
+            throw new AwsException("PolicyTypeAlreadyEnabledException",
+                    "The policy type is already enabled on the root.", 400);
+        }
+        root.getPolicyTypes().add(new PolicyTypeSummary(type, "ENABLED"));
+        rootStore.putForAccount(mgmt, rootId, root);
+
+        Organization org = ctx.org();
+        if (org.getAvailablePolicyTypes().stream().noneMatch(t -> type.equals(t.getType()))) {
+            org.getAvailablePolicyTypes().add(new PolicyTypeSummary(type, "ENABLED"));
+            organizationStore.putForAccount(mgmt, ORG_KEY, org);
+        }
+
+        if (SCP_TYPE.equals(type)) {
+            List<String> nodes = new ArrayList<>();
+            nodes.add(rootId);
+            organizationalUnits(mgmt).forEach(ou -> nodes.add(ou.getId()));
+            memberAccounts(mgmt).forEach(a -> nodes.add(a.getId()));
+            seedFullAwsAccess(mgmt, nodes.stream()
+                    .filter(node -> policiesForTarget(mgmt, node, SCP_TYPE).isEmpty())
+                    .toList());
+        }
+        return root;
+    }
+
+    public OrgRoot disablePolicyType(String callerAccount, String rootId, String type) {
+        OrgContext ctx = requireManagement(callerAccount);
+        String mgmt = ctx.managementAccount();
+        OrgRoot root = requireRoot(mgmt, rootId);
+        requireValidPolicyType(type);
+        if (root.getPolicyTypes().stream().noneMatch(t -> type.equals(t.getType()))) {
+            throw new AwsException("PolicyTypeNotEnabledException",
+                    "The policy type is not enabled on the root.", 400);
+        }
+        root.getPolicyTypes().removeIf(t -> type.equals(t.getType()));
+        rootStore.putForAccount(mgmt, rootId, root);
+
+        Organization org = ctx.org();
+        org.getAvailablePolicyTypes().removeIf(t -> type.equals(t.getType()));
+        organizationStore.putForAccount(mgmt, ORG_KEY, org);
+
+        // Disabling a policy type detaches every policy of that type, matching AWS.
+        for (OrgPolicy policy : policies(mgmt)) {
+            if (type.equals(policy.getType()) && !policy.getTargetIds().isEmpty()) {
+                policy.getTargetIds().clear();
+                policyStore.putForAccount(mgmt, policy.getId(), policy);
+            }
+        }
+        return root;
+    }
+
+    /** The merged effective policy for the non-SCP policy types. */
+    record EffectivePolicy(String policyContent, double lastUpdatedTimestamp,
+                           String targetId, String policyType) {}
+
+    public EffectivePolicy describeEffectivePolicy(String callerAccount, String policyType,
+                                                   String targetId) {
+        OrgContext ctx = resolveOrg(callerAccount);
+        String mgmt = ctx.managementAccount();
+        requireValidPolicyType(policyType);
+        if (SCP_TYPE.equals(policyType)) {
+            throw new AwsException("InvalidInputException",
+                    "DescribeEffectivePolicy does not apply to service control policies.", 400);
+        }
+        String target = targetId == null ? callerAccount : targetId;
+        requireAccount(mgmt, target);
+
+        JsonNode merged = null;
+        double lastUpdated = 0;
+        for (String node : chainToTarget(mgmt, target)) {
+            for (OrgPolicy policy : policiesForTarget(mgmt, node, policyType)) {
+                merged = mergeEffective(merged, parsePolicyContent(policy.getContent()));
+                lastUpdated = Math.max(lastUpdated, policy.getUpdated());
+            }
+        }
+        if (merged == null) {
+            throw new AwsException("EffectivePolicyNotFoundException",
+                    "There is no effective policy of the specified type for the target.", 400);
+        }
+        return new EffectivePolicy(merged.toString(), lastUpdated, target, policyType);
+    }
+
+    /** Root-first chain of node IDs ending at the target account. */
+    List<String> chainToTarget(String mgmt, String accountId) {
+        List<String> chain = new ArrayList<>();
+        chain.add(accountId);
+        String parent = requireAccount(mgmt, accountId).getParentId();
+        while (parent != null && parent.startsWith("ou-")) {
+            chain.add(parent);
+            parent = requireOu(mgmt, parent).getParentId();
+        }
+        if (parent != null) {
+            chain.add(parent);
+        }
+        java.util.Collections.reverse(chain);
+        return chain;
+    }
+
+    /**
+     * Merges one policy document over the inherited base, honoring the child-policy
+     * inheritance operators: {@code @@assign} replaces the inherited value, {@code @@append}
+     * concatenates onto the inherited list, and {@code @@remove} filters values out. Bare
+     * scalar and array values behave like {@code @@assign}; bare objects merge recursively.
+     * Other {@code @@}-prefixed control keys are dropped from the output.
+     */
+    private JsonNode mergeEffective(JsonNode base, JsonNode overlay) {
+        if (!(overlay instanceof ObjectNode overlayNode)) {
+            return overlay == null ? base : overlay.deepCopy();
+        }
+        if (overlayNode.has("@@assign")) {
+            return overlayNode.get("@@assign").deepCopy();
+        }
+        if (overlayNode.has("@@append")) {
+            ArrayNode result = mapper.createArrayNode();
+            if (base != null && base.isArray()) {
+                base.forEach(result::add);
+            }
+            JsonNode values = overlayNode.get("@@append");
+            if (values.isArray()) {
+                values.forEach(result::add);
+            } else {
+                result.add(values);
+            }
+            return result;
+        }
+        if (overlayNode.has("@@remove")) {
+            ArrayNode result = mapper.createArrayNode();
+            JsonNode values = overlayNode.get("@@remove");
+            if (base != null && base.isArray()) {
+                base.forEach(entry -> {
+                    boolean removed = false;
+                    if (values.isArray()) {
+                        for (JsonNode value : values) {
+                            if (value.equals(entry)) {
+                                removed = true;
+                                break;
+                            }
+                        }
+                    } else {
+                        removed = values.equals(entry);
+                    }
+                    if (!removed) {
+                        result.add(entry);
+                    }
+                });
+            }
+            return result;
+        }
+        ObjectNode result = base instanceof ObjectNode baseNode
+                ? baseNode.deepCopy() : mapper.createObjectNode();
+        overlayNode.fields().forEachRemaining(entry -> {
+            if (entry.getKey().startsWith("@@")) {
+                return;
+            }
+            result.set(entry.getKey(), mergeEffective(result.get(entry.getKey()), entry.getValue()));
+        });
+        return result;
+    }
+
+    private void seedFullAwsAccess(String mgmt, List<String> targetIds) {
+        OrgPolicy policy = policyStore.getForAccount(mgmt, FULL_AWS_ACCESS_ID).orElseGet(() -> {
+            OrgPolicy seeded = new OrgPolicy();
+            seeded.setId(FULL_AWS_ACCESS_ID);
+            seeded.setArn(policyArn(mgmt, null, SCP_TYPE, FULL_AWS_ACCESS_ID, true));
+            seeded.setName("FullAWSAccess");
+            seeded.setDescription("Allows access to every operation");
+            seeded.setType(SCP_TYPE);
+            seeded.setContent(FULL_AWS_ACCESS_CONTENT);
+            seeded.setAwsManaged(true);
+            seeded.setCreated(now());
+            seeded.setUpdated(seeded.getCreated());
+            return seeded;
+        });
+        for (String targetId : targetIds) {
+            if (!policy.getTargetIds().contains(targetId)) {
+                policy.getTargetIds().add(targetId);
+            }
+        }
+        policyStore.putForAccount(mgmt, FULL_AWS_ACCESS_ID, policy);
+    }
+
+    private void attachFullAwsAccessIfScpEnabled(String mgmt, String targetId) {
+        boolean scpEnabled = rootStore.scanForAccount(mgmt, key -> true).stream()
+                .flatMap(root -> root.getPolicyTypes().stream())
+                .anyMatch(t -> SCP_TYPE.equals(t.getType()) && "ENABLED".equals(t.getStatus()));
+        if (scpEnabled) {
+            seedFullAwsAccess(mgmt, List.of(targetId));
+        }
+    }
+
+    private void detachFromAllPolicies(String mgmt, String targetId) {
+        for (OrgPolicy policy : policies(mgmt)) {
+            if (policy.getTargetIds().remove(targetId)) {
+                policyStore.putForAccount(mgmt, policy.getId(), policy);
+            }
+        }
+    }
+
+    List<OrgPolicy> policies(String mgmt) {
+        return policyStore.scanForAccount(mgmt, key -> true).stream()
+                .sorted(Comparator.comparing(OrgPolicy::getId))
+                .toList();
+    }
+
+    List<OrgPolicy> policiesForTarget(String mgmt, String targetId, String type) {
+        return policies(mgmt).stream()
+                .filter(p -> type.equals(p.getType()) && p.getTargetIds().contains(targetId))
+                .toList();
+    }
+
+    OrgPolicy requirePolicy(String mgmt, String policyId) {
+        return policyStore.getForAccount(mgmt, policyId)
+                .orElseThrow(() -> new AwsException("PolicyNotFoundException",
+                        "We can't find a policy with the PolicyId that you specified: " + policyId, 400));
+    }
+
+    private void requireTarget(String mgmt, String targetId) {
+        boolean exists;
+        if (targetId != null && targetId.startsWith("r-")) {
+            exists = rootStore.getForAccount(mgmt, targetId).isPresent();
+        } else if (targetId != null && targetId.startsWith("ou-")) {
+            exists = ouStore.getForAccount(mgmt, targetId).isPresent();
+        } else if (isAccountId(targetId)) {
+            exists = accountStore.getForAccount(mgmt, targetId).isPresent();
+        } else {
+            throw new AwsException("InvalidInputException",
+                    "You provided an invalid value for TargetId: " + targetId, 400);
+        }
+        if (!exists) {
+            throw new AwsException("TargetNotFoundException",
+                    "We can't find a root, OU, or account with the TargetId that you specified: "
+                            + targetId, 400);
+        }
+    }
+
+    private void requirePolicyTypeEnabled(String mgmt, String type) {
+        boolean enabled = rootStore.scanForAccount(mgmt, key -> true).stream()
+                .flatMap(root -> root.getPolicyTypes().stream())
+                .anyMatch(t -> type.equals(t.getType()) && "ENABLED".equals(t.getStatus()));
+        if (!enabled) {
+            throw new AwsException("PolicyTypeNotEnabledException",
+                    "The policy type " + type + " is not enabled on the root.", 400);
+        }
+    }
+
+    private static void requireValidPolicyType(String type) {
+        if (type == null || !POLICY_TYPES.contains(type)) {
+            throw new AwsException("InvalidInputException",
+                    "You provided an invalid value for policy type: " + type, 400);
+        }
+    }
+
+    private JsonNode parsePolicyContent(String content) {
+        try {
+            return mapper.readTree(content);
+        } catch (Exception e) {
+            throw new AwsException("MalformedPolicyDocumentException",
+                    "The policy content is not valid JSON.", 400);
+        }
+    }
+
+    private void validatePolicyContent(String content) {
+        if (content == null || content.isBlank()) {
+            throw new AwsException("InvalidInputException",
+                    "You provided an invalid value for Content.", 400);
+        }
+        JsonNode parsed = parsePolicyContent(content);
+        if (!parsed.isObject()) {
+            throw new AwsException("MalformedPolicyDocumentException",
+                    "The policy content must be a JSON object.", 400);
+        }
+    }
+
+    /** AWS managed policies carry the literal {@code aws} account and no org ID path segment. */
+    private static String policyArn(String mgmt, String orgId, String type, String policyId,
+                                    boolean awsManaged) {
+        String typeSegment = type.toLowerCase(java.util.Locale.ROOT);
+        if (awsManaged) {
+            return "arn:aws:organizations::aws:policy/" + typeSegment + "/" + policyId;
+        }
+        return "arn:aws:organizations::" + mgmt + ":policy/" + orgId + "/" + typeSegment + "/" + policyId;
     }
 
     // ---------------------------------------------------------------- shared lookups
