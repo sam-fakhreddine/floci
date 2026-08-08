@@ -189,4 +189,70 @@ class OrganizationsIntegrationTest {
             .statusCode(200)
             .body("Organization.Id", equalTo(orgId));
     }
+
+    @Test
+    @Order(9)
+    void scpLifecycleOverTheWire() {
+        String policyId = call("CreatePolicy")
+            .body("""
+                {
+                  "Name": "deny-s3",
+                  "Description": "no s3",
+                  "Type": "SERVICE_CONTROL_POLICY",
+                  "Content": "{\\"Version\\":\\"2012-10-17\\",\\"Statement\\":[{\\"Effect\\":\\"Deny\\",\\"Action\\":\\"s3:*\\",\\"Resource\\":\\"*\\"}]}"
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Policy.PolicySummary.Id", startsWith("p-"))
+            .body("Policy.PolicySummary.AwsManaged", equalTo(false))
+            .extract().path("Policy.PolicySummary.Id");
+
+        call("AttachPolicy")
+            .body("""
+                { "PolicyId": "%s", "TargetId": "%s" }
+                """.formatted(policyId, ouId))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        // FullAWSAccess was auto-attached at OU creation, so the OU now carries two SCPs.
+        call("ListPoliciesForTarget")
+            .body("""
+                { "TargetId": "%s", "Filter": "SERVICE_CONTROL_POLICY" }
+                """.formatted(ouId))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Policies", hasSize(2))
+            .body("Policies.Id", hasItem(policyId));
+
+        call("ListPolicies")
+            .body("""
+                { "Filter": "SERVICE_CONTROL_POLICY" }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Policies.Id", hasItem("p-FullAWSAccess"));
+    }
+
+    @Test
+    @Order(10)
+    void lastScpDetachIsRejectedWithTypedError() {
+        call("DetachPolicy")
+            .body("""
+                { "PolicyId": "p-FullAWSAccess", "TargetId": "%s" }
+                """.formatted(memberId))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("ConstraintViolationException"));
+    }
 }

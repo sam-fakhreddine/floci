@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.organizations.model.CreateAccountStatus;
 import io.github.hectorvent.floci.services.organizations.model.OrgAccount;
+import io.github.hectorvent.floci.services.organizations.model.OrgPolicy;
 import io.github.hectorvent.floci.services.organizations.model.OrgRoot;
 import io.github.hectorvent.floci.services.organizations.model.Organization;
 import io.github.hectorvent.floci.services.organizations.model.OrganizationalUnit;
@@ -30,7 +31,8 @@ class OrganizationsServiceTest {
     void setUp() {
         accountStore = backend();
         service = new OrganizationsService(
-                backend(), accountStore, backend(), backend(), backend());
+                backend(), accountStore, backend(), backend(), backend(), backend(),
+                new com.fasterxml.jackson.databind.ObjectMapper());
     }
 
     private static <V> AccountAwareStorageBackend<V> backend() {
@@ -269,5 +271,156 @@ class OrganizationsServiceTest {
         AwsException bad = assertThrows(AwsException.class,
                 () -> service.tagResource(MGMT, "not-a-resource", Map.of("a", "b")));
         assertEquals("InvalidInputException", bad.getErrorCode());
+    }
+
+    // ---------------------------------------------------------------- policies
+
+    private static final String DENY_S3 =
+            "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Deny\","
+                    + "\"Action\":\"s3:*\",\"Resource\":\"*\"}]}";
+
+    @Test
+    void createOrganizationSeedsFullAwsAccessOnRootAndManagement() {
+        service.createOrganization(MGMT, null);
+        String rootId = service.listRoots(MGMT).get(0).getId();
+
+        List<OrgPolicy> onRoot = service.listPoliciesForTarget(MGMT, rootId, "SERVICE_CONTROL_POLICY");
+        assertEquals(List.of("p-FullAWSAccess"), onRoot.stream().map(OrgPolicy::getId).toList());
+        assertTrue(onRoot.get(0).isAwsManaged());
+
+        List<OrgPolicy> onMgmt = service.listPoliciesForTarget(MGMT, MGMT, "SERVICE_CONTROL_POLICY");
+        assertEquals(1, onMgmt.size());
+    }
+
+    @Test
+    void newAccountsAndOusGetFullAwsAccessAutomatically() {
+        service.createOrganization(MGMT, null);
+        String rootId = service.listRoots(MGMT).get(0).getId();
+        String ouId = service.createOrganizationalUnit(MGMT, rootId, "workloads", null).getId();
+        String member = service.createAccount(MGMT, "member@example.com", "Member", null, false)
+                .getAccountId();
+
+        assertEquals(1, service.listPoliciesForTarget(MGMT, ouId, "SERVICE_CONTROL_POLICY").size());
+        assertEquals(1, service.listPoliciesForTarget(MGMT, member, "SERVICE_CONTROL_POLICY").size());
+    }
+
+    @Test
+    void policyCrudAndAttachmentLifecycle() {
+        service.createOrganization(MGMT, null);
+        String rootId = service.listRoots(MGMT).get(0).getId();
+        String ouId = service.createOrganizationalUnit(MGMT, rootId, "workloads", null).getId();
+
+        OrgPolicy policy = service.createPolicy(MGMT, "deny-s3", "no s3",
+                "SERVICE_CONTROL_POLICY", DENY_S3, Map.of("team", "sec"));
+        assertTrue(policy.getId().startsWith("p-"));
+        assertTrue(policy.getArn().contains("/service_control_policy/"));
+
+        AwsException duplicate = assertThrows(AwsException.class, () -> service.createPolicy(
+                MGMT, "deny-s3", null, "SERVICE_CONTROL_POLICY", DENY_S3, null));
+        assertEquals("DuplicatePolicyException", duplicate.getErrorCode());
+
+        service.attachPolicy(MGMT, policy.getId(), ouId);
+        AwsException again = assertThrows(AwsException.class,
+                () -> service.attachPolicy(MGMT, policy.getId(), ouId));
+        assertEquals("DuplicatePolicyAttachmentException", again.getErrorCode());
+
+        assertEquals(2, service.listPoliciesForTarget(MGMT, ouId, "SERVICE_CONTROL_POLICY").size());
+        assertEquals(List.of(ouId), service.listTargetsForPolicy(MGMT, policy.getId()).stream()
+                .map(OrganizationsService.TargetRef::targetId).toList());
+
+        AwsException inUse = assertThrows(AwsException.class,
+                () -> service.deletePolicy(MGMT, policy.getId()));
+        assertEquals("PolicyInUseException", inUse.getErrorCode());
+
+        service.detachPolicy(MGMT, policy.getId(), ouId);
+        service.deletePolicy(MGMT, policy.getId());
+        AwsException gone = assertThrows(AwsException.class,
+                () -> service.describePolicy(MGMT, policy.getId()));
+        assertEquals("PolicyNotFoundException", gone.getErrorCode());
+    }
+
+    @Test
+    void lastScpCannotBeDetachedAndAwsManagedIsProtected() {
+        service.createOrganization(MGMT, null);
+        String rootId = service.listRoots(MGMT).get(0).getId();
+
+        AwsException lastScp = assertThrows(AwsException.class,
+                () -> service.detachPolicy(MGMT, "p-FullAWSAccess", rootId));
+        assertEquals("ConstraintViolationException", lastScp.getErrorCode());
+
+        AwsException deleteManaged = assertThrows(AwsException.class,
+                () -> service.deletePolicy(MGMT, "p-FullAWSAccess"));
+        assertEquals("ConstraintViolationException", deleteManaged.getErrorCode());
+
+        AwsException updateManaged = assertThrows(AwsException.class,
+                () -> service.updatePolicy(MGMT, "p-FullAWSAccess", "renamed", null, null));
+        assertEquals("ConstraintViolationException", updateManaged.getErrorCode());
+    }
+
+    @Test
+    void policyTypeEnablementGatesAttachment() {
+        service.createOrganization(MGMT, null);
+        String rootId = service.listRoots(MGMT).get(0).getId();
+        OrgPolicy tagPolicy = service.createPolicy(MGMT, "tags", null, "TAG_POLICY",
+                "{\"tags\":{}}", null);
+
+        AwsException notEnabled = assertThrows(AwsException.class,
+                () -> service.attachPolicy(MGMT, tagPolicy.getId(), rootId));
+        assertEquals("PolicyTypeNotEnabledException", notEnabled.getErrorCode());
+
+        service.enablePolicyType(MGMT, rootId, "TAG_POLICY");
+        service.attachPolicy(MGMT, tagPolicy.getId(), rootId);
+
+        AwsException alreadyEnabled = assertThrows(AwsException.class,
+                () -> service.enablePolicyType(MGMT, rootId, "TAG_POLICY"));
+        assertEquals("PolicyTypeAlreadyEnabledException", alreadyEnabled.getErrorCode());
+
+        // Disabling detaches every policy of that type.
+        service.disablePolicyType(MGMT, rootId, "TAG_POLICY");
+        assertTrue(service.listTargetsForPolicy(MGMT, tagPolicy.getId()).isEmpty());
+    }
+
+    @Test
+    void effectivePolicyMergesInheritanceOperators() {
+        service.createOrganization(MGMT, null);
+        String rootId = service.listRoots(MGMT).get(0).getId();
+        String ouId = service.createOrganizationalUnit(MGMT, rootId, "workloads", null).getId();
+        String member = service.createAccount(MGMT, "member@example.com", "Member", null, false)
+                .getAccountId();
+        service.moveAccount(MGMT, member, rootId, ouId);
+        service.enablePolicyType(MGMT, rootId, "TAG_POLICY");
+
+        String rootPolicy = "{\"tags\":{\"costcenter\":{\"tag_key\":{\"@@assign\":\"CostCenter\"},"
+                + "\"tag_value\":{\"@@assign\":[\"100\",\"200\"]}}}}";
+        String ouPolicy = "{\"tags\":{\"costcenter\":{\"tag_value\":{\"@@append\":[\"300\"]}}}}";
+
+        String rootPolicyId = service.createPolicy(MGMT, "root-tags", null, "TAG_POLICY", rootPolicy, null).getId();
+        String ouPolicyId = service.createPolicy(MGMT, "ou-tags", null, "TAG_POLICY", ouPolicy, null).getId();
+        service.attachPolicy(MGMT, rootPolicyId, rootId);
+        service.attachPolicy(MGMT, ouPolicyId, ouId);
+
+        OrganizationsService.EffectivePolicy effective =
+                service.describeEffectivePolicy(MGMT, "TAG_POLICY", member);
+        assertEquals(member, effective.targetId());
+        assertTrue(effective.policyContent().contains("\"CostCenter\""));
+        assertTrue(effective.policyContent().contains("\"300\""));
+        assertTrue(effective.policyContent().contains("\"100\""));
+
+        AwsException scp = assertThrows(AwsException.class,
+                () -> service.describeEffectivePolicy(MGMT, "SERVICE_CONTROL_POLICY", member));
+        assertEquals("InvalidInputException", scp.getErrorCode());
+
+        AwsException none = assertThrows(AwsException.class,
+                () -> service.describeEffectivePolicy(MGMT, "BACKUP_POLICY", member));
+        assertEquals("EffectivePolicyNotFoundException", none.getErrorCode());
+    }
+
+    @Test
+    void policyTagsAreTaggable() {
+        service.createOrganization(MGMT, null);
+        String policyId = service.createPolicy(MGMT, "deny-s3", null,
+                "SERVICE_CONTROL_POLICY", DENY_S3, null).getId();
+        service.tagResource(MGMT, policyId, Map.of("env", "test"));
+        assertEquals("test", service.tagsForResource(MGMT, policyId).get("env"));
     }
 }
