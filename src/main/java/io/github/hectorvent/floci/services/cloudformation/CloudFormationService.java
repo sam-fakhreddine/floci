@@ -1103,12 +1103,19 @@ public class CloudFormationService {
         Set<String> allIds = new LinkedHashSet<>();
         resources.fieldNames().forEachRemaining(allIds::add);
 
+        // Resources whose Condition evaluates false are not created at all. They must be
+        // dropped from the sort output too: leaving them in the queue seeding or the
+        // cycle-leftover tail below would provision them first (in-degree 0) with any
+        // Fn::GetAtt references unresolved.
+        Set<String> excluded = new HashSet<>();
+
         Map<String, Set<String>> dependencies = new HashMap<>();
         for (String logicalId : allIds) {
             JsonNode resDef = resources.get(logicalId);
 
             String condition = resDef.path("Condition").asText(null);
             if (condition != null && !conditions.getOrDefault(condition, false)) {
+                excluded.add(logicalId);
                 continue;
             }
 
@@ -1141,7 +1148,7 @@ public class CloudFormationService {
 
         Deque<String> queue = new ArrayDeque<>();
         for (String id : allIds) {
-            if (inDegree.get(id) == 0) {
+            if (!excluded.contains(id) && inDegree.get(id) == 0) {
                 queue.add(id);
             }
         }
@@ -1162,7 +1169,7 @@ public class CloudFormationService {
         }
 
         for (String id : allIds) {
-            if (!sorted.contains(id)) {
+            if (!excluded.contains(id) && !sorted.contains(id)) {
                 sorted.add(id);
             }
         }
