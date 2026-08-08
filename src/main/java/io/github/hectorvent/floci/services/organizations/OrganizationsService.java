@@ -8,7 +8,9 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.organizations.model.CreateAccountStatus;
+import io.github.hectorvent.floci.services.organizations.model.Handshake;
 import io.github.hectorvent.floci.services.organizations.model.OrgAccount;
 import io.github.hectorvent.floci.services.organizations.model.OrgPolicy;
 import io.github.hectorvent.floci.services.organizations.model.OrgRoot;
@@ -63,17 +65,23 @@ public class OrganizationsService {
             "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
                     + "\"Action\":\"*\",\"Resource\":\"*\"}]}";
 
+    /** Handshakes expire 15 days after creation, matching AWS. */
+    private static final double HANDSHAKE_TTL_SECONDS = 15 * 24 * 3600;
+
     private final AccountAwareStorageBackend<Organization> organizationStore;
     private final AccountAwareStorageBackend<OrgAccount> accountStore;
     private final AccountAwareStorageBackend<OrgRoot> rootStore;
     private final AccountAwareStorageBackend<OrganizationalUnit> ouStore;
     private final AccountAwareStorageBackend<CreateAccountStatus> accountStatusStore;
     private final AccountAwareStorageBackend<OrgPolicy> policyStore;
+    private final AccountAwareStorageBackend<Handshake> handshakeStore;
     private final ObjectMapper mapper;
+    /** Nullable in unit tests: role provisioning on CreateAccount is best-effort. */
+    private final IamService iamService;
 
     @Inject
     @SuppressWarnings("unchecked")
-    public OrganizationsService(StorageFactory storageFactory, ObjectMapper mapper) {
+    public OrganizationsService(StorageFactory storageFactory, ObjectMapper mapper, IamService iamService) {
         this((AccountAwareStorageBackend<Organization>) storageFactory.create(
                         "organizations", "org-organizations.json", new TypeReference<Map<String, Organization>>() {}),
                 (AccountAwareStorageBackend<OrgAccount>) storageFactory.create(
@@ -87,7 +95,9 @@ public class OrganizationsService {
                         new TypeReference<Map<String, CreateAccountStatus>>() {}),
                 (AccountAwareStorageBackend<OrgPolicy>) storageFactory.create(
                         "organizations", "org-policies.json", new TypeReference<Map<String, OrgPolicy>>() {}),
-                mapper);
+                (AccountAwareStorageBackend<Handshake>) storageFactory.create(
+                        "organizations", "org-handshakes.json", new TypeReference<Map<String, Handshake>>() {}),
+                mapper, iamService);
     }
 
     OrganizationsService(AccountAwareStorageBackend<Organization> organizationStore,
@@ -96,14 +106,17 @@ public class OrganizationsService {
                          AccountAwareStorageBackend<OrganizationalUnit> ouStore,
                          AccountAwareStorageBackend<CreateAccountStatus> accountStatusStore,
                          AccountAwareStorageBackend<OrgPolicy> policyStore,
-                         ObjectMapper mapper) {
+                         AccountAwareStorageBackend<Handshake> handshakeStore,
+                         ObjectMapper mapper, IamService iamService) {
         this.organizationStore = organizationStore;
         this.accountStore = accountStore;
         this.rootStore = rootStore;
         this.ouStore = ouStore;
         this.accountStatusStore = accountStatusStore;
         this.policyStore = policyStore;
+        this.handshakeStore = handshakeStore;
         this.mapper = mapper;
+        this.iamService = iamService;
     }
 
     /** The caller's organization plus which namespace owns it. */
@@ -233,6 +246,9 @@ public class OrganizationsService {
         for (String key : policyStore.keysForAccount(mgmt)) {
             policyStore.deleteForAccount(mgmt, key);
         }
+        for (String key : handshakeStore.keysForAccount(mgmt)) {
+            handshakeStore.deleteForAccount(mgmt, key);
+        }
         organizationStore.deleteForAccount(mgmt, ORG_KEY);
         LOG.infov("DeleteOrganization: {0}", ctx.org().getId());
     }
@@ -240,7 +256,7 @@ public class OrganizationsService {
     // ---------------------------------------------------------------- accounts
 
     public CreateAccountStatus createAccount(String callerAccount, String email, String accountName,
-                                             Map<String, String> tags, boolean govCloud) {
+                                             String roleName, Map<String, String> tags, boolean govCloud) {
         OrgContext ctx = requireManagement(callerAccount);
         if (email == null || !email.contains("@")) {
             throw new AwsException("InvalidInputException",
@@ -268,6 +284,7 @@ public class OrganizationsService {
         }
         accountStore.putForAccount(mgmt, accountId, account);
         attachFullAwsAccessIfScpEnabled(mgmt, accountId);
+        provisionAccountAccessRole(mgmt, accountId, roleName);
 
         CreateAccountStatus status = new CreateAccountStatus();
         status.setId("car-" + randomId(24));
@@ -1005,6 +1022,413 @@ public class OrganizationsService {
             return "arn:aws:organizations::aws:policy/" + typeSegment + "/" + policyId;
         }
         return "arn:aws:organizations::" + mgmt + ":policy/" + orgId + "/" + typeSegment + "/" + policyId;
+    }
+
+    // ---------------------------------------------------------------- handshakes
+
+    public Handshake inviteAccountToOrganization(String callerAccount, String targetId,
+                                                 String targetType, String notes) {
+        OrgContext ctx = requireManagement(callerAccount);
+        String mgmt = ctx.managementAccount();
+        if ("EMAIL".equals(targetType)) {
+            throw new AwsException("InvalidInputException",
+                    "EMAIL targets are not supported by the emulator; invite by ACCOUNT ID.", 400);
+        }
+        if (!isAccountId(targetId)) {
+            throw new AwsException("InvalidInputException",
+                    "You provided an invalid value for Target.Id: " + targetId, 400);
+        }
+        if (accountStore.getForAccount(mgmt, targetId).isPresent()) {
+            throw new AwsException("ConstraintViolationException",
+                    "The account is already a member of the organization.", 400);
+        }
+        boolean openInvite = handshakes(mgmt).stream()
+                .anyMatch(h -> "INVITE".equals(h.getAction())
+                        && targetId.equals(h.getTargetAccountId())
+                        && "OPEN".equals(h.effectiveState(now())));
+        if (openInvite) {
+            throw new AwsException("DuplicateHandshakeException",
+                    "An open invitation for the account already exists.", 400);
+        }
+        Handshake handshake = newHandshake(ctx, "INVITE", targetId, null);
+        handshake.setNotes(notes);
+        handshakeStore.putForAccount(mgmt, handshake.getId(), handshake);
+        LOG.infov("InviteAccountToOrganization: {0} invited to {1}", targetId, ctx.org().getId());
+        return handshake;
+    }
+
+    public Handshake acceptHandshake(String callerAccount, String handshakeId) {
+        HandshakeRef ref = requireHandshakeAnywhere(handshakeId);
+        Handshake handshake = ref.handshake();
+        String mgmt = ref.managementAccount();
+        requireOpen(handshake);
+        if (!callerAccount.equals(handshake.getTargetAccountId())) {
+            throw new AwsException("AccessDeniedException",
+                    "Only the invited account can accept the handshake.", 400);
+        }
+        switch (handshake.getAction()) {
+            case "INVITE" -> acceptInvite(mgmt, handshake, callerAccount);
+            case "APPROVE_ALL_FEATURES" -> acceptAllFeaturesApproval(mgmt, handshake);
+            default -> throw new AwsException("InvalidHandshakeTransitionException",
+                    "The handshake can't be accepted directly.", 400);
+        }
+        handshake.setState("ACCEPTED");
+        handshakeStore.putForAccount(mgmt, handshake.getId(), handshake);
+        return handshake;
+    }
+
+    private void acceptInvite(String mgmt, Handshake handshake, String callerAccount) {
+        if (organizationStore.getForAccount(callerAccount, ORG_KEY).isPresent()) {
+            throw new AwsException("HandshakeConstraintViolationException",
+                    "The invited account is already the management account of another organization.", 400);
+        }
+        for (OrgAccount member : accountStore.scanAllAccounts()) {
+            if (member.getId().equals(callerAccount)) {
+                throw new AwsException("HandshakeConstraintViolationException",
+                        "The invited account is already a member of an organization.", 400);
+            }
+        }
+        Organization org = organizationStore.getForAccount(mgmt, ORG_KEY)
+                .orElseThrow(() -> new AwsException("AWSOrganizationsNotInUseException",
+                        "The inviting organization no longer exists.", 400));
+        OrgAccount account = new OrgAccount();
+        account.setId(callerAccount);
+        account.setArn(arn(mgmt, "account/" + org.getId() + "/" + callerAccount));
+        account.setName("Account " + callerAccount);
+        account.setEmail("account+" + callerAccount + "@example.com");
+        account.setStatus(STATUS_ACTIVE);
+        account.setJoinedMethod("INVITED");
+        account.setJoinedTimestamp(now());
+        account.setParentId(rootId(mgmt));
+        account.setManagementAccountId(mgmt);
+        accountStore.putForAccount(mgmt, callerAccount, account);
+        attachFullAwsAccessIfScpEnabled(mgmt, callerAccount);
+    }
+
+    private void acceptAllFeaturesApproval(String mgmt, Handshake approval) {
+        boolean allOthersAccepted = handshakes(mgmt).stream()
+                .filter(h -> "APPROVE_ALL_FEATURES".equals(h.getAction())
+                        && approval.getParentHandshakeId() != null
+                        && approval.getParentHandshakeId().equals(h.getParentHandshakeId())
+                        && !h.getId().equals(approval.getId()))
+                .allMatch(h -> "ACCEPTED".equals(h.getState()));
+        if (allOthersAccepted) {
+            finalizeAllFeatures(mgmt, approval.getParentHandshakeId());
+        }
+    }
+
+    private void finalizeAllFeatures(String mgmt, String parentHandshakeId) {
+        Organization org = organizationStore.getForAccount(mgmt, ORG_KEY).orElseThrow();
+        org.setFeatureSet("ALL");
+        if (org.getAvailablePolicyTypes().stream().noneMatch(t -> SCP_TYPE.equals(t.getType()))) {
+            org.getAvailablePolicyTypes().add(new PolicyTypeSummary(SCP_TYPE, "ENABLED"));
+        }
+        organizationStore.putForAccount(mgmt, ORG_KEY, org);
+
+        String rootId = rootId(mgmt);
+        OrgRoot root = requireRoot(mgmt, rootId);
+        if (root.getPolicyTypes().stream().noneMatch(t -> SCP_TYPE.equals(t.getType()))) {
+            root.getPolicyTypes().add(new PolicyTypeSummary(SCP_TYPE, "ENABLED"));
+            rootStore.putForAccount(mgmt, rootId, root);
+        }
+        List<String> nodes = new ArrayList<>();
+        nodes.add(rootId);
+        organizationalUnits(mgmt).forEach(ou -> nodes.add(ou.getId()));
+        memberAccounts(mgmt).forEach(a -> nodes.add(a.getId()));
+        seedFullAwsAccess(mgmt, nodes.stream()
+                .filter(node -> policiesForTarget(mgmt, node, SCP_TYPE).isEmpty())
+                .toList());
+
+        if (parentHandshakeId != null) {
+            handshakeStore.getForAccount(mgmt, parentHandshakeId).ifPresent(parent -> {
+                parent.setState("ACCEPTED");
+                handshakeStore.putForAccount(mgmt, parentHandshakeId, parent);
+            });
+        }
+        LOG.infov("EnableAllFeatures finalized for organization {0}", org.getId());
+    }
+
+    public Handshake declineHandshake(String callerAccount, String handshakeId) {
+        HandshakeRef ref = requireHandshakeAnywhere(handshakeId);
+        Handshake handshake = ref.handshake();
+        requireOpen(handshake);
+        if (!callerAccount.equals(handshake.getTargetAccountId())) {
+            throw new AwsException("AccessDeniedException",
+                    "Only the recipient account can decline the handshake.", 400);
+        }
+        handshake.setState("DECLINED");
+        handshakeStore.putForAccount(ref.managementAccount(), handshakeId, handshake);
+        return handshake;
+    }
+
+    public Handshake cancelHandshake(String callerAccount, String handshakeId) {
+        OrgContext ctx = requireManagement(callerAccount);
+        String mgmt = ctx.managementAccount();
+        Handshake handshake = handshakeStore.getForAccount(mgmt, handshakeId)
+                .orElseThrow(OrganizationsService::handshakeNotFound);
+        requireOpen(handshake);
+        handshake.setState("CANCELED");
+        handshakeStore.putForAccount(mgmt, handshakeId, handshake);
+        return handshake;
+    }
+
+    public Handshake describeHandshake(String callerAccount, String handshakeId) {
+        HandshakeRef ref = requireHandshakeAnywhere(handshakeId);
+        Handshake handshake = ref.handshake();
+        if (!callerAccount.equals(handshake.getTargetAccountId())
+                && !callerAccount.equals(ref.managementAccount())) {
+            throw new AwsException("AccessDeniedException",
+                    "You are not a party to the handshake.", 400);
+        }
+        return handshake;
+    }
+
+    public List<Handshake> listHandshakesForAccount(String callerAccount, String actionTypeFilter) {
+        return handshakeStore.scanAllAccounts().stream()
+                .filter(h -> callerAccount.equals(h.getTargetAccountId())
+                        || callerAccount.equals(h.getManagementAccountId()))
+                .filter(h -> actionTypeFilter == null || actionTypeFilter.equals(h.getAction()))
+                .sorted(Comparator.comparing(Handshake::getId))
+                .toList();
+    }
+
+    public List<Handshake> listHandshakesForOrganization(String callerAccount, String actionTypeFilter) {
+        OrgContext ctx = requireManagement(callerAccount);
+        return handshakes(ctx.managementAccount()).stream()
+                .filter(h -> actionTypeFilter == null || actionTypeFilter.equals(h.getAction()))
+                .toList();
+    }
+
+    public Handshake enableAllFeatures(String callerAccount) {
+        OrgContext ctx = requireManagement(callerAccount);
+        String mgmt = ctx.managementAccount();
+        if ("ALL".equals(ctx.org().getFeatureSet())) {
+            throw new AwsException("HandshakeConstraintViolationException",
+                    "The organization already has all features enabled.", 400);
+        }
+        Handshake parent = newHandshake(ctx, "ENABLE_ALL_FEATURES", mgmt, null);
+        List<OrgAccount> members = memberAccounts(mgmt).stream()
+                .filter(a -> !a.getId().equals(mgmt))
+                .toList();
+        if (members.isEmpty()) {
+            parent.setState("ACCEPTED");
+            handshakeStore.putForAccount(mgmt, parent.getId(), parent);
+            finalizeAllFeatures(mgmt, null);
+            return parent;
+        }
+        handshakeStore.putForAccount(mgmt, parent.getId(), parent);
+        for (OrgAccount member : members) {
+            Handshake approval = newHandshake(ctx, "APPROVE_ALL_FEATURES", member.getId(), parent.getId());
+            handshakeStore.putForAccount(mgmt, approval.getId(), approval);
+        }
+        return parent;
+    }
+
+    private Handshake newHandshake(OrgContext ctx, String action, String targetAccountId,
+                                   String parentHandshakeId) {
+        String mgmt = ctx.managementAccount();
+        Handshake handshake = new Handshake();
+        handshake.setId("h-" + randomId(8));
+        handshake.setArn(arn(mgmt, "handshake/" + ctx.org().getId() + "/"
+                + action.toLowerCase(java.util.Locale.ROOT) + "/" + handshake.getId()));
+        handshake.setState("OPEN");
+        handshake.setAction(action);
+        handshake.setRequestedTimestamp(now());
+        handshake.setExpirationTimestamp(now() + HANDSHAKE_TTL_SECONDS);
+        handshake.setTargetAccountId(targetAccountId);
+        handshake.setManagementAccountId(mgmt);
+        handshake.setOrgId(ctx.org().getId());
+        handshake.setParentHandshakeId(parentHandshakeId);
+        return handshake;
+    }
+
+    private record HandshakeRef(Handshake handshake, String managementAccount) {}
+
+    private HandshakeRef requireHandshakeAnywhere(String handshakeId) {
+        for (Map.Entry<String, Handshake> entry : handshakeStore.scanAllAccountsAsMap().entrySet()) {
+            Handshake handshake = entry.getValue();
+            if (handshakeId.equals(handshake.getId())) {
+                return new HandshakeRef(handshake, handshake.getManagementAccountId());
+            }
+        }
+        throw handshakeNotFound();
+    }
+
+    private static AwsException handshakeNotFound() {
+        return new AwsException("HandshakeNotFoundException",
+                "We can't find a handshake with the HandshakeId that you specified.", 400);
+    }
+
+    private void requireOpen(Handshake handshake) {
+        String state = handshake.effectiveState(now());
+        if (!"OPEN".equals(state)) {
+            throw new AwsException("HandshakeAlreadyInStateException",
+                    "The handshake is already " + state + ".", 400);
+        }
+    }
+
+    List<Handshake> handshakes(String mgmt) {
+        return handshakeStore.scanForAccount(mgmt, key -> true).stream()
+                .sorted(Comparator.comparing(Handshake::getId))
+                .toList();
+    }
+
+    // ---------------------------------------------------------------- delegated administrators
+
+    public void registerDelegatedAdministrator(String callerAccount, String accountId,
+                                               String servicePrincipal) {
+        OrgContext ctx = requireManagement(callerAccount);
+        String mgmt = ctx.managementAccount();
+        requireServicePrincipal(servicePrincipal);
+        OrgAccount account = requireAccount(mgmt, accountId);
+        if (accountId.equals(mgmt)) {
+            throw new AwsException("ConstraintViolationException",
+                    "You can't register the management account as a delegated administrator.", 400);
+        }
+        if (!ctx.org().getEnabledServicePrincipals().containsKey(servicePrincipal)) {
+            throw new AwsException("ConstraintViolationException",
+                    "Enable trusted access for " + servicePrincipal
+                            + " before registering a delegated administrator.", 400);
+        }
+        if (account.getDelegatedServices().containsKey(servicePrincipal)) {
+            throw new AwsException("AccountAlreadyRegisteredException",
+                    "The account is already a delegated administrator for the service.", 400);
+        }
+        account.getDelegatedServices().put(servicePrincipal, now());
+        accountStore.putForAccount(mgmt, accountId, account);
+    }
+
+    public void deregisterDelegatedAdministrator(String callerAccount, String accountId,
+                                                 String servicePrincipal) {
+        OrgContext ctx = requireManagement(callerAccount);
+        String mgmt = ctx.managementAccount();
+        requireServicePrincipal(servicePrincipal);
+        OrgAccount account = requireAccount(mgmt, accountId);
+        if (account.getDelegatedServices().remove(servicePrincipal) == null) {
+            throw new AwsException("AccountNotRegisteredException",
+                    "The account is not a delegated administrator for the service.", 400);
+        }
+        accountStore.putForAccount(mgmt, accountId, account);
+    }
+
+    public List<OrgAccount> listDelegatedAdministrators(String callerAccount, String servicePrincipal) {
+        OrgContext ctx = resolveOrg(callerAccount);
+        return memberAccounts(ctx.managementAccount()).stream()
+                .filter(a -> servicePrincipal == null
+                        ? !a.getDelegatedServices().isEmpty()
+                        : a.getDelegatedServices().containsKey(servicePrincipal))
+                .toList();
+    }
+
+    public Map<String, Double> listDelegatedServicesForAccount(String callerAccount, String accountId) {
+        OrgContext ctx = resolveOrg(callerAccount);
+        OrgAccount account = requireAccount(ctx.managementAccount(), accountId);
+        if (account.getDelegatedServices().isEmpty()) {
+            throw new AwsException("AccountNotRegisteredException",
+                    "The account is not a delegated administrator for any service.", 400);
+        }
+        return account.getDelegatedServices();
+    }
+
+    // ---------------------------------------------------------------- AWS service access
+
+    public void enableAwsServiceAccess(String callerAccount, String servicePrincipal) {
+        OrgContext ctx = requireManagement(callerAccount);
+        requireServicePrincipal(servicePrincipal);
+        Organization org = ctx.org();
+        org.getEnabledServicePrincipals().putIfAbsent(servicePrincipal, now());
+        organizationStore.putForAccount(ctx.managementAccount(), ORG_KEY, org);
+    }
+
+    public void disableAwsServiceAccess(String callerAccount, String servicePrincipal) {
+        OrgContext ctx = requireManagement(callerAccount);
+        String mgmt = ctx.managementAccount();
+        requireServicePrincipal(servicePrincipal);
+        Organization org = ctx.org();
+        org.getEnabledServicePrincipals().remove(servicePrincipal);
+        organizationStore.putForAccount(mgmt, ORG_KEY, org);
+        // Disabling trusted access also revokes the service's delegated administrators.
+        for (OrgAccount account : memberAccounts(mgmt)) {
+            if (account.getDelegatedServices().remove(servicePrincipal) != null) {
+                accountStore.putForAccount(mgmt, account.getId(), account);
+            }
+        }
+    }
+
+    public Map<String, Double> listAwsServiceAccessForOrganization(String callerAccount) {
+        return resolveOrg(callerAccount).org().getEnabledServicePrincipals();
+    }
+
+    private static void requireServicePrincipal(String servicePrincipal) {
+        if (servicePrincipal == null || servicePrincipal.isBlank() || !servicePrincipal.contains(".")) {
+            throw new AwsException("InvalidInputException",
+                    "You provided an invalid value for ServicePrincipal: " + servicePrincipal, 400);
+        }
+    }
+
+    // ---------------------------------------------------------------- resource policy
+
+    /** The organization's resource-based delegation policy. */
+    record ResourcePolicy(String id, String arn, String content) {}
+
+    public ResourcePolicy putResourcePolicy(String callerAccount, String content,
+                                            Map<String, String> tags) {
+        OrgContext ctx = requireManagement(callerAccount);
+        String mgmt = ctx.managementAccount();
+        validatePolicyContent(content);
+        Organization org = ctx.org();
+        if (org.getResourcePolicyId() == null) {
+            org.setResourcePolicyId("rp-" + randomId(8));
+        }
+        org.setResourcePolicyContent(content);
+        if (tags != null) {
+            org.getResourcePolicyTags().putAll(tags);
+        }
+        organizationStore.putForAccount(mgmt, ORG_KEY, org);
+        return resourcePolicyOf(org, mgmt);
+    }
+
+    public ResourcePolicy describeResourcePolicy(String callerAccount) {
+        OrgContext ctx = resolveOrg(callerAccount);
+        Organization org = ctx.org();
+        if (org.getResourcePolicyId() == null) {
+            throw new AwsException("ResourcePolicyNotFoundException",
+                    "The organization has no resource policy.", 400);
+        }
+        return resourcePolicyOf(org, ctx.managementAccount());
+    }
+
+    public void deleteResourcePolicy(String callerAccount) {
+        OrgContext ctx = requireManagement(callerAccount);
+        Organization org = ctx.org();
+        if (org.getResourcePolicyId() == null) {
+            throw new AwsException("ResourcePolicyNotFoundException",
+                    "The organization has no resource policy.", 400);
+        }
+        org.setResourcePolicyId(null);
+        org.setResourcePolicyContent(null);
+        org.getResourcePolicyTags().clear();
+        organizationStore.putForAccount(ctx.managementAccount(), ORG_KEY, org);
+    }
+
+    private ResourcePolicy resourcePolicyOf(Organization org, String mgmt) {
+        return new ResourcePolicy(org.getResourcePolicyId(),
+                arn(mgmt, "resourcepolicy/" + org.getId() + "/" + org.getResourcePolicyId()),
+                org.getResourcePolicyContent());
+    }
+
+    private void provisionAccountAccessRole(String mgmt, String accountId, String roleName) {
+        if (iamService == null) {
+            return;
+        }
+        String effectiveRoleName =
+                roleName == null || roleName.isBlank() ? "OrganizationAccountAccessRole" : roleName;
+        try {
+            iamService.provisionCrossAccountAdminRole(accountId, effectiveRoleName, mgmt);
+        } catch (Exception e) {
+            LOG.warnv("Could not provision {0} in account {1}: {2}",
+                    effectiveRoleName, accountId, e.getMessage());
+        }
     }
 
     // ---------------------------------------------------------------- shared lookups

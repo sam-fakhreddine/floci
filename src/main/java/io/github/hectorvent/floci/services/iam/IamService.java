@@ -371,6 +371,32 @@ public class IamService implements SessionAccountLookup {
     }
 
     /**
+     * Writes an administrator role directly into another account's namespace. Used by
+     * Organizations CreateAccount to provision the {@code OrganizationAccountAccessRole}
+     * in a freshly minted member account, the same role AWS creates there. The trust
+     * policy allows {@code trustedAccountId} (the management account) to assume the role.
+     *
+     * <p>Idempotent: an existing role with the same name is left untouched.</p>
+     */
+    public void provisionCrossAccountAdminRole(String accountId, String roleName, String trustedAccountId) {
+        if (!(roles instanceof AccountAwareStorageBackend<IamRole> aware)
+                || aware.getForAccount(accountId, roleName).isPresent()) {
+            return;
+        }
+        String trustPolicy = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
+                + "\"Principal\":{\"AWS\":\"arn:aws:iam::" + trustedAccountId + ":root\"},"
+                + "\"Action\":\"sts:AssumeRole\"}]}";
+        String arn = AwsArnUtils.Arn.of("iam", "", accountId, "role/" + roleName).toString();
+        IamRole role = new IamRole("AROA" + randomId(16), roleName, "/", arn, trustPolicy);
+        role.setDescription("Provisioned by Organizations CreateAccount");
+        role.getInlinePolicies().put("AdministratorAccess",
+                "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
+                        + "\"Action\":\"*\",\"Resource\":\"*\"}]}");
+        aware.putForAccount(accountId, roleName, role);
+        LOG.infov("Provisioned cross-account admin role {0} in account {1}", roleName, accountId);
+    }
+
+    /**
      * Looks up a role by name in a specific account's namespace, without throwing when absent.
      *
      * <p>Roles are account-namespaced, so a cross-account caller (e.g. STS AssumeRole) must resolve
