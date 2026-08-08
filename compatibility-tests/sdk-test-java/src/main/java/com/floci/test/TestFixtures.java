@@ -65,6 +65,7 @@ import software.amazon.awssdk.services.pipes.PipesClient;
 import software.amazon.awssdk.services.codebuild.CodeBuildClient;
 import software.amazon.awssdk.services.codedeploy.CodeDeployClient;
 import software.amazon.awssdk.services.codepipeline.CodePipelineClient;
+import software.amazon.awssdk.services.organizations.OrganizationsClient;
 import software.amazon.awssdk.services.ecs.EcsClient;
 import software.amazon.awssdk.services.eks.EksClient;
 import software.amazon.awssdk.services.iot.IotClient;
@@ -934,6 +935,20 @@ public final class TestFixtures {
                 .endpointOverride(ENDPOINT)
                 .region(REGION)
                 .credentialsProvider(CREDENTIALS)
+                .build();
+    }
+
+    /**
+     * Organizations is a management-account-scoped service: the calling credentials decide
+     * which account owns the organization, so tests use a 12-digit access key ID to get a
+     * dedicated management account instead of the shared default account.
+     */
+    public static OrganizationsClient organizationsClient(String accountId) {
+        return OrganizationsClient.builder()
+                .endpointOverride(ENDPOINT)
+                .region(REGION)
+                .credentialsProvider(StaticCredentialsProvider.create(
+                        AwsBasicCredentials.create(accountId, "test")))
                 .build();
     }
 

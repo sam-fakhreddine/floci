@@ -373,6 +373,11 @@
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>codepipeline</artifactId>
         </dependency>
+        <!-- Organizations client -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>organizations</artifactId>
+        </dependency>
         <!-- AWS Backup client -->
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
