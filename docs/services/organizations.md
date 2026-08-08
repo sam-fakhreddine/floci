@@ -88,6 +88,19 @@ ID against any other emulated service.
 | `FLOCI_STORAGE_SERVICES_ORGANIZATIONS_MODE` | inherits `FLOCI_STORAGE_MODE` | Storage mode override |
 | `FLOCI_STORAGE_SERVICES_ORGANIZATIONS_FLUSH_INTERVAL_MS` | `5000` | Hybrid/WAL flush interval |
 
+## SCP enforcement
+
+With `FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED=true` and
+`FLOCI_SERVICES_ORGANIZATIONS_SCP_ENFORCEMENT_ENABLED=true`, service control policies
+attached to the root, OUs, and accounts participate in IAM policy evaluation: an action
+must be allowed at every level of the account's chain and denied at none, before the
+caller's identity policies are consulted. SCPs never grant permissions on their own, and
+the management account is exempt — both matching AWS. See
+[IAM enforcement](iam.md#service-control-policies-scps) for the evaluation order.
+
+`DescribeEffectivePolicy` applies to the three non-SCP policy types and merges the
+inherited chain with the `@@assign`, `@@append`, and `@@remove` inheritance operators.
+
 ## Example
 
 ```bash
