@@ -811,6 +811,15 @@ public interface EmulatorConfig {
          */
         @WithDefault("false")
         boolean scpEnforcementEnabled();
+
+        /**
+         * Override for the management account's email. AWS derives it from the account that
+         * creates the organization; floci has no signup identity, so it otherwise synthesizes
+         * {@code management+<id>@example.com}. Tools that resolve accounts by email (e.g. the
+         * AWS Landing Zone Accelerator) need this to match their config. When empty, the
+         * synthetic default is used.
+         */
+        Optional<String> managementAccountEmail();
     }
 
     interface SsmServiceConfig {

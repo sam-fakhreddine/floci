@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -78,10 +79,20 @@ public class OrganizationsService {
     private final ObjectMapper mapper;
     /** Nullable in unit tests: role provisioning on CreateAccount is best-effort. */
     private final IamService iamService;
+    /**
+     * Optional override for the management account's email. AWS derives the management
+     * account email from the account that creates the organization; floci has no such
+     * signup identity, so when this is blank it falls back to a synthetic
+     * {@code management+<id>@example.com}. Tools that resolve accounts by email (e.g. the
+     * AWS Landing Zone Accelerator) require this to match their config, so operators can
+     * set it via {@code floci.services.organizations.management-account-email}.
+     */
+    private final String managementAccountEmailOverride;
 
     @Inject
     @SuppressWarnings("unchecked")
-    public OrganizationsService(StorageFactory storageFactory, ObjectMapper mapper, IamService iamService) {
+    public OrganizationsService(StorageFactory storageFactory, ObjectMapper mapper,
+                                IamService iamService, EmulatorConfig config) {
         this((AccountAwareStorageBackend<Organization>) storageFactory.create(
                         "organizations", "org-organizations.json", new TypeReference<Map<String, Organization>>() {}),
                 (AccountAwareStorageBackend<OrgAccount>) storageFactory.create(
@@ -97,7 +108,8 @@ public class OrganizationsService {
                         "organizations", "org-policies.json", new TypeReference<Map<String, OrgPolicy>>() {}),
                 (AccountAwareStorageBackend<Handshake>) storageFactory.create(
                         "organizations", "org-handshakes.json", new TypeReference<Map<String, Handshake>>() {}),
-                mapper, iamService);
+                mapper, iamService,
+                config.services().organizations().managementAccountEmail().orElse(null));
     }
 
     OrganizationsService(AccountAwareStorageBackend<Organization> organizationStore,
@@ -107,7 +119,8 @@ public class OrganizationsService {
                          AccountAwareStorageBackend<CreateAccountStatus> accountStatusStore,
                          AccountAwareStorageBackend<OrgPolicy> policyStore,
                          AccountAwareStorageBackend<Handshake> handshakeStore,
-                         ObjectMapper mapper, IamService iamService) {
+                         ObjectMapper mapper, IamService iamService,
+                         String managementAccountEmailOverride) {
         this.organizationStore = organizationStore;
         this.accountStore = accountStore;
         this.rootStore = rootStore;
@@ -117,6 +130,7 @@ public class OrganizationsService {
         this.handshakeStore = handshakeStore;
         this.mapper = mapper;
         this.iamService = iamService;
+        this.managementAccountEmailOverride = managementAccountEmailOverride;
     }
 
     /** The caller's organization plus which namespace owns it. */
@@ -1526,7 +1540,10 @@ public class OrganizationsService {
         return "arn:aws:organizations::" + managementAccount + ":" + resource;
     }
 
-    private static String defaultEmail(String accountId) {
+    private String defaultEmail(String accountId) {
+        if (managementAccountEmailOverride != null && !managementAccountEmailOverride.isBlank()) {
+            return managementAccountEmailOverride;
+        }
         return "management+" + accountId + "@example.com";
     }
 

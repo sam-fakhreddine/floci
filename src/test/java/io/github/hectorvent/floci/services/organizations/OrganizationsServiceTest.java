@@ -33,7 +33,14 @@ class OrganizationsServiceTest {
         accountStore = backend();
         service = new OrganizationsService(
                 backend(), accountStore, backend(), backend(), backend(), backend(), backend(),
-                new com.fasterxml.jackson.databind.ObjectMapper(), null);
+                new com.fasterxml.jackson.databind.ObjectMapper(), null, null);
+    }
+
+    /** Builds a service whose management account email is overridden. */
+    private OrganizationsService serviceWithManagementEmail(String email) {
+        return new OrganizationsService(
+                backend(), backend(), backend(), backend(), backend(), backend(), backend(),
+                new com.fasterxml.jackson.databind.ObjectMapper(), null, email);
     }
 
     private static <V> AccountAwareStorageBackend<V> backend() {
@@ -61,6 +68,25 @@ class OrganizationsServiceTest {
         assertEquals(1, accounts.size());
         assertEquals(MGMT, accounts.get(0).getId());
         assertEquals("CREATED", accounts.get(0).getJoinedMethod());
+    }
+
+    @Test
+    void createOrganizationUsesDefaultManagementEmailWhenUnconfigured() {
+        Organization org = service.createOrganization(MGMT, null);
+        assertEquals("management+" + MGMT + "@example.com", org.getManagementAccountEmail());
+        assertEquals("management+" + MGMT + "@example.com", service.listAccounts(MGMT).get(0).getEmail());
+    }
+
+    @Test
+    void createOrganizationUsesConfiguredManagementEmail() {
+        // Real deployments (e.g. AWS Landing Zone Accelerator) resolve the management
+        // account by matching the configured email against the Organizations account
+        // list. The operator must be able to set that email so it matches their config,
+        // instead of floci hardcoding an unusable example.com address.
+        OrganizationsService svc = serviceWithManagementEmail("aws-lza-management@floci.test");
+        Organization org = svc.createOrganization(MGMT, null);
+        assertEquals("aws-lza-management@floci.test", org.getManagementAccountEmail());
+        assertEquals("aws-lza-management@floci.test", svc.listAccounts(MGMT).get(0).getEmail());
     }
 
     @Test
