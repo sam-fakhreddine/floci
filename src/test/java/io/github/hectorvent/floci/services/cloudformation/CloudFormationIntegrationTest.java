@@ -3642,7 +3642,7 @@ class CloudFormationIntegrationTest {
     }
 
     @Test
-    void createStack_withPipe() {
+    void createStack_withPipe() throws Exception {
         String template = """
             {
               "Resources": {
@@ -3715,7 +3715,8 @@ class CloudFormationIntegrationTest {
             .body("DesiredState", equalTo("STOPPED"))
             .body("CurrentState", equalTo("STOPPED"));
 
-        // 4. Delete stack and verify pipe is cleaned up
+        // 4. Delete stack and verify pipe is cleaned up. DeleteStack runs asynchronously, so poll
+        // until the pipe is gone.
         given()
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "DeleteStack")
@@ -3725,12 +3726,20 @@ class CloudFormationIntegrationTest {
         .then()
             .statusCode(200);
 
-        given()
-            .contentType("application/json")
-        .when()
-            .get("/v1/pipes/cfn-test-pipe")
-        .then()
-            .statusCode(404);
+        int pipeStatus = 0;
+        for (int i = 0; i < 50; i++) {
+            pipeStatus = given()
+                .contentType("application/json")
+            .when()
+                .get("/v1/pipes/cfn-test-pipe")
+            .then()
+                .extract().statusCode();
+            if (pipeStatus == 404) {
+                break;
+            }
+            Thread.sleep(200);
+        }
+        assertThat(pipeStatus, equalTo(404));
     }
 
     // ── TemplateURL (path-style AWS S3) ──────────────────────────────────────

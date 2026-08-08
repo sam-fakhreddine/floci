@@ -105,6 +105,18 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
     }
 
     /**
+     * Returns every entry keyed by its raw stored key (account-prefixed, or un-prefixed for
+     * pre-multi-account data), so callers can recover the owning account on load.
+     */
+    public Map<String, V> entriesAllAccounts() {
+        Map<String, V> result = new LinkedHashMap<>();
+        for (String rawKey : delegate.keys()) {
+            delegate.get(rawKey).ifPresent(v -> result.put(rawKey, v));
+        }
+        return result;
+    }
+
+    /**
      * Returns all entries across every account as a map of logical-key (account prefix stripped)
      * to value. Entries without a slash-prefixed account segment are skipped.
      */

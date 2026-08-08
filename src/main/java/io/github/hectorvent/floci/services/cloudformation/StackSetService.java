@@ -244,7 +244,7 @@ public class StackSetService {
                                          String changeSetName, String changeSetType) {
         String stackName = instanceStackName(ss.getStackSetName(), account);
         cfnService.createChangeSet(stackName, changeSetName, changeSetType, ss.getTemplateBody(), null,
-                ss.getParameters(), ss.getCapabilities(), ss.getTags(), region);
+                ss.getParameters(), ss.getCapabilities(), ss.getTags(), region, account);
         await(cfnService.executeChangeSet(stackName, changeSetName, region, account));
 
         StackInstance inst = new StackInstance();
@@ -254,7 +254,7 @@ public class StackSetService {
         inst.setRegion(region);
         inst.setStackName(stackName);
         inst.setStackId(resolveStackId(stackName, region, account));
-        List<Stack> stacks = cfnService.describeStacks(stackName, region);
+        List<Stack> stacks = cfnService.describeStacks(stackName, region, account);
         String stackStatus = stacks.isEmpty() ? null : stacks.get(0).getStatus();
         // Only a clean create/update is a success. A failed resource rolls the stack back, so its
         // terminal status is ROLLBACK_COMPLETE (not *_FAILED) — treat anything that is not COMPLETE
@@ -270,7 +270,7 @@ public class StackSetService {
     }
 
     private String resolveStackId(String stackName, String region, String account) {
-        List<Stack> stacks = cfnService.describeStacks(stackName, region);
+        List<Stack> stacks = cfnService.describeStacks(stackName, region, account);
         if (!stacks.isEmpty() && stacks.get(0).getStackId() != null) {
             return stacks.get(0).getStackId();
         }

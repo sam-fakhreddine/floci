@@ -46,7 +46,7 @@ class StackSetServiceDeleteFailureTest {
         created.setStackName("StackSet-" + SET + "-" + ACCOUNT);
         created.setStackId("stack-id");
         created.setStatus("CREATE_COMPLETE");
-        when(cfnService.describeStacks(anyString(), anyString())).thenReturn(List.of(created));
+        when(cfnService.describeStacks(anyString(), anyString(), anyString())).thenReturn(List.of(created));
 
         service = new StackSetService(cfnService, new InMemoryStorageFactory());
         service.createStackSet(SET, "{\"Resources\":{}}", null, null, null, null);

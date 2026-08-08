@@ -46,7 +46,7 @@ public class CloudFormationService {
 
     private final ConcurrentHashMap<String, Stack> stacks = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, DeletedStackEntry> deletedStacks = new ConcurrentHashMap<>();
-    // Global exports registry: region:exportName -> exportValue
+    // Exports registry, per-account per-region as in AWS: account:region:exportName -> exportValue
     private final ConcurrentHashMap<String, String> exports = new ConcurrentHashMap<>();
     private final ExecutorService executor = Executors.newCachedThreadPool();
 
@@ -59,12 +59,13 @@ public class CloudFormationService {
     private final Clock clock;
 
     // Persisted state so stacks survive a restart (criteria #10, #11). The in-memory maps above are
-    // the live working copy; these backends are write-through + loaded on startup. CloudFormation is
-    // account-blind (keyed by stack+region), so everything is stored under one fixed account
-    // namespace for thread-consistent access from both request and background executor threads.
+    // the live working copy; these backends are write-through + loaded on startup. Entries are
+    // stored under the owning stack's account namespace via the explicit *ForAccount overloads so
+    // they stay consistent across request and background executor threads; legacy entries persisted
+    // without an account load into the default account.
     private final AccountAwareStorageBackend<Stack> stackBackend;
     private final AccountAwareStorageBackend<String> exportBackend;
-    private final String storageAccount;
+    private final String defaultAccount;
 
     @Inject
     public CloudFormationService(CloudFormationResourceProvisioner provisioner, S3Service s3Service,
@@ -78,7 +79,7 @@ public class CloudFormationService {
         this.regionResolver = regionResolver;
         this.samTransformProcessor = new SamTransformProcessor(objectMapper);
         this.clock = clock;
-        this.storageAccount = config.defaultAccountId();
+        this.defaultAccount = config.defaultAccountId();
         this.stackBackend = asAccountAware(storageFactory.create(
                 "cloudformation", "cloudformation-stacks.json", new TypeReference<Map<String, Stack>>() {}));
         this.exportBackend = asAccountAware(storageFactory.create(
@@ -91,12 +92,18 @@ public class CloudFormationService {
 
     @PostConstruct
     void loadPersistedState() {
-        for (Stack stack : stackBackend.scanForAccount(storageAccount, k -> true)) {
-            stacks.put(key(stack.getStackName(), stack.getRegion()), stack);
+        for (Stack stack : stackBackend.scanAllAccounts()) {
+            if (stack.getAccountId() == null) {
+                stack.setAccountId(defaultAccount);
+            }
+            stacks.put(key(stack.getAccountId(), stack.getStackName(), stack.getRegion()), stack);
         }
-        for (String exportKey : exportBackend.keysForAccount(storageAccount)) {
-            exportBackend.getForAccount(storageAccount, exportKey)
-                    .ifPresent(value -> exports.put(exportKey, value));
+        for (var entry : exportBackend.entriesAllAccounts().entrySet()) {
+            String rawKey = entry.getKey();
+            int slash = rawKey.indexOf('/');
+            String account = slash > 0 ? rawKey.substring(0, slash) : defaultAccount;
+            String logicalKey = slash > 0 ? rawKey.substring(slash + 1) : rawKey;
+            exports.put(account + ":" + logicalKey, entry.getValue());
         }
         if (!stacks.isEmpty() || !exports.isEmpty()) {
             LOG.infov("Loaded {0} CloudFormation stack(s) and {1} export(s) from storage",
@@ -105,11 +112,13 @@ public class CloudFormationService {
     }
 
     private void persistStack(Stack stack) {
-        stackBackend.putForAccount(storageAccount, key(stack.getStackName(), stack.getRegion()), stack);
+        stackBackend.putForAccount(stack.getAccountId(),
+                storageKey(stack.getStackName(), stack.getRegion()), stack);
     }
 
-    private void unpersistStack(String stackName, String region) {
-        stackBackend.deleteForAccount(storageAccount, key(stackName, region));
+    private void unpersistStack(Stack stack) {
+        stackBackend.deleteForAccount(stack.getAccountId(),
+                storageKey(stack.getStackName(), stack.getRegion()));
     }
 
     /**
@@ -117,7 +126,7 @@ public class CloudFormationService {
      * Returns the stack so the caller can echo its {@code StackId}.
      */
     public Stack updateTerminationProtection(String stackName, boolean enabled, String region) {
-        Stack stack = getStackOrThrow(stackName, region);
+        Stack stack = getStackOrThrow(stackName, region, regionResolver.getAccountId());
         stack.setEnableTerminationProtection(enabled);
         persistStack(stack);
         return stack;
@@ -126,8 +135,12 @@ public class CloudFormationService {
     // ── DescribeStacks ────────────────────────────────────────────────────────
 
     public List<Stack> describeStacks(String stackName, String region) {
+        return describeStacks(stackName, region, regionResolver.getAccountId());
+    }
+
+    public List<Stack> describeStacks(String stackName, String region, String accountId) {
         if (stackName != null && !stackName.isBlank()) {
-            Stack stack = resolveStackForDescribe(stackName, region);
+            Stack stack = resolveStackForDescribe(stackName, region, accountId);
             if (stack == null) {
                 throw new AwsException("ValidationError",
                         "Stack with id " + stackName + " does not exist", 400);
@@ -135,7 +148,7 @@ public class CloudFormationService {
             return List.of(stack);
         }
         return stacks.values().stream()
-                .filter(s -> region.equals(s.getRegion()))
+                .filter(s -> region.equals(s.getRegion()) && accountId.equals(s.getAccountId()))
                 .sorted(Comparator.comparing(Stack::getCreationTime))
                 .toList();
     }
@@ -146,15 +159,23 @@ public class CloudFormationService {
                                      String templateBody, String templateUrl,
                                      Map<String, String> parameters, List<String> capabilities,
                                      Map<String, String> tags, String region) {
+        return createChangeSet(stackName, changeSetName, changeSetType, templateBody, templateUrl,
+                parameters, capabilities, tags, region, regionResolver.getAccountId());
+    }
+
+    public ChangeSet createChangeSet(String stackName, String changeSetName, String changeSetType,
+                                     String templateBody, String templateUrl,
+                                     Map<String, String> parameters, List<String> capabilities,
+                                     Map<String, String> tags, String region, String accountId) {
         String resolvedTemplate = resolveTemplate(templateBody, templateUrl);
 
         // Detect first creation atomically: the mapping function runs at most once per key, so the
         // flag is only set for the thread that actually creates the stack (no double-recording under
         // concurrent CreateChangeSet calls).
         boolean[] stackCreated = {false};
-        Stack stack = stacks.computeIfAbsent(key(stackName, region), k -> {
+        Stack stack = stacks.computeIfAbsent(key(accountId, stackName, region), k -> {
             stackCreated[0] = true;
-            Stack s = newStack(stackName, region);
+            Stack s = newStack(stackName, region, accountId);
             if (tags != null) s.getTags().putAll(tags);
             return s;
         });
@@ -170,7 +191,7 @@ public class CloudFormationService {
         }
 
         ChangeSet cs = new ChangeSet();
-        cs.setChangeSetId(AwsArnUtils.Arn.of("cloudformation", region, regionResolver.getAccountId(), "changeSet/" + changeSetName + "/" + UUID.randomUUID()).toString());
+        cs.setChangeSetId(AwsArnUtils.Arn.of("cloudformation", region, accountId, "changeSet/" + changeSetName + "/" + UUID.randomUUID()).toString());
         cs.setChangeSetName(changeSetName);
         cs.setStackName(stackName);
         cs.setStackId(stack.getStackId());
@@ -189,7 +210,7 @@ public class CloudFormationService {
     // ── DescribeChangeSet ─────────────────────────────────────────────────────
 
     public ChangeSet describeChangeSet(String stackName, String changeSetName, String region) {
-        Stack stack = getStackOrThrow(stackName, region);
+        Stack stack = getStackOrThrow(stackName, region, regionResolver.getAccountId());
         ChangeSet cs = stack.getChangeSets().get(resolveChangeSetName(changeSetName));
         if (cs == null) {
             throw new AwsException("ChangeSetNotFoundException",
@@ -213,7 +234,7 @@ public class CloudFormationService {
      * deployment lands in the caller's account, and a StackSet instance lands in its target account.
      */
     public Future<?> executeChangeSet(String stackName, String changeSetName, String region, String accountId) {
-        Stack stack = getStackOrThrow(stackName, region);
+        Stack stack = getStackOrThrow(stackName, region, accountId);
         ChangeSet cs = stack.getChangeSets().get(resolveChangeSetName(changeSetName));
         if (cs == null) {
             throw new AwsException("ChangeSetNotFoundException",
@@ -269,7 +290,7 @@ public class CloudFormationService {
     // ── DeleteChangeSet ───────────────────────────────────────────────────────
 
     public void deleteChangeSet(String stackName, String changeSetName, String region) {
-        Stack stack = getStackOrThrow(stackName, region);
+        Stack stack = getStackOrThrow(stackName, region, regionResolver.getAccountId());
         String name = resolveChangeSetName(changeSetName);
         ChangeSet cs = stack.getChangeSets().get(name);
         if (cs == null) {
@@ -297,7 +318,7 @@ public class CloudFormationService {
      */
     public Future<?> deleteStack(String stackName, String region, String accountId) {
         purgeExpiredDeletedStacks();
-        Stack stack = resolveStack(stackName, region);
+        Stack stack = resolveStack(stackName, region, accountId);
         if (stack == null) {
             return CompletableFuture.completedFuture(null); // Already gone — no-op
         }
@@ -317,14 +338,14 @@ public class CloudFormationService {
     // ── GetTemplate ───────────────────────────────────────────────────────────
 
     public String getTemplate(String stackName, String region) {
-        Stack stack = getStackOrThrow(stackName, region);
+        Stack stack = getStackOrThrow(stackName, region, regionResolver.getAccountId());
         return stack.getTemplateBody() != null ? stack.getTemplateBody() : "{}";
     }
 
     // ── DescribeStackEvents ───────────────────────────────────────────────────
 
     public List<StackEvent> describeStackEvents(String stackName, String region) {
-        Stack stack = resolveStackForDescribe(stackName, region);
+        Stack stack = resolveStackForDescribe(stackName, region, regionResolver.getAccountId());
         if (stack == null) {
             throw new AwsException("ValidationError",
                     "Stack with id " + stackName + " does not exist", 400);
@@ -337,15 +358,16 @@ public class CloudFormationService {
     // ── DescribeStackResources ────────────────────────────────────────────────
 
     public List<StackResource> describeStackResources(String stackName, String region) {
-        Stack stack = getStackOrThrow(stackName, region);
+        Stack stack = getStackOrThrow(stackName, region, regionResolver.getAccountId());
         return new ArrayList<>(stack.getResources().values());
     }
 
     // ── ListStacks ────────────────────────────────────────────────────────────
 
     public List<Stack> listStacks(String region) {
+        String accountId = regionResolver.getAccountId();
         return stacks.values().stream()
-                .filter(s -> region.equals(s.getRegion()))
+                .filter(s -> region.equals(s.getRegion()) && accountId.equals(s.getAccountId()))
                 .sorted(Comparator.comparing(Stack::getCreationTime))
                 .toList();
     }
@@ -353,9 +375,10 @@ public class CloudFormationService {
     // ── ListExports ─────────────────────────────────────────────────────────
 
     public Map<String, ExportEntry> listExports(String region) {
+        String accountId = regionResolver.getAccountId();
         Map<String, ExportEntry> result = new LinkedHashMap<>();
         for (Stack stack : stacks.values()) {
-            if (!region.equals(stack.getRegion())) {
+            if (!region.equals(stack.getRegion()) || !accountId.equals(stack.getAccountId())) {
                 continue;
             }
             for (var entry : stack.getExports().entrySet()) {
@@ -371,24 +394,28 @@ public class CloudFormationService {
 
     private void removeStackExports(Stack stack, String region) {
         for (String exportName : stack.getExports().keySet()) {
-            String exportKey = exportKey(region, exportName);
-            exports.remove(exportKey);
-            exportBackend.deleteForAccount(storageAccount, exportKey);
+            exports.remove(exportKey(stack.getAccountId(), region, exportName));
+            exportBackend.deleteForAccount(stack.getAccountId(), exportStorageKey(region, exportName));
         }
     }
 
-    private String exportKey(String region, String exportName) {
+    private String exportKey(String accountId, String region, String exportName) {
+        return accountId + ":" + region + ":" + exportName;
+    }
+
+    private String exportStorageKey(String region, String exportName) {
         return region + ":" + exportName;
     }
 
-    private void validateExportNameAvailable(String region, String exportName,
+    private void validateExportNameAvailable(String accountId, String region, String exportName,
                                              Map<String, String> oldExports,
                                              Map<String, String> newExports) {
         if (newExports.containsKey(exportName)) {
             throw new AwsException("ValidationError",
                     "Export with name " + exportName + " is already defined by this stack", 400);
         }
-        if (!oldExports.containsKey(exportName) && exports.containsKey(exportKey(region, exportName))) {
+        if (!oldExports.containsKey(exportName)
+                && exports.containsKey(exportKey(accountId, region, exportName))) {
             throw new AwsException("ValidationError",
                     "Export with name " + exportName + " is already exported by another stack", 400);
         }
@@ -460,7 +487,7 @@ public class CloudFormationService {
                     CloudFormationTemplateEngine engine = new CloudFormationTemplateEngine(
                             accountId, region, stack.getStackName(),
                             stack.getStackId(), resolvedParams, physicalIds, resourceAttrs, conditions, mappings, objectMapper,
-                            name -> exports.get(exportKey(region, name)));
+                            name -> exports.get(exportKey(accountId, region, name)));
 
                     StackResource resource = stack.getResources().get(logicalId);
                     if (resource == null) {
@@ -509,7 +536,7 @@ public class CloudFormationService {
             CloudFormationTemplateEngine finalEngine = new CloudFormationTemplateEngine(
                     accountId, region, stack.getStackName(),
                     stack.getStackId(), resolvedParams, physicalIds, resourceAttrs, conditions, mappings, objectMapper,
-                    name -> exports.get(exportKey(region, name)));
+                    name -> exports.get(exportKey(accountId, region, name)));
 
             // Resolve outputs before mutating stack/global export state, so failed updates do not
             // leave stale or partially registered exports behind.
@@ -528,7 +555,7 @@ public class CloudFormationService {
                     JsonNode exportNode = outputDef.path("Export").path("Name");
                     if (!exportNode.isMissingNode()) {
                         String exportName = finalEngine.resolve(exportNode);
-                        validateExportNameAvailable(region, exportName, oldExports, newExports);
+                        validateExportNameAvailable(accountId, region, exportName, oldExports, newExports);
                         newExports.put(exportName, value);
                         newOutputExportNames.put(e.getKey(), exportName);
                     }
@@ -543,9 +570,8 @@ public class CloudFormationService {
             stack.getOutputExportNames().clear();
             stack.getOutputExportNames().putAll(newOutputExportNames);
             newExports.forEach((exportName, value) -> {
-                String exportKey = exportKey(region, exportName);
-                exports.put(exportKey, value);
-                exportBackend.putForAccount(storageAccount, exportKey, value);
+                exports.put(exportKey(accountId, region, exportName), value);
+                exportBackend.putForAccount(accountId, exportStorageKey(region, exportName), value);
                 LOG.infov("Registered export {0} = {1} from stack {2}",
                         exportName, value, stack.getStackName());
             });
@@ -715,8 +741,8 @@ public class CloudFormationService {
             addEvent(stack, stack.getStackName(), stack.getStackId(),
                     "AWS::CloudFormation::Stack", "DELETE_COMPLETE", null);
             removeStackExports(stack, region);
-            stacks.remove(key(stack.getStackName(), region));
-            unpersistStack(stack.getStackName(), region);
+            stacks.remove(key(stack.getAccountId(), stack.getStackName(), region));
+            unpersistStack(stack);
             deletedStacks.put(stack.getStackId(), new DeletedStackEntry(
                     stack,
                     now().plusSeconds(config.services().cloudformation().deletedStackRetentionSeconds())));
@@ -934,9 +960,9 @@ public class CloudFormationService {
         String childTemplate = fetchTemplateFromS3(templateUrl);
         String childStackName = parentStack.getStackName() + "-" + logicalId;
 
-        Stack childStack = newStack(childStackName, region);
+        Stack childStack = newStack(childStackName, region, accountId);
         childStack.setStatus("CREATE_IN_PROGRESS");
-        stacks.put(key(childStackName, region), childStack);
+        stacks.put(key(accountId, childStackName, region), childStack);
 
         Map<String, String> childParams = new LinkedHashMap<>();
         if (props != null && props.has("Parameters") && props.get("Parameters").isObject()) {
@@ -960,12 +986,13 @@ public class CloudFormationService {
         return resource;
     }
 
-    private Stack newStack(String stackName, String region) {
+    private Stack newStack(String stackName, String region, String accountId) {
         Stack stack = new Stack();
         stack.setStackName(stackName);
+        stack.setAccountId(accountId);
         stack.setRegion(region);
         stack.setStatus("REVIEW_IN_PROGRESS");
-        String stackId = AwsArnUtils.Arn.of("cloudformation", region, regionResolver.getAccountId(), "stack/" + stackName + "/" + UUID.randomUUID()).toString();
+        String stackId = AwsArnUtils.Arn.of("cloudformation", region, accountId, "stack/" + stackName + "/" + UUID.randomUUID()).toString();
         stack.setStackId(stackId);
         stack.setCreationTime(now());
         return stack;
@@ -984,8 +1011,8 @@ public class CloudFormationService {
         stack.getEvents().add(event);
     }
 
-    private Stack getStackOrThrow(String stackNameOrArn, String region) {
-        Stack stack = resolveStack(stackNameOrArn, region);
+    private Stack getStackOrThrow(String stackNameOrArn, String region, String accountId) {
+        Stack stack = resolveStack(stackNameOrArn, region, accountId);
         if (stack == null) {
             throw new AwsException("ValidationError",
                     "Stack with id " + stackNameOrArn + " does not exist", 400);
@@ -993,8 +1020,8 @@ public class CloudFormationService {
         return stack;
     }
 
-    private Stack resolveStackForDescribe(String stackNameOrArn, String region) {
-        Stack stack = resolveStack(stackNameOrArn, region);
+    private Stack resolveStackForDescribe(String stackNameOrArn, String region, String accountId) {
+        Stack stack = resolveStack(stackNameOrArn, region, accountId);
         if (stack != null) {
             return stack;
         }
@@ -1005,7 +1032,8 @@ public class CloudFormationService {
                     deletedStacks.remove(stackNameOrArn, deleted);
                     return null;
                 }
-                if (region.equals(deleted.stack().getRegion())) {
+                if (region.equals(deleted.stack().getRegion())
+                        && accountId.equals(deleted.stack().getAccountId())) {
                     return deleted.stack();
                 }
             }
@@ -1054,9 +1082,9 @@ public class CloudFormationService {
      * is extracted from the ARN path segment ({@code …:stack/<name>/<id>}).
      * Falls back to a linear scan matching on stackId for robustness.
      */
-    private Stack resolveStack(String stackNameOrArn, String region) {
+    private Stack resolveStack(String stackNameOrArn, String region, String accountId) {
         // Try direct name lookup first (fast path)
-        Stack stack = stacks.get(key(stackNameOrArn, region));
+        Stack stack = stacks.get(key(accountId, stackNameOrArn, region));
         if (stack != null) {
             return stack;
         }
@@ -1065,14 +1093,14 @@ public class CloudFormationService {
         if (stackNameOrArn != null && stackNameOrArn.startsWith("arn:")) {
             String extractedName = extractStackNameFromArn(stackNameOrArn);
             if (extractedName != null) {
-                stack = stacks.get(key(extractedName, region));
+                stack = stacks.get(key(accountId, extractedName, region));
                 if (stack != null) {
                     return stack;
                 }
             }
             // Fallback: scan by stackId in case the ARN format is unexpected
             for (Stack s : stacks.values()) {
-                if (stackNameOrArn.equals(s.getStackId())) {
+                if (stackNameOrArn.equals(s.getStackId()) && accountId.equals(s.getAccountId())) {
                     return s;
                 }
             }
@@ -1246,7 +1274,11 @@ public class CloudFormationService {
         }
     }
 
-    private static String key(String stackName, String region) {
+    private static String key(String accountId, String stackName, String region) {
+        return accountId + ":" + region + ":" + stackName;
+    }
+
+    private static String storageKey(String stackName, String region) {
         return region + ":" + stackName;
     }
 }
