@@ -111,6 +111,8 @@ floci:
         flush-interval-ms: 5000
       codepipeline:
         flush-interval-ms: 5000
+      organizations:
+        flush-interval-ms: 5000
       s3vectors:
         flush-interval-ms: 5000
       ecs:
@@ -412,6 +414,9 @@ floci:
       enabled: true
     codepipeline:
       enabled: true
+    organizations:
+      enabled: true
+      scp-enforcement-enabled: false
     autoscaling:
       enabled: true
     applicationautoscaling:

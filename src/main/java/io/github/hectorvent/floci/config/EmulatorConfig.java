@@ -271,6 +271,7 @@ public interface EmulatorConfig {
         BatchStorageConfig batch();
         LightsailStorageConfig lightsail();
         CodePipelineStorageConfig codepipeline();
+        OrganizationsStorageConfig organizations();
         S3VectorsStorageConfig s3vectors();
         EcsStorageConfig ecs();
         CodeBuildStorageConfig codebuild();
@@ -433,6 +434,13 @@ public interface EmulatorConfig {
         long flushIntervalMs();
     }
 
+    interface OrganizationsStorageConfig {
+        Optional<String> mode();
+
+        @WithDefault("5000")
+        long flushIntervalMs();
+    }
+
     interface S3VectorsStorageConfig {
         Optional<String> mode();
 
@@ -569,6 +577,7 @@ public interface EmulatorConfig {
         CodeBuildServiceConfig codebuild();
         CodeDeployServiceConfig codedeploy();
         CodePipelineServiceConfig codepipeline();
+        OrganizationsServiceConfig organizations();
         AutoScalingServiceConfig autoscaling();
         ApplicationAutoScalingServiceConfig applicationautoscaling();
         ElasticBeanstalkServiceConfig elasticbeanstalk();
@@ -729,6 +738,18 @@ public interface EmulatorConfig {
     interface CodePipelineServiceConfig {
         @WithDefault("true")
         boolean enabled();
+    }
+
+    interface OrganizationsServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+
+        /**
+         * When true (and IAM enforcement is enabled), service control policies attached in
+         * the caller's organization participate in policy evaluation.
+         */
+        @WithDefault("false")
+        boolean scpEnforcementEnabled();
     }
 
     interface SsmServiceConfig {
