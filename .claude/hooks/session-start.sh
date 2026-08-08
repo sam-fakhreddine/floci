@@ -20,6 +20,11 @@ fi
 
 if ! docker info >/dev/null 2>&1; then
   if command -v dockerd >/dev/null 2>&1; then
+    # A suspended/resumed container leaves stale pid files behind; dockerd
+    # refuses to start while they name a (now unrelated) live PID.
+    if ! pgrep -x dockerd >/dev/null 2>&1; then
+      rm -f /var/run/docker.pid /run/docker/containerd/containerd.pid
+    fi
     echo "Starting dockerd..."
     nohup dockerd >/tmp/dockerd.log 2>&1 &
     for _ in $(seq 1 30); do

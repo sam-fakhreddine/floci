@@ -15,12 +15,12 @@ data/
 .zed/settings.json
 .kiro/
 
-CLAUDE.md
 GEMINI.md
 COPILOT.md
 .claude/*
 !.claude/settings.json
 !.claude/hooks/
+!.claude/references/
 
 posts
 local
