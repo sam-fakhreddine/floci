@@ -313,7 +313,7 @@ public class AslExecutor {
 
                 boolean jsonata = isJsonata(stateDef, topLevelQueryLanguage);
                 try {
-                    StateResult stateResult = executeState(currentStateName, type, stateDef, currentInput,
+                    StateResult stateResult = executeStateWithRetry(currentStateName, type, stateDef, currentInput,
                             history, eventId, sm, jsonata, topLevelQueryLanguage, execContext, variables);
                     addEvent(history, eventId, stateExitedEventType(type), eventId.get() - 1,
                             Map.of("name", currentStateName, "output", stateResult.output().toString()));
@@ -388,6 +388,70 @@ public class AslExecutor {
             case "Map" -> executeMapState(name, stateDef, input, sm, jsonata, topLevelQueryLanguage, context, variables);
             default -> new StateResult(input, stateDef.path("Next").asText(null));
         };
+    }
+
+    /**
+     * Runs a state, honouring its {@code Retry} array. AWS retries a failed state in place — waiting
+     * {@code IntervalSeconds * BackoffRate^attempt} between attempts, up to {@code MaxAttempts} — before
+     * the error falls through to {@code Catch}. Retriers are matched in order against the raised error
+     * (same {@code ErrorEquals} semantics as {@code Catch}); the first match owns its own attempt budget.
+     * A state without a {@code Retry} array runs exactly once, so non-retrying states are unchanged.
+     *
+     * <p>This is what drives the CDK Provider framework's waiter state machine: its
+     * {@code framework-isComplete-task} throws on every not-yet-complete poll and relies on {@code Retry}
+     * to re-invoke {@code framework.isComplete} until it PUTs its response, only reaching the
+     * {@code Catch}/{@code onTimeout} branch once the attempt budget is exhausted.
+     *
+     * <p>The inter-attempt sleep is capped at {@link #MAX_WAIT_SECONDS} — the same bound Wait states use —
+     * so the emulator stays responsive under large real-world cadences (the waiter's 15s x 480).
+     */
+    private StateResult executeStateWithRetry(String name, String type, JsonNode stateDef, JsonNode input,
+                                              List<HistoryEvent> history, AtomicLong eventId, StateMachine sm,
+                                              boolean jsonata, String topLevelQueryLanguage, JsonNode context,
+                                              ObjectNode variables) throws Exception {
+        JsonNode retriers = stateDef.path("Retry");
+        if (!retriers.isArray() || retriers.isEmpty()) {
+            return executeState(name, type, stateDef, input, history, eventId, sm, jsonata,
+                    topLevelQueryLanguage, context, variables);
+        }
+        int[] attempts = new int[retriers.size()];
+        while (true) {
+            try {
+                return executeState(name, type, stateDef, input, history, eventId, sm, jsonata,
+                        topLevelQueryLanguage, context, variables);
+            } catch (FailStateException e) {
+                int idx = matchRetrier(retriers, e.error != null ? e.error : "States.Runtime");
+                if (idx < 0) {
+                    throw e;
+                }
+                JsonNode retrier = retriers.get(idx);
+                int maxAttempts = retrier.path("MaxAttempts").asInt(3);
+                if (attempts[idx] >= maxAttempts) {
+                    throw e;
+                }
+                double interval = retrier.path("IntervalSeconds").asDouble(1.0);
+                double backoff = retrier.path("BackoffRate").asDouble(2.0);
+                double delay = interval * Math.pow(backoff, attempts[idx]);
+                if (retrier.has("MaxDelaySeconds")) {
+                    delay = Math.min(delay, retrier.path("MaxDelaySeconds").asDouble(delay));
+                }
+                attempts[idx]++;
+                long millis = (long) (Math.min(delay, MAX_WAIT_SECONDS) * 1000);
+                if (millis > 0) {
+                    Thread.sleep(millis);
+                }
+            }
+        }
+    }
+
+    /** Index of the first retrier whose {@code ErrorEquals} matches {@code error}, or -1 for none. */
+    private int matchRetrier(JsonNode retriers, String error) {
+        for (int i = 0; i < retriers.size(); i++) {
+            if (catchMatches(retriers.get(i), error)) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     private StateResult executePassState(JsonNode stateDef, JsonNode input, boolean jsonata, JsonNode context,
@@ -1999,7 +2063,7 @@ public class AslExecutor {
             boolean stateJsonata = isJsonata(stateDef, topLevelQueryLanguage);
             StateResult result;
             try {
-                result = executeState(currentState, type, stateDef, currentInput, ignored, eventId, sm,
+                result = executeStateWithRetry(currentState, type, stateDef, currentInput, ignored, eventId, sm,
                         stateJsonata, topLevelQueryLanguage, context, variables);
             } catch (FailStateException e) {
                 StateResult caught = handleCatch(stateDef, currentInput, e, stateJsonata, context, variables);
