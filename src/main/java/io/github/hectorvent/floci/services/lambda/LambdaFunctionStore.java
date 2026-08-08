@@ -90,10 +90,20 @@ public class LambdaFunctionStore implements Resettable {
     }
 
     public Optional<LambdaFunction> getForAccount(String accountId, String region, String functionName) {
+        return getForAccount(accountId, region, functionName, "$LATEST");
+    }
+
+    /**
+     * Resolves a function in an explicitly-named account, bypassing the caller's
+     * ambient account context. Used when the account is known from a full ARN or
+     * a stored resource model (e.g. async provider-framework waiters, event-source
+     * pollers) rather than the current request scope.
+     */
+    public Optional<LambdaFunction> getForAccount(String accountId, String region, String functionName, String version) {
         if (backend instanceof AccountAwareStorageBackend<LambdaFunction> aware) {
-            return aware.getForAccount(accountId, regionKey(region, functionName, "$LATEST"));
+            return aware.getForAccount(accountId, regionKey(region, functionName, version));
         }
-        return backend.get(regionKey(region, functionName, "$LATEST"));
+        return backend.get(regionKey(region, functionName, version));
     }
 
     public Optional<LambdaFunction> getByUrlId(String urlId) {

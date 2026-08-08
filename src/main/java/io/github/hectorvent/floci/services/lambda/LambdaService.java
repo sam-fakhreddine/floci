@@ -611,32 +611,55 @@ public class LambdaService {
         enforceRegion(region, ref);
         String name = ref.name();
         String qualifier = ref.qualifier();
-        LambdaFunction fn = resolveInvokeTarget(region, name, qualifier);
+        LambdaFunction fn = resolveInvokeTarget(region, name, qualifier, ref.account());
         InvokeResult result = executorService.invoke(fn, payload, type);
         result.setExecutedVersion(fn.getVersion());
         return result;
     }
 
-    private LambdaFunction resolveInvokeTarget(String region, String name, String qualifier) {
+    /**
+     * Resolves the function to invoke. When {@code account} is non-null — the
+     * input was a full or partial ARN — the function is looked up in that
+     * account rather than the caller's ambient request context. A full Lambda
+     * ARN authoritatively names its owning account, so honoring it lets async /
+     * cross-account callers (e.g. the CDK provider-framework waiter that polls a
+     * member-account {@code isComplete} function from a Step Functions execution
+     * thread) resolve the target even when their ambient context differs.
+     */
+    LambdaFunction resolveInvokeTarget(String region, String name, String qualifier, String account) {
         if (qualifier == null || qualifier.equals("$LATEST")) {
-            return functionStore.get(region, name)
+            return getForInvoke(region, name, "$LATEST", account)
                     .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Function not found: " + name, 404));
         }
         if (qualifier.chars().allMatch(Character::isDigit)) {
-            return functionStore.get(region, name, qualifier)
+            return getForInvoke(region, name, qualifier, account)
                     .orElseThrow(() -> new AwsException("ResourceNotFoundException",
                             "Function version not found: " + name + ":" + qualifier, 404));
         }
-        // qualifier is an alias name
+        // qualifier is an alias name. NOTE: getAlias still resolves in the caller's
+        // ambient account context, not the ARN account — cross-account alias invokes
+        // are deliberately out of scope here. LZA custom resources invoke $LATEST, so
+        // this path is not exercised; broaden it only if a cross-account alias 404 surfaces.
         LambdaAlias alias = getAlias(region, name, qualifier);
         String version = pickAliasVersion(alias);
         if (version == null || version.equals("$LATEST")) {
-            return functionStore.get(region, name)
+            return getForInvoke(region, name, "$LATEST", account)
                     .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Function not found: " + name, 404));
         }
-        return functionStore.get(region, name, version)
+        return getForInvoke(region, name, version, account)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException",
                         "Function version not found: " + name + ":" + version, 404));
+    }
+
+    /**
+     * Looks up a function version, honoring an ARN-supplied account when present
+     * and otherwise falling back to the caller's ambient account context.
+     */
+    private Optional<LambdaFunction> getForInvoke(String region, String name, String version, String account) {
+        if (account != null) {
+            return functionStore.getForAccount(account, region, name, version);
+        }
+        return functionStore.get(region, name, version);
     }
 
     private String pickAliasVersion(LambdaAlias alias) {

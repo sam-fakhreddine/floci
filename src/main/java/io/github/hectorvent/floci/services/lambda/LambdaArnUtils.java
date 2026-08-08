@@ -26,8 +26,13 @@ public final class LambdaArnUtils {
      * @param qualifier version or alias, or null if absent
      * @param region    region extracted from a full ARN, or null for bare
      *                  name / partial ARN inputs
+     * @param account   12-digit account id extracted from a full or partial
+     *                  ARN, or null for a bare name. A full ARN authoritatively
+     *                  names the account that owns the function, so callers on
+     *                  async/cross-account threads can resolve it explicitly
+     *                  instead of guessing from ambient request context.
      */
-    public record ResolvedFunctionRef(String name, String qualifier, String region) {}
+    public record ResolvedFunctionRef(String name, String qualifier, String region, String account) {}
 
     /**
      * Parses a {@code FunctionName} path parameter. Throws
@@ -65,7 +70,7 @@ public final class LambdaArnUtils {
         if (effective != null && !QUALIFIER_PATTERN.matcher(effective).matches()) {
             throw invalid("Invalid qualifier: " + effective);
         }
-        return new ResolvedFunctionRef(ref.name(), effective, ref.region());
+        return new ResolvedFunctionRef(ref.name(), effective, ref.region(), ref.account());
     }
 
     private static ResolvedFunctionRef parseFullArn(String input) {
@@ -100,7 +105,7 @@ public final class LambdaArnUtils {
         if (qualifier != null) {
             validateQualifier(qualifier);
         }
-        return new ResolvedFunctionRef(name, qualifier, base.region());
+        return new ResolvedFunctionRef(name, qualifier, base.region(), base.accountId());
     }
 
     private static ResolvedFunctionRef parsePartialArn(String input) {
@@ -122,7 +127,7 @@ public final class LambdaArnUtils {
         if (qualifier != null) {
             validateQualifier(qualifier);
         }
-        return new ResolvedFunctionRef(name, qualifier, null);
+        return new ResolvedFunctionRef(name, qualifier, null, account);
     }
 
     private static ResolvedFunctionRef parseNameWithOptionalQualifier(String input) {
@@ -137,7 +142,7 @@ public final class LambdaArnUtils {
         if (qualifier != null) {
             validateQualifier(qualifier);
         }
-        return new ResolvedFunctionRef(name, qualifier, null);
+        return new ResolvedFunctionRef(name, qualifier, null, null);
     }
 
     private static void validateName(String name) {
