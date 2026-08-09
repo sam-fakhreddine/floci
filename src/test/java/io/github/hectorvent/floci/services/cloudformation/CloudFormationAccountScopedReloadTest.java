@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.cloudformation.model.Stack;
 import io.github.hectorvent.floci.services.s3.S3Service;
+import io.github.hectorvent.floci.services.ssm.SsmService;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -92,7 +93,8 @@ class CloudFormationAccountScopedReloadTest {
         when(config.defaultAccountId()).thenReturn(DEFAULT_ACCOUNT);
         return new CloudFormationService(
                 mock(CloudFormationResourceProvisioner.class), mock(S3Service.class),
-                new ObjectMapper(), config, new RegionResolver(REGION, DEFAULT_ACCOUNT),
+                mock(SsmService.class), new ObjectMapper(), config,
+                new RegionResolver(REGION, DEFAULT_ACCOUNT),
                 Clock.systemUTC(), new TempDirStorageFactory(tempDir));
     }
 
