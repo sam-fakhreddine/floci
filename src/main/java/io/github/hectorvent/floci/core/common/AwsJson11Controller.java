@@ -40,6 +40,7 @@ import io.github.hectorvent.floci.services.kinesis.KinesisJsonHandler;
 import io.github.hectorvent.floci.services.kinesisanalytics.KinesisAnalyticsV2JsonHandler;
 import io.github.hectorvent.floci.services.kms.KmsJsonHandler;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerJsonHandler;
+import io.github.hectorvent.floci.services.servicequotas.ServiceQuotasJsonHandler;
 import io.github.hectorvent.floci.services.ssm.Ec2MessagesJsonHandler;
 import io.github.hectorvent.floci.services.ssm.SsmJsonHandler;
 import jakarta.inject.Inject;
@@ -105,6 +106,7 @@ public class AwsJson11Controller {
     private final CloudControlJsonHandler cloudControlJsonHandler;
     private final ApplicationAutoScalingJsonHandler applicationAutoScalingJsonHandler;
     private final CloudHsmV2JsonHandler cloudHsmV2JsonHandler;
+    private final ServiceQuotasJsonHandler serviceQuotasJsonHandler;
 
     @Inject
     public AwsJson11Controller(ObjectMapper objectMapper, ResolvedServiceCatalog catalog,
@@ -141,7 +143,8 @@ public class AwsJson11Controller {
                                LightsailJsonHandler lightsailJsonHandler,
                                CloudControlJsonHandler cloudControlJsonHandler,
                                ApplicationAutoScalingJsonHandler applicationAutoScalingJsonHandler,
-                               CloudHsmV2JsonHandler cloudHsmV2JsonHandler){
+                               CloudHsmV2JsonHandler cloudHsmV2JsonHandler,
+                               ServiceQuotasJsonHandler serviceQuotasJsonHandler) {
         this.objectMapper = objectMapper;
         this.strictBodyReader = objectMapper.reader().with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
         this.catalog = catalog;
@@ -183,6 +186,7 @@ public class AwsJson11Controller {
         this.cloudControlJsonHandler = cloudControlJsonHandler;
         this.applicationAutoScalingJsonHandler = applicationAutoScalingJsonHandler;
         this.cloudHsmV2JsonHandler = cloudHsmV2JsonHandler;
+        this.serviceQuotasJsonHandler = serviceQuotasJsonHandler;
     }
 
     @POST
@@ -255,6 +259,8 @@ public class AwsJson11Controller {
                 case "lightsail" -> lightsailJsonHandler.handle(action, request, region);
                 case "cloudcontrol" -> cloudControlJsonHandler.handle(action, request, region);
                 case "cloudhsmv2" -> cloudHsmV2JsonHandler.handle(action, request, region);
+                case "servicequotas" -> serviceQuotasJsonHandler.handle(
+                        action, request, region, regionResolver.getAccountId());
                 default -> null;
             };
             // catalog.matchTarget is protocol-agnostic: a JSON 1.0 target
