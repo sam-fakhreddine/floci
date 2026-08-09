@@ -50,6 +50,23 @@ omitted value, uses the AWS service ceiling: 40 concurrent iterations for Inline
 Results remain in input order even when iterations finish out of order. If an iteration fails,
 the Map state fails promptly, cancels its active sibling iterations, and does not start queued
 iterations.
+## State Retry
+
+Task, Parallel, and Map states honor an ASL `Retry` array, so a state that fails is retried in
+place before the failure propagates. Each retrier supports:
+
+| Field | Default | Behavior |
+|---|---|---|
+| `ErrorEquals` | — | Error names this retrier matches; the first matching retrier is used |
+| `MaxAttempts` | `3` | Retries after the initial attempt before the error is re-raised |
+| `IntervalSeconds` | `1.0` | Base wait before the first retry |
+| `BackoffRate` | `2.0` | Multiplier applied to the interval on each successive retry |
+| `MaxDelaySeconds` | — | Optional cap on the computed backoff delay |
+
+A state with no `Retry` array runs exactly once. This is what makes CDK-generated provider-framework
+workflows converge: the `framework-isComplete-task` throws on every not-yet-complete poll and relies on
+`Retry` to poll again until the custom resource reports done — see
+[CloudFormation custom resources](cloudformation.md#custom-resources-and-the-cdk-provider-framework).
 
 ## Configuration
 
