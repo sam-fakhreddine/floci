@@ -99,6 +99,18 @@ caller's identity policies are consulted. SCPs never grant permissions on their 
 the management account is exempt — both matching AWS. See
 [IAM enforcement](iam.md#service-control-policies-scps) for the evaluation order.
 
+**SCP guardrails and the member's bare account key.** A member account's own bare
+12-digit access key is evaluated as the account root and is **subject to the SCP chain**,
+so an SCP `Deny` (for example, `DenyLeaveOrganization`) blocks that key. What the bare
+key does *not* carry is any identity policy — it is an allow-everything root bounded only
+by SCPs. So to exercise **identity-policy** enforcement (permissions granted or denied by
+policies attached to a principal), use account-routable credentials for the member — most
+naturally the `ASIA…` session from assuming its `OrganizationAccountAccessRole`. Unknown
+`AKIA…` keys, and accounts with no effective SCP ceiling (the management account, or an
+account outside any organization), still bypass enforcement (see the
+[bypass rules](iam.md#bypass-rules) and
+[account-root SCP handling](iam.md#service-control-policies-scps)).
+
 `DescribeEffectivePolicy` applies to the three non-SCP policy types and merges the
 inherited chain with the `@@assign`, `@@append`, and `@@remove` inheritance operators.
 
