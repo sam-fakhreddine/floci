@@ -39,6 +39,20 @@ The following providers execute against local Floci services:
 AWS-managed providers without a corresponding Floci execution adapter fail the action with an
 AWS-shaped action error. Floci does not call real AWS accounts or third-party SaaS providers.
 
+## Events and notifications
+
+Executions publish the real `aws.codepipeline` state-change events to the **default
+EventBridge bus**: `CodePipeline Pipeline Execution State Change` (STARTED, SUCCEEDED,
+FAILED, STOPPING, STOPPED, RESUMED), `CodePipeline Stage Execution State Change`, and
+`CodePipeline Action Execution State Change`, with the pipeline ARN in `resources` and
+the documented detail fields. EventBridge rules matching `{"source":
+["aws.codepipeline"]}` deliver them to any configured target. Publishing is best-effort
+and never fails the execution.
+
+A Manual approval action whose configuration sets `NotificationArn` publishes the
+approval-needed message (subject `APPROVAL NEEDED: AWS CodePipeline ...`, JSON body with
+the approval token and `CustomData`) to that SNS topic when it starts waiting.
+
 ## V2 stage conditions, retry, and rollback
 
 V2 stage condition blocks (`beforeEntry`, `onSuccess`, `onFailure`) are evaluated during
