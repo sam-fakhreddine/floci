@@ -18,6 +18,7 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -33,14 +34,14 @@ class OrganizationsServiceTest {
         accountStore = backend();
         service = new OrganizationsService(
                 backend(), accountStore, backend(), backend(), backend(), backend(), backend(),
-                new com.fasterxml.jackson.databind.ObjectMapper(), null, null);
+                new com.fasterxml.jackson.databind.ObjectMapper(), null, null, true);
     }
 
     /** Builds a service whose management account email is overridden. */
     private OrganizationsService serviceWithManagementEmail(String email) {
         return new OrganizationsService(
                 backend(), backend(), backend(), backend(), backend(), backend(), backend(),
-                new com.fasterxml.jackson.databind.ObjectMapper(), null, email);
+                new com.fasterxml.jackson.databind.ObjectMapper(), null, email, false);
     }
 
     private static <V> AccountAwareStorageBackend<V> backend() {
@@ -567,6 +568,50 @@ class OrganizationsServiceTest {
         AwsException notRegistered = assertThrows(AwsException.class, () ->
                 service.deregisterDelegatedAdministrator(MGMT, member, "guardduty.amazonaws.com"));
         assertEquals("AccountNotRegisteredException", notRegistered.getErrorCode());
+    }
+
+    // ---------------------------------------------------------------- effective SCP levels
+
+    @Test
+    void effectiveScpLevelsWalkRootOuAccountChain() {
+        service.createOrganization(MGMT, null);
+        String rootId = service.listRoots(MGMT).get(0).getId();
+        String ouId = service.createOrganizationalUnit(MGMT, rootId, "workloads", null).getId();
+        String member = service.createAccount(MGMT, "member@example.com", "Member", null, null, false)
+                .getAccountId();
+        service.moveAccount(MGMT, member, rootId, ouId);
+
+        // The management account is exempt.
+        assertNull(service.effectiveScpLevels(MGMT));
+        // Unknown accounts have no levels.
+        assertNull(service.effectiveScpLevels("999999999999"));
+
+        // FullAWSAccess sits on root, OU, and account: three levels.
+        List<List<String>> levels = service.effectiveScpLevels(member);
+        assertEquals(3, levels.size());
+        assertTrue(levels.get(0).get(0).contains("\"Allow\""));
+
+        // A deny-s3 SCP attached to the OU shows up on the middle level.
+        String policyId = service.createPolicy(MGMT, "deny-s3", null,
+                "SERVICE_CONTROL_POLICY", DENY_S3, null).getId();
+        service.attachPolicy(MGMT, policyId, ouId);
+        levels = service.effectiveScpLevels(member);
+        assertEquals(2, levels.get(1).size());
+
+        // Disabling the SCP policy type turns the levels off entirely.
+        service.disablePolicyType(MGMT, rootId, "SERVICE_CONTROL_POLICY");
+        assertNull(service.effectiveScpLevels(member));
+    }
+
+    @Test
+    void effectiveScpLevelsAreNullWhenEnforcementDisabled() {
+        OrganizationsService disabled = new OrganizationsService(
+                backend(), backend(), backend(), backend(), backend(), backend(), backend(),
+                new com.fasterxml.jackson.databind.ObjectMapper(), null, null, false);
+        disabled.createOrganization(MGMT, null);
+        String member = disabled.createAccount(MGMT, "member@example.com", "Member", null, null, false)
+                .getAccountId();
+        assertNull(disabled.effectiveScpLevels(member));
     }
 
     // ---------------------------------------------------------------- resource policy

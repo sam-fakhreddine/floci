@@ -10,6 +10,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.iam.ScpProvider;
 import io.github.hectorvent.floci.services.organizations.model.CreateAccountStatus;
 import io.github.hectorvent.floci.services.organizations.model.Handshake;
 import io.github.hectorvent.floci.services.organizations.model.OrgAccount;
@@ -44,7 +45,7 @@ import java.util.Set;
  * @see <a href="https://docs.aws.amazon.com/organizations/latest/APIReference/Welcome.html">Organizations API Reference</a>
  */
 @ApplicationScoped
-public class OrganizationsService {
+public class OrganizationsService implements ScpProvider {
 
     private static final Logger LOG = Logger.getLogger(OrganizationsService.class);
 
@@ -88,6 +89,7 @@ public class OrganizationsService {
      * set it via {@code floci.services.organizations.management-account-email}.
      */
     private final String managementAccountEmailOverride;
+    private final boolean scpEnforcementEnabled;
 
     @Inject
     @SuppressWarnings("unchecked")
@@ -109,7 +111,8 @@ public class OrganizationsService {
                 (AccountAwareStorageBackend<Handshake>) storageFactory.create(
                         "organizations", "org-handshakes.json", new TypeReference<Map<String, Handshake>>() {}),
                 mapper, iamService,
-                config.services().organizations().managementAccountEmail().orElse(null));
+                config.services().organizations().managementAccountEmail().orElse(null),
+                config.services().organizations().scpEnforcementEnabled());
     }
 
     OrganizationsService(AccountAwareStorageBackend<Organization> organizationStore,
@@ -120,7 +123,7 @@ public class OrganizationsService {
                          AccountAwareStorageBackend<OrgPolicy> policyStore,
                          AccountAwareStorageBackend<Handshake> handshakeStore,
                          ObjectMapper mapper, IamService iamService,
-                         String managementAccountEmailOverride) {
+                         String managementAccountEmailOverride, boolean scpEnforcementEnabled) {
         this.organizationStore = organizationStore;
         this.accountStore = accountStore;
         this.rootStore = rootStore;
@@ -131,6 +134,7 @@ public class OrganizationsService {
         this.mapper = mapper;
         this.iamService = iamService;
         this.managementAccountEmailOverride = managementAccountEmailOverride;
+        this.scpEnforcementEnabled = scpEnforcementEnabled;
     }
 
     /** The caller's organization plus which namespace owns it. */
@@ -1429,6 +1433,48 @@ public class OrganizationsService {
         return new ResourcePolicy(org.getResourcePolicyId(),
                 arn(mgmt, "resourcepolicy/" + org.getId() + "/" + org.getResourcePolicyId()),
                 org.getResourcePolicyContent());
+    }
+
+    // ---------------------------------------------------------------- SCP provider
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Levels are ordered root → OUs on the path → account. Only bites when
+     * {@code floci.services.organizations.scp-enforcement-enabled} is set (and, in
+     * practice, IAM enforcement too — {@code IamEnforcementFilter} is the only consumer).</p>
+     */
+    @Override
+    public List<List<String>> effectiveScpLevels(String accountId) {
+        if (!scpEnforcementEnabled) {
+            return null;
+        }
+        OrgContext ctx;
+        try {
+            ctx = resolveOrg(accountId);
+        } catch (AwsException e) {
+            return null;
+        }
+        String mgmt = ctx.managementAccount();
+        if (accountId.equals(mgmt)) {
+            return null;
+        }
+        boolean scpEnabled = rootStore.scanForAccount(mgmt, key -> true).stream()
+                .flatMap(root -> root.getPolicyTypes().stream())
+                .anyMatch(t -> SCP_TYPE.equals(t.getType()) && "ENABLED".equals(t.getStatus()));
+        if (!scpEnabled) {
+            return null;
+        }
+        List<List<String>> levels = new ArrayList<>();
+        for (String node : chainToTarget(mgmt, accountId)) {
+            List<String> documents = policiesForTarget(mgmt, node, SCP_TYPE).stream()
+                    .map(OrgPolicy::getContent)
+                    .toList();
+            if (!documents.isEmpty()) {
+                levels.add(documents);
+            }
+        }
+        return levels.isEmpty() ? null : levels;
     }
 
     private void provisionAccountAccessRole(String mgmt, String accountId, String roleName) {
