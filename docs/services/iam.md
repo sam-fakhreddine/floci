@@ -215,6 +215,14 @@ nothing here performs the TLS handshake they describe.
 | DeleteLoginProfile | Deletes a user's login profile. |
 | UpdateLoginProfile | Updates a user's login profile password settings. |
 
+### Account Password Policy
+
+| Action | Description |
+|--------|-------------|
+| UpdateAccountPasswordPolicy | Creates or replaces the account's password policy. |
+| GetAccountPasswordPolicy | Returns the stored password policy, or `NoSuchEntity` when none is set. |
+| DeleteAccountPasswordPolicy | Deletes the account's password policy. |
+
 ### Policy Simulation
 
 | Action | Description |
