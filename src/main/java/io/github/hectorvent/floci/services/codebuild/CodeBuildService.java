@@ -398,10 +398,12 @@ public class CodeBuildService {
     public Build startBuild(String region, String account, String projectName,
                             String buildspecOverride,
                             ProjectEnvironment environmentOverride,
+                            List<Map<String, String>> environmentVariablesOverride,
                             ProjectArtifacts artifactsOverride,
                             String sourceVersion,
                             String sourceTypeOverride,
                             String sourceLocationOverride,
+                            List<ProjectSource> secondarySourcesOverride,
                             Integer timeoutOverride,
                             String imageOverride,
                             String computeTypeOverride) {
@@ -440,18 +442,29 @@ public class CodeBuildService {
         } else {
             build.setSource(projectSource);
         }
+        build.setSecondarySources(secondarySourcesOverride != null && !secondarySourcesOverride.isEmpty()
+                ? secondarySourcesOverride : project.getSecondarySources());
         build.setArtifacts(artifactsOverride != null ? artifactsOverride : project.getArtifacts());
         build.setTimeoutInMinutes(timeoutOverride != null ? timeoutOverride : project.getTimeoutInMinutes());
         build.setQueuedTimeoutInMinutes(project.getQueuedTimeoutInMinutes());
         build.setEncryptionKey(project.getEncryptionKey());
 
         ProjectEnvironment env = environmentOverride != null ? environmentOverride : project.getEnvironment();
-        if (imageOverride != null || computeTypeOverride != null) {
+        boolean hasVariablesOverride = environmentVariablesOverride != null && !environmentVariablesOverride.isEmpty();
+        if (imageOverride != null || computeTypeOverride != null || hasVariablesOverride) {
             ProjectEnvironment merged = new ProjectEnvironment();
             merged.setType(env != null ? env.getType() : null);
             merged.setImage(imageOverride != null ? imageOverride : (env != null ? env.getImage() : null));
             merged.setComputeType(computeTypeOverride != null ? computeTypeOverride : (env != null ? env.getComputeType() : null));
-            merged.setEnvironmentVariables(env != null ? env.getEnvironmentVariables() : null);
+            List<Map<String, String>> baseVariables = env != null ? env.getEnvironmentVariables() : null;
+            if (hasVariablesOverride) {
+                List<Map<String, String>> variables =
+                        new ArrayList<>(baseVariables != null ? baseVariables : List.of());
+                variables.addAll(environmentVariablesOverride);
+                merged.setEnvironmentVariables(variables);
+            } else {
+                merged.setEnvironmentVariables(baseVariables);
+            }
             merged.setPrivilegedMode(env != null ? env.getPrivilegedMode() : null);
             build.setEnvironment(merged);
         } else {
@@ -515,9 +528,10 @@ public class CodeBuildService {
         Build original = getBuild(region, buildId);
         ProjectSource originalSource = original.getSource();
         return startBuild(region, account, original.getProjectName(),
-                null, original.getEnvironment(), original.getArtifacts(),
+                null, original.getEnvironment(), null, original.getArtifacts(),
                 null, originalSource != null ? originalSource.getType() : null,
                 originalSource != null ? originalSource.getLocation() : null,
+                original.getSecondarySources(),
                 original.getTimeoutInMinutes(), null, null);
     }
 
@@ -534,6 +548,7 @@ public class CodeBuildService {
         copy.setStartTime(source.getStartTime());
         copy.setEndTime(source.getEndTime());
         copy.setSource(source.getSource());
+        copy.setSecondarySources(source.getSecondarySources());
         copy.setArtifacts(source.getArtifacts());
         copy.setEnvironment(source.getEnvironment());
         copy.setLogs(source.getLogs());
