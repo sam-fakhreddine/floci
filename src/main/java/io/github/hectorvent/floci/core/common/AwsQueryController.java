@@ -103,6 +103,7 @@ public class AwsQueryController {
             "CreateLoginProfile", "GetLoginProfile", "DeleteLoginProfile", "UpdateLoginProfile",
             "GenerateCredentialReport", "GetCredentialReport",
             "GetAccountSummary", "GetAccountAuthorizationDetails",
+            "UpdateAccountPasswordPolicy", "GetAccountPasswordPolicy", "DeleteAccountPasswordPolicy",
             "SimulatePrincipalPolicy"
     );
 

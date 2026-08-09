@@ -16,6 +16,7 @@ import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.github.hectorvent.floci.services.iam.model.IamUser;
 import io.github.hectorvent.floci.services.iam.model.InstanceProfile;
 import io.github.hectorvent.floci.services.iam.model.OpenIDConnectProvider;
+import io.github.hectorvent.floci.services.iam.model.PasswordPolicy;
 import io.github.hectorvent.floci.services.iam.model.PolicyVersion;
 import io.github.hectorvent.floci.services.iam.model.CallerContext;
 import io.github.hectorvent.floci.services.iam.model.SessionCredential;
@@ -75,6 +76,7 @@ public class IamService implements SessionAccountLookup {
     /** CustomSuffix as AWS constrains it: 1-64 characters of {@code [\w+=,.@-]}. */
     private static final Pattern CUSTOM_SUFFIX_PATTERN = Pattern.compile("[\\w+=,.@-]{1,64}");
     private static final int ROLE_NAME_MAX_LENGTH = 64;
+    private static final String PASSWORD_POLICY_KEY = "account-password-policy";
 
     private final StorageBackend<String, IamUser> users;
     private final StorageBackend<String, IamGroup> groups;
@@ -83,21 +85,13 @@ public class IamService implements SessionAccountLookup {
     private final StorageBackend<String, AccessKey> accessKeys;
     private final StorageBackend<String, InstanceProfile> instanceProfiles;
     private final StorageBackend<String, SessionCredential> sessions;
-    /**
-     * Holds at most one entry per account under {@link #ACCOUNT_ALIAS_KEY} — an account alias is a
-     * single value, and the store is already account-namespaced, so no further keying is needed.
-     */
-    private final StorageBackend<String, String> accountAliases;
-    /**
-     * Guards the check-then-write in alias create/delete. Unlike a named resource, where two
-     * racing creates carry the same name and either winner is equivalent, racing alias creates
-     * carry different values — an unguarded race would report success to both callers while
-     * silently keeping only one. A single lock across accounts is enough: alias writes are rare.
-     */
-    private final Object accountAliasLock = new Object();
-    private final StorageBackend<String, OpenIDConnectProvider> oidcProviders;
-    /** Deletion is synchronous, so an issued task id is a completed one; the value is its role. */
-    private final StorageBackend<String, String> serviceLinkedRoleDeletions;
+               StorageBackend<String, String> accountAliases,
+               StorageBackend<String, OpenIDConnectProvider> oidcProviders,
+               StorageBackend<String, String> serviceLinkedRoleDeletions,
+               StorageBackend<String, PasswordPolicy> passwordPolicies,
+               RegionResolver regionResolver,
+               boolean seedDeployerPrincipal,
+               String seededAccountAlias) {
     private final RegionResolver regionResolver;
     private final boolean seedDeployerPrincipal;
     private final String seededAccountAlias;
@@ -122,6 +116,7 @@ public class IamService implements SessionAccountLookup {
             storageFactory.create("iam", "iam-account-aliases.json", new TypeReference<>() {}),
             storageFactory.create("iam", "iam-oidc-providers.json", new TypeReference<>() {}),
             storageFactory.create("iam", "iam-slr-deletions.json", new TypeReference<>() {}),
+            storageFactory.create("iam", "iam-password-policy.json", new TypeReference<>() {}),
             regionResolver,
             config.services().iam().seedDeployerPrincipal(),
             config.services().iam().accountAlias().orElse(null)
@@ -136,7 +131,9 @@ public class IamService implements SessionAccountLookup {
                StorageBackend<String, InstanceProfile> instanceProfiles,
                StorageBackend<String, SessionCredential> sessions,
                RegionResolver regionResolver) {
-        this(users, groups, roles, policies, accessKeys, instanceProfiles, sessions, regionResolver, false);
+        this(users, groups, roles, policies, accessKeys, instanceProfiles, sessions,
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), regionResolver, false, null);
     }
 
     IamService(StorageBackend<String, IamUser> users,
@@ -150,7 +147,7 @@ public class IamService implements SessionAccountLookup {
                boolean seedDeployerPrincipal) {
         this(users, groups, roles, policies, accessKeys, instanceProfiles, sessions,
                 new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
-                regionResolver, seedDeployerPrincipal, null);
+                new InMemoryStorage<>(), regionResolver, seedDeployerPrincipal, null);
     }
 
     IamService(StorageBackend<String, IamUser> users,
@@ -163,6 +160,7 @@ public class IamService implements SessionAccountLookup {
                StorageBackend<String, String> accountAliases,
                StorageBackend<String, OpenIDConnectProvider> oidcProviders,
                StorageBackend<String, String> serviceLinkedRoleDeletions,
+               StorageBackend<String, PasswordPolicy> passwordPolicies,
                RegionResolver regionResolver,
                boolean seedDeployerPrincipal,
                String seededAccountAlias) {
@@ -176,6 +174,7 @@ public class IamService implements SessionAccountLookup {
         this.accountAliases = accountAliases;
         this.oidcProviders = oidcProviders;
         this.serviceLinkedRoleDeletions = serviceLinkedRoleDeletions;
+        this.passwordPolicies = passwordPolicies;
         this.regionResolver = regionResolver;
         this.seedDeployerPrincipal = seedDeployerPrincipal;
         this.seededAccountAlias = seededAccountAlias;
@@ -1222,6 +1221,28 @@ public class IamService implements SessionAccountLookup {
         }
         key.setStatus(status);
         accessKeys.put(accessKeyId, key);
+    }
+
+    // =========================================================================
+    // Account Password Policy
+    // =========================================================================
+
+    public void updateAccountPasswordPolicy(PasswordPolicy policy) {
+        passwordPolicies.put(PASSWORD_POLICY_KEY, policy);
+        LOG.infov("Updated account password policy for account {0}", regionResolver.getAccountId());
+    }
+
+    public PasswordPolicy getAccountPasswordPolicy() {
+        return passwordPolicies.get(PASSWORD_POLICY_KEY)
+                .orElseThrow(() -> new AwsException("NoSuchEntity",
+                        "The Password Policy with domain name " + regionResolver.getAccountId()
+                                + " cannot be found.", 404));
+    }
+
+    public void deleteAccountPasswordPolicy() {
+        getAccountPasswordPolicy();
+        passwordPolicies.delete(PASSWORD_POLICY_KEY);
+        LOG.infov("Deleted account password policy for account {0}", regionResolver.getAccountId());
     }
 
     // =========================================================================
