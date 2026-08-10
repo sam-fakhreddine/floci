@@ -59,7 +59,8 @@ public class OrganizationsService {
 
     static final String SCP_TYPE = "SERVICE_CONTROL_POLICY";
     static final Set<String> POLICY_TYPES = Set.of(
-            SCP_TYPE, "TAG_POLICY", "BACKUP_POLICY", "AISERVICES_OPT_OUT_POLICY");
+            SCP_TYPE, "TAG_POLICY", "BACKUP_POLICY", "AISERVICES_OPT_OUT_POLICY",
+            "RESOURCE_CONTROL_POLICY", "DECLARATIVE_POLICY_EC2", "CHATBOT_POLICY");
 
     static final String FULL_AWS_ACCESS_ID = "p-FullAWSAccess";
     static final String FULL_AWS_ACCESS_CONTENT =

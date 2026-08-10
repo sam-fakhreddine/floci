@@ -408,6 +408,22 @@ class OrganizationsServiceTest {
     }
 
     @Test
+    void enablesNewerAwsPolicyTypes() {
+        // LZA's AccountsStack enables DECLARATIVE_POLICY_EC2 (and orgs also support
+        // RESOURCE_CONTROL_POLICY / CHATBOT_POLICY). These must be accepted, not rejected
+        // as InvalidInputException.
+        service.createOrganization(MGMT, null);
+        String rootId = service.listRoots(MGMT).get(0).getId();
+
+        for (String type : List.of("DECLARATIVE_POLICY_EC2", "RESOURCE_CONTROL_POLICY", "CHATBOT_POLICY")) {
+            OrgRoot root = service.enablePolicyType(MGMT, rootId, type);
+            assertTrue(root.getPolicyTypes().stream()
+                            .anyMatch(t -> type.equals(t.getType()) && "ENABLED".equals(t.getStatus())),
+                    "policy type " + type + " should be enabled on the root");
+        }
+    }
+
+    @Test
     void effectivePolicyMergesInheritanceOperators() {
         service.createOrganization(MGMT, null);
         String rootId = service.listRoots(MGMT).get(0).getId();
