@@ -286,6 +286,8 @@ public interface EmulatorConfig {
         RumStorageConfig rum();
         GuardDutyStorageConfig guardduty();
         EmrServerlessStorageConfig emrserverless();
+
+        ControlTowerStorageConfig controltower();
     }
 
     interface SsmStorageConfig {
@@ -522,6 +524,13 @@ public interface EmulatorConfig {
         long flushIntervalMs();
     }
 
+    interface ControlTowerStorageConfig {
+        Optional<String> mode();
+
+        @WithDefault("5000")
+        long flushIntervalMs();
+    }
+
     interface GuardDutyStorageConfig {
         Optional<String> mode();
 
@@ -646,6 +655,8 @@ public interface EmulatorConfig {
         RumServiceConfig rum();
         GuardDutyServiceConfig guardduty();
         EmrServerlessServiceConfig emrserverless();
+
+        ControlTowerServiceConfig controltower();
     }
 
     interface IotServiceConfig {
@@ -675,6 +686,11 @@ public interface EmulatorConfig {
     }
 
     interface RumServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
+    interface ControlTowerServiceConfig {
         @WithDefault("true")
         boolean enabled();
     }
