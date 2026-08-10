@@ -95,6 +95,7 @@ public class IamQueryHandler {
 
             // Roles
             case "CreateRole" -> handleCreateRole(params);
+            case "CreateServiceLinkedRole" -> handleCreateServiceLinkedRole(params);
             case "GetRole" -> handleGetRole(params);
             case "DeleteRole" -> handleDeleteRole(params);
             case "ListRoles" -> handleListRoles(params);
@@ -167,6 +168,11 @@ public class IamQueryHandler {
             case "UpdateAccountPasswordPolicy" -> handleUpdateAccountPasswordPolicy(params);
             case "GetAccountPasswordPolicy" -> handleGetAccountPasswordPolicy(params);
             case "DeleteAccountPasswordPolicy" -> handleDeleteAccountPasswordPolicy(params);
+            case "ListOrganizationsFeatures" -> handleListOrganizationsFeatures(params);
+            case "EnableOrganizationsRootCredentialsManagement" -> handleEnableOrganizationsRootCredentialsManagement(params);
+            case "EnableOrganizationsRootSessions" -> handleEnableOrganizationsRootSessions(params);
+            case "DisableOrganizationsRootCredentialsManagement" -> handleDisableOrganizationsRootCredentialsManagement(params);
+            case "DisableOrganizationsRootSessions" -> handleDisableOrganizationsRootSessions(params);
 
             // Instance Profiles
             case "CreateInstanceProfile" -> handleCreateInstanceProfile(params);
@@ -519,6 +525,16 @@ public class IamQueryHandler {
         IamRole role = iamService.createRole(roleName, path, trustPolicy, description, maxSession, tags);
         String result = new XmlBuilder().start("Role").raw(roleXml(role, true)).end("Role").build();
         return Response.ok(AwsQueryResponse.envelope("CreateRole", AwsNamespaces.IAM, result)).build();
+    }
+
+    private Response handleCreateServiceLinkedRole(MultivaluedMap<String, String> params) {
+        String awsServiceName = getParam(params, "AWSServiceName");
+        String customSuffix = getParam(params, "CustomSuffix");
+        String description = getParam(params, "Description");
+        IamRole role = iamService.createServiceLinkedRole(awsServiceName, customSuffix, description);
+        String result = new XmlBuilder().start("Role").raw(roleXml(role)).end("Role").build();
+        return Response.ok(
+                AwsQueryResponse.envelope("CreateServiceLinkedRole", AwsNamespaces.IAM, result)).build();
     }
 
     private Response handleGetRole(MultivaluedMap<String, String> params) {
@@ -960,6 +976,49 @@ public class IamQueryHandler {
     private Response handleDeleteAccountPasswordPolicy(MultivaluedMap<String, String> params) {
         iamService.deleteAccountPasswordPolicy();
         return Response.ok(AwsQueryResponse.envelopeNoResult("DeleteAccountPasswordPolicy", AwsNamespaces.IAM)).build();
+    }
+
+    // =========================================================================
+    // Centralized root access management (org-scoped, IAM Query endpoint)
+    // =========================================================================
+
+    private Response handleListOrganizationsFeatures(MultivaluedMap<String, String> params) {
+        return rootFeaturesResponse("ListOrganizationsFeatures", iamService.listOrganizationsFeatures());
+    }
+
+    private Response handleEnableOrganizationsRootCredentialsManagement(MultivaluedMap<String, String> params) {
+        return rootFeaturesResponse("EnableOrganizationsRootCredentialsManagement",
+                iamService.enableOrganizationsRootCredentialsManagement());
+    }
+
+    private Response handleEnableOrganizationsRootSessions(MultivaluedMap<String, String> params) {
+        return rootFeaturesResponse("EnableOrganizationsRootSessions",
+                iamService.enableOrganizationsRootSessions());
+    }
+
+    private Response handleDisableOrganizationsRootCredentialsManagement(MultivaluedMap<String, String> params) {
+        return rootFeaturesResponse("DisableOrganizationsRootCredentialsManagement",
+                iamService.disableOrganizationsRootCredentialsManagement());
+    }
+
+    private Response handleDisableOrganizationsRootSessions(MultivaluedMap<String, String> params) {
+        return rootFeaturesResponse("DisableOrganizationsRootSessions",
+                iamService.disableOrganizationsRootSessions());
+    }
+
+    /**
+     * Builds the shared {@code <EnabledFeatures><member>..</member></EnabledFeatures>} result used by
+     * both {@code ListOrganizationsFeatures} and the enable/disable ops. The org-scoped
+     * {@code OrganizationId} is intentionally omitted — LZA's root-user-management module reads only
+     * the enabled-feature set, and omitting it avoids coupling the IAM endpoint to Organizations.
+     */
+    private Response rootFeaturesResponse(String action, List<String> features) {
+        XmlBuilder xml = new XmlBuilder().start("EnabledFeatures");
+        for (String feature : features) {
+            xml.elem("member", feature);
+        }
+        String result = xml.end("EnabledFeatures").build();
+        return Response.ok(AwsQueryResponse.envelope(action, AwsNamespaces.IAM, result)).build();
     }
 
     // =========================================================================
