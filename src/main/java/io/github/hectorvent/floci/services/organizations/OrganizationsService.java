@@ -81,6 +81,8 @@ public class OrganizationsService {
     private final ObjectMapper mapper;
     /** Nullable in unit tests: role provisioning on CreateAccount is best-effort. */
     private final IamService iamService;
+    private final Object policyMutationLock = new Object();
+    private final Object policyTypeMutationLock = new Object();
     /**
      * Optional override for the management account's email. AWS derives the management
      * account email from the account that creates the organization; floci has no such
@@ -712,33 +714,41 @@ public class OrganizationsService {
     public void attachPolicy(String callerAccount, String policyId, String targetId) {
         OrgContext ctx = requireManagement(callerAccount);
         String mgmt = ctx.managementAccount();
-        OrgPolicy policy = requirePolicy(mgmt, policyId);
         requireTarget(mgmt, targetId);
-        requirePolicyTypeEnabled(mgmt, policy.getType());
-        if (policy.getTargetIds().contains(targetId)) {
-            throw new AwsException("DuplicatePolicyAttachmentException",
-                    "The policy is already attached to the target.", 400);
+        synchronized (policyMutationLock) {
+            OrgPolicy policy = requirePolicy(mgmt, policyId);
+            requirePolicyTypeEnabled(mgmt, policy.getType());
+            if (policy.getTargetIds().contains(targetId)) {
+                throw new AwsException("DuplicatePolicyAttachmentException",
+                        "The policy is already attached to the target.", 400);
+            }
+            List<String> targetIds = new ArrayList<>(policy.getTargetIds());
+            targetIds.add(targetId);
+            policy.setTargetIds(targetIds);
+            policyStore.putForAccount(mgmt, policyId, policy);
         }
-        policy.getTargetIds().add(targetId);
-        policyStore.putForAccount(mgmt, policyId, policy);
     }
 
     public void detachPolicy(String callerAccount, String policyId, String targetId) {
         OrgContext ctx = requireManagement(callerAccount);
         String mgmt = ctx.managementAccount();
-        OrgPolicy policy = requirePolicy(mgmt, policyId);
         requireTarget(mgmt, targetId);
-        if (!policy.getTargetIds().contains(targetId)) {
-            throw new AwsException("PolicyNotAttachedException",
-                    "The policy is not attached to the target.", 400);
+        synchronized (policyMutationLock) {
+            OrgPolicy policy = requirePolicy(mgmt, policyId);
+            if (!policy.getTargetIds().contains(targetId)) {
+                throw new AwsException("PolicyNotAttachedException",
+                        "The policy is not attached to the target.", 400);
+            }
+            if (SCP_TYPE.equals(policy.getType())
+                    && policiesForTarget(mgmt, targetId, SCP_TYPE).size() == 1) {
+                throw new AwsException("ConstraintViolationException",
+                        "You can't detach the last service control policy from a target.", 400);
+            }
+            List<String> targetIds = new ArrayList<>(policy.getTargetIds());
+            targetIds.remove(targetId);
+            policy.setTargetIds(targetIds);
+            policyStore.putForAccount(mgmt, policyId, policy);
         }
-        if (SCP_TYPE.equals(policy.getType())
-                && policiesForTarget(mgmt, targetId, SCP_TYPE).size() == 1) {
-            throw new AwsException("ConstraintViolationException",
-                    "You can't detach the last service control policy from a target.", 400);
-        }
-        policy.getTargetIds().remove(targetId);
-        policyStore.putForAccount(mgmt, policyId, policy);
     }
 
     public List<OrgPolicy> listPoliciesForTarget(String callerAccount, String targetId, String filter) {
@@ -775,19 +785,27 @@ public class OrganizationsService {
     public OrgRoot enablePolicyType(String callerAccount, String rootId, String type) {
         OrgContext ctx = requireManagement(callerAccount);
         String mgmt = ctx.managementAccount();
-        OrgRoot root = requireRoot(mgmt, rootId);
         requireValidPolicyType(type);
-        if (root.getPolicyTypes().stream().anyMatch(t -> type.equals(t.getType()))) {
-            throw new AwsException("PolicyTypeAlreadyEnabledException",
-                    "The policy type is already enabled on the root.", 400);
-        }
-        root.getPolicyTypes().add(new PolicyTypeSummary(type, "ENABLED"));
-        rootStore.putForAccount(mgmt, rootId, root);
+        OrgRoot root;
+        synchronized (policyTypeMutationLock) {
+            root = requireRoot(mgmt, rootId);
+            if (root.getPolicyTypes().stream().anyMatch(t -> type.equals(t.getType()))) {
+                throw new AwsException("PolicyTypeAlreadyEnabledException",
+                        "The policy type is already enabled on the root.", 400);
+            }
+            List<PolicyTypeSummary> policyTypes = new ArrayList<>(root.getPolicyTypes());
+            policyTypes.add(new PolicyTypeSummary(type, "ENABLED"));
+            root.setPolicyTypes(policyTypes);
+            rootStore.putForAccount(mgmt, rootId, root);
 
-        Organization org = ctx.org();
-        if (org.getAvailablePolicyTypes().stream().noneMatch(t -> type.equals(t.getType()))) {
-            org.getAvailablePolicyTypes().add(new PolicyTypeSummary(type, "ENABLED"));
-            organizationStore.putForAccount(mgmt, ORG_KEY, org);
+            Organization org = organizationStore.getForAccount(mgmt, ORG_KEY).orElseThrow();
+            if (org.getAvailablePolicyTypes().stream().noneMatch(t -> type.equals(t.getType()))) {
+                List<PolicyTypeSummary> availablePolicyTypes =
+                        new ArrayList<>(org.getAvailablePolicyTypes());
+                availablePolicyTypes.add(new PolicyTypeSummary(type, "ENABLED"));
+                org.setAvailablePolicyTypes(availablePolicyTypes);
+                organizationStore.putForAccount(mgmt, ORG_KEY, org);
+            }
         }
 
         if (SCP_TYPE.equals(type)) {

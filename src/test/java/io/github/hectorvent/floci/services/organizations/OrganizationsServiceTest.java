@@ -10,11 +10,17 @@ import io.github.hectorvent.floci.services.organizations.model.OrgPolicy;
 import io.github.hectorvent.floci.services.organizations.model.OrgRoot;
 import io.github.hectorvent.floci.services.organizations.model.Organization;
 import io.github.hectorvent.floci.services.organizations.model.OrganizationalUnit;
+import io.github.hectorvent.floci.services.organizations.model.PolicyTypeSummary;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -364,6 +370,70 @@ class OrganizationsServiceTest {
         AwsException gone = assertThrows(AwsException.class,
                 () -> service.describePolicy(MGMT, policy.getId()));
         assertEquals("PolicyNotFoundException", gone.getErrorCode());
+    }
+
+    @Test
+    void concurrentPolicyAttachmentsDoNotLoseUpdates() throws Exception {
+        service.createOrganization(MGMT, null);
+        String rootId = service.listRoots(MGMT).get(0).getId();
+        String firstOu = service.createOrganizationalUnit(MGMT, rootId, "first", null).getId();
+        String secondOu = service.createOrganizationalUnit(MGMT, rootId, "second", null).getId();
+        OrgPolicy policy = service.createPolicy(MGMT, "concurrent", null,
+                "SERVICE_CONTROL_POLICY", DENY_S3, null);
+
+        runConcurrently(
+                () -> service.attachPolicy(MGMT, policy.getId(), firstOu),
+                () -> service.attachPolicy(MGMT, policy.getId(), secondOu));
+
+        assertEquals(Set.of(firstOu, secondOu),
+                Set.copyOf(service.describePolicy(MGMT, policy.getId()).getTargetIds()));
+    }
+
+    @Test
+    void concurrentPolicyTypeEnablementDoesNotLoseUpdates() throws Exception {
+        service.createOrganization(MGMT, null);
+        String rootId = service.listRoots(MGMT).get(0).getId();
+
+        runConcurrently(
+                () -> service.enablePolicyType(MGMT, rootId, "TAG_POLICY"),
+                () -> service.enablePolicyType(MGMT, rootId, "BACKUP_POLICY"));
+
+        assertEquals(Set.of("SERVICE_CONTROL_POLICY", "TAG_POLICY", "BACKUP_POLICY"),
+                service.listRoots(MGMT).get(0).getPolicyTypes().stream()
+                        .map(PolicyTypeSummary::getType).collect(java.util.stream.Collectors.toSet()));
+        assertEquals(Set.of("SERVICE_CONTROL_POLICY", "TAG_POLICY", "BACKUP_POLICY"),
+                service.describeOrganization(MGMT).getAvailablePolicyTypes().stream()
+                        .map(PolicyTypeSummary::getType).collect(java.util.stream.Collectors.toSet()));
+    }
+
+    private static void runConcurrently(Runnable first, Runnable second) throws Exception {
+        CountDownLatch ready = new CountDownLatch(2);
+        CountDownLatch start = new CountDownLatch(1);
+        try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
+            Future<?> firstResult = executor.submit(() -> {
+                ready.countDown();
+                await(start);
+                first.run();
+            });
+            Future<?> secondResult = executor.submit(() -> {
+                ready.countDown();
+                await(start);
+                second.run();
+            });
+            ready.await();
+            start.countDown();
+            firstResult.get();
+            secondResult.get();
+        }
+    }
+
+    private static void await(CountDownLatch latch) {
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while awaiting concurrent test start", e);
+        }
     }
 
     @Test
