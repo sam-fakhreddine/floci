@@ -62,6 +62,11 @@ returns `InvalidApprovalTokenException` for unknown tokens, and returns
 
 ## V2 stage conditions, retry, and rollback
 
+Floci currently provides a useful **partial V2 implementation**. Completing trigger-driven
+execution, strict rule evaluation, execution isolation, and persistent artifact lineage is
+tracked in the [CodePipeline V2 follow-up epic](codepipeline-v2-epic.md). The LZA scenario uses
+a V1 pipeline and does not depend on that follow-up.
+
 V2 stage condition blocks (`beforeEntry`, `onSuccess`, `onFailure`) are evaluated during
 execution. Two rule providers evaluate for real: **LambdaInvoke** (invokes the configured
 local Lambda function; the rule passes when the invocation succeeds) and **VariableCheck**
