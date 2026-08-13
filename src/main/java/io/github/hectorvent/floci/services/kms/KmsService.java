@@ -269,11 +269,17 @@ public class KmsService {
     }
 
     public KmsGrant createGrant(String keyId, String granteePrincipal, List<String> operations, String region) {
-        return createGrant(keyId, granteePrincipal, operations, null, region);
+        return createGrant(keyId, granteePrincipal, operations, null, null, null, region);
     }
 
     public KmsGrant createGrant(String keyId, String granteePrincipal, List<String> operations,
                                 String retiringPrincipal, String region) {
+        return createGrant(keyId, granteePrincipal, operations, retiringPrincipal, null, null, region);
+    }
+
+    public KmsGrant createGrant(String keyId, String granteePrincipal, List<String> operations,
+                                String retiringPrincipal, String name, Map<String, Object> constraints,
+                                String region) {
         if (keyId == null || keyId.isBlank()) {
             throw new AwsException("ValidationException", "KeyId is required", 400);
         }
@@ -292,11 +298,13 @@ public class KmsService {
         KmsGrant grant = new KmsGrant();
         grant.setGrantId(grantId);
         grant.setGrantToken(Base64.getUrlEncoder().withoutPadding().encodeToString(tokenBytes));
+        grant.setName(name);
         grant.setKeyId(key.getKeyId());
         grant.setKeyArn(key.getArn());
         grant.setGranteePrincipal(granteePrincipal);
         grant.setRetiringPrincipal(retiringPrincipal);
         grant.setOperations(new ArrayList<>(operations));
+        grant.setConstraints(constraints == null ? null : new HashMap<>(constraints));
 
         grantStore.put(region + "::" + grantId, grant);
         LOG.infov("Created KMS grant: {0} for key {1} in {2}", grantId, key.getKeyId(), region);
@@ -461,6 +469,12 @@ public class KmsService {
         result.put("GranteePrincipal", grant.getGranteePrincipal());
         result.put("Operations", grant.getOperations());
         result.put("CreationDate", grant.getCreationDate());
+        if (grant.getName() != null) {
+            result.put("Name", grant.getName());
+        }
+        if (grant.getConstraints() != null) {
+            result.put("Constraints", grant.getConstraints());
+        }
         if (grant.getRetiringPrincipal() != null) {
             result.put("RetiringPrincipal", grant.getRetiringPrincipal());
         }
