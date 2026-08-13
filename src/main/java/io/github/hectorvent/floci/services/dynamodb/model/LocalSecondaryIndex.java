@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.dynamodb.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
@@ -62,6 +63,7 @@ public class LocalSecondaryIndex {
     public long getItemCount() { return itemCount; }
     public void setItemCount(long itemCount) { this.itemCount = itemCount; }
 
+    @JsonIgnore
     public String getPartitionKeyName() {
         return keySchema.stream()
                 .filter(k -> "HASH".equals(k.getKeyType()))
@@ -70,6 +72,7 @@ public class LocalSecondaryIndex {
                 .orElseThrow();
     }
 
+    @JsonIgnore
     public String getSortKeyName() {
         return keySchema.stream()
                 .filter(k -> "RANGE".equals(k.getKeyType()))
@@ -82,6 +85,7 @@ public class LocalSecondaryIndex {
      * Returns all sort key attribute names in key-schema order. For a composite sort key this
      * contains more than one element; ordering must consider all of them, not just the first.
      */
+    @JsonIgnore
     public List<String> getSortKeyNames() {
         return keySchema.stream()
                 .filter(k -> "RANGE".equals(k.getKeyType()))
