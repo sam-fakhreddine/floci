@@ -26,6 +26,7 @@ import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -67,6 +68,8 @@ public class OrganizationsService {
     static final String FULL_AWS_ACCESS_CONTENT =
             "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
                     + "\"Action\":\"*\",\"Resource\":\"*\"}]}";
+    static final String CONTROL_TOWER_GUARDRAIL_ID = "p-flocictguardrail";
+    static final String CONTROL_TOWER_GUARDRAIL_NAME = "aws-guardrails-FlociControlTowerBaseline";
 
     /** Handshakes expire 15 days after creation, matching AWS. */
     private static final double HANDSHAKE_TTL_SECONDS = 15 * 24 * 3600;
@@ -757,6 +760,57 @@ public class OrganizationsService {
         requireTarget(mgmt, targetId);
         requireValidPolicyType(filter);
         return policiesForTarget(mgmt, targetId, filter);
+    }
+
+    /**
+     * Reconciles the Organizations side effect of Control Tower OU registration. Real Control
+     * Tower attaches customer-managed SCPs named {@code aws-guardrails-*}; LZA 1.14 uses that
+     * observable contract to validate top-level OU governance. The Security OU is governed by
+     * the landing zone itself and therefore may not appear in the enabled-baseline targets.
+     */
+    public void ensureControlTowerGuardrails(String callerAccount, Set<String> registeredOuIds) {
+        if (organizationStore.getForAccount(callerAccount, ORG_KEY).isEmpty()) {
+            return;
+        }
+        OrgContext ctx = requireManagement(callerAccount);
+        String mgmt = ctx.managementAccount();
+        Set<String> targetIds = new LinkedHashSet<>(registeredOuIds);
+        organizationalUnits(mgmt).stream()
+                .filter(ou -> "Security".equals(ou.getName()))
+                .map(OrganizationalUnit::getId)
+                .forEach(targetIds::add);
+        if (targetIds.isEmpty()) {
+            return;
+        }
+        targetIds.forEach(targetId -> requireOu(mgmt, targetId));
+
+        synchronized (policyMutationLock) {
+            OrgPolicy guardrail = policies(mgmt).stream()
+                    .filter(policy -> SCP_TYPE.equals(policy.getType()))
+                    .filter(policy -> CONTROL_TOWER_GUARDRAIL_NAME.equals(policy.getName()))
+                    .findFirst()
+                    .orElseGet(() -> {
+                        OrgPolicy policy = new OrgPolicy();
+                        policy.setId(CONTROL_TOWER_GUARDRAIL_ID);
+                        policy.setArn(policyArn(mgmt, ctx.org().getId(), SCP_TYPE,
+                                CONTROL_TOWER_GUARDRAIL_ID, false));
+                        policy.setName(CONTROL_TOWER_GUARDRAIL_NAME);
+                        policy.setDescription("Control Tower governance marker for registered OUs");
+                        policy.setType(SCP_TYPE);
+                        policy.setContent(FULL_AWS_ACCESS_CONTENT);
+                        policy.setAwsManaged(false);
+                        policy.setCreated(now());
+                        policy.setUpdated(policy.getCreated());
+                        return policy;
+                    });
+
+            Set<String> mergedTargets = new LinkedHashSet<>(guardrail.getTargetIds());
+            if (mergedTargets.addAll(targetIds) || guardrail.getTargetIds().isEmpty()) {
+                guardrail.setTargetIds(new ArrayList<>(mergedTargets));
+                guardrail.setUpdated(now());
+                policyStore.putForAccount(mgmt, guardrail.getId(), guardrail);
+            }
+        }
     }
 
     /** An attachment target of a policy: root, OU, or account. */
