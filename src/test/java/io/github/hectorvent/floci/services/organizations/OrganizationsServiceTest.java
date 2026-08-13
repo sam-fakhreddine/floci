@@ -338,6 +338,29 @@ class OrganizationsServiceTest {
     }
 
     @Test
+    void controlTowerGuardrailsReconcileRegisteredAndSecurityOusIdempotently() {
+        service.createOrganization(MGMT, null);
+        String rootId = service.listRoots(MGMT).get(0).getId();
+        String registered = service.createOrganizationalUnit(MGMT, rootId, "Infrastructure", null).getId();
+        String security = service.createOrganizationalUnit(MGMT, rootId, "Security", null).getId();
+        String unrelated = service.createOrganizationalUnit(MGMT, rootId, "Suspended", null).getId();
+
+        service.ensureControlTowerGuardrails(MGMT, Set.of(registered));
+        service.ensureControlTowerGuardrails(MGMT, Set.of(registered));
+
+        OrgPolicy guardrail = service.describePolicy(MGMT, OrganizationsService.CONTROL_TOWER_GUARDRAIL_ID);
+        assertEquals(OrganizationsService.CONTROL_TOWER_GUARDRAIL_NAME, guardrail.getName());
+        assertFalse(guardrail.isAwsManaged());
+        assertEquals(Set.of(registered, security), Set.copyOf(guardrail.getTargetIds()));
+        assertTrue(service.listPoliciesForTarget(MGMT, registered, "SERVICE_CONTROL_POLICY")
+                .stream().anyMatch(policy -> policy.getName().startsWith("aws-guardrails-")));
+        assertTrue(service.listPoliciesForTarget(MGMT, security, "SERVICE_CONTROL_POLICY")
+                .stream().anyMatch(policy -> policy.getName().startsWith("aws-guardrails-")));
+        assertFalse(service.listPoliciesForTarget(MGMT, unrelated, "SERVICE_CONTROL_POLICY")
+                .stream().anyMatch(policy -> policy.getName().startsWith("aws-guardrails-")));
+    }
+
+    @Test
     void policyCrudAndAttachmentLifecycle() {
         service.createOrganization(MGMT, null);
         String rootId = service.listRoots(MGMT).get(0).getId();
