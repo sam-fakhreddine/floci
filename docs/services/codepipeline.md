@@ -54,6 +54,12 @@ A Manual approval action whose configuration sets `NotificationArn` publishes th
 approval-needed message (subject `APPROVAL NEEDED: AWS CodePipeline ...`, JSON body with
 the approval token and `CustomData`) to that SNS topic when it starts waiting.
 
+`PutApprovalResult` now completes waiting Manual approval actions with AWS-shaped
+validation and error responses. Floci validates the stage and action names, enforces
+`result.status` as `Approved` or `Rejected`, limits `result.summary` to 512 characters,
+returns `InvalidApprovalTokenException` for unknown tokens, and returns
+`ApprovalAlreadyCompletedException` if the same approval token is reused after completion.
+
 ## V2 stage conditions, retry, and rollback
 
 V2 stage condition blocks (`beforeEntry`, `onSuccess`, `onFailure`) are evaluated during
