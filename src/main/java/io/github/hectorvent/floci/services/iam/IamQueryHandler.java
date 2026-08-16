@@ -86,6 +86,7 @@ public class IamQueryHandler {
             // Groups
             case "CreateGroup" -> handleCreateGroup(params);
             case "GetGroup" -> handleGetGroup(params);
+            case "UpdateGroup" -> handleUpdateGroup(params);
             case "DeleteGroup" -> handleDeleteGroup(params);
             case "ListGroups" -> handleListGroups(params);
             case "AddUserToGroup" -> handleAddUserToGroup(params);
@@ -104,6 +105,8 @@ public class IamQueryHandler {
             case "UpdateAssumeRolePolicy" -> handleUpdateAssumeRolePolicy(params);
             case "TagRole" -> handleTagRole(params);
             case "UntagRole" -> handleUntagRole(params);
+            case "TagInstanceProfile" -> handleTagInstanceProfile(params);
+            case "UntagInstanceProfile" -> handleUntagInstanceProfile(params);
             case "ListRoleTags" -> handleListRoleTags(params);
 
             // Managed Policies
@@ -462,6 +465,12 @@ public class IamQueryHandler {
         }
         xml.end("Users").elem("IsTruncated", false);
         return Response.ok(AwsQueryResponse.envelope("GetGroup", AwsNamespaces.IAM, xml.build())).build();
+    }
+
+    private Response handleUpdateGroup(MultivaluedMap<String, String> params) {
+        iamService.updateGroup(getParam(params, "GroupName"),
+                getParam(params, "NewGroupName"), getParam(params, "NewPath"));
+        return Response.ok(AwsQueryResponse.envelopeNoResult("UpdateGroup", AwsNamespaces.IAM)).build();
     }
 
     private Response handleDeleteGroup(MultivaluedMap<String, String> params) {
@@ -1266,5 +1275,15 @@ public class IamQueryHandler {
     private String isoDate(Instant instant) {
         if (instant == null) return "";
         return DateTimeFormatter.ISO_INSTANT.format(instant);
+    }
+
+    private Response handleTagInstanceProfile(MultivaluedMap<String, String> params) {
+        iamService.tagInstanceProfile(getParam(params, "InstanceProfileName"), extractTags(params));
+        return Response.ok(AwsQueryResponse.envelopeNoResult("TagInstanceProfile", AwsNamespaces.IAM)).build();
+    }
+
+    private Response handleUntagInstanceProfile(MultivaluedMap<String, String> params) {
+        iamService.untagInstanceProfile(getParam(params, "InstanceProfileName"), extractTagKeys(params));
+        return Response.ok(AwsQueryResponse.envelopeNoResult("UntagInstanceProfile", AwsNamespaces.IAM)).build();
     }
 }
