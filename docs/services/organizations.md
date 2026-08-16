@@ -31,6 +31,7 @@ ID against any other emulated service.
 | `ListCreateAccountStatus` | Lists account-creation status records, optionally by state |
 | `DescribeAccount` | Returns one member account |
 | `ListAccounts` | Lists all accounts in the organization |
+| `ListAccountsWithInvalidEffectivePolicy` | - |
 | `ListAccountsForParent` | Lists the accounts directly under a root or OU |
 | `CloseAccount` | Marks a member account SUSPENDED |
 | `RemoveAccountFromOrganization` | Removes a member account (management account only) |

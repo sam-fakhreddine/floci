@@ -19,6 +19,7 @@ import jakarta.ws.rs.core.Response;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
@@ -54,6 +55,7 @@ public class OrganizationsJsonHandler {
             case "ListCreateAccountStatus" -> handleListCreateAccountStatus(request, account);
             case "DescribeAccount" -> handleDescribeAccount(request, account);
             case "ListAccounts" -> handleListAccounts(request, account);
+            case "ListAccountsWithInvalidEffectivePolicy" -> handleListAccountsWithInvalidEffectivePolicy(request, account);
             case "ListAccountsForParent" -> handleListAccountsForParent(request, account);
             case "CloseAccount" -> handleCloseAccount(request, account);
             case "RemoveAccountFromOrganization" -> handleRemoveAccountFromOrganization(request, account);
@@ -681,5 +683,14 @@ public class OrganizationsJsonHandler {
 
     private Response empty() {
         return Response.ok(mapper.createObjectNode()).build();
+    }
+
+    /**
+     * Effective policies are not modeled in Floci; there is no way to evaluate
+     * which accounts have invalid effective policies. Return an explicit empty
+     * list to match the wire contract without fabricating data.
+     */
+    private Response handleListAccountsWithInvalidEffectivePolicy(JsonNode request, String account) {
+        return paged(request, Collections.emptyList(), "Accounts", this::accountNode);
     }
 }
