@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.github.hectorvent.floci.services.iam.model.IamUser;
 import io.github.hectorvent.floci.services.iam.model.InstanceProfile;
 import io.github.hectorvent.floci.services.iam.model.OpenIDConnectProvider;
+import io.github.hectorvent.floci.services.iam.model.PasswordPolicy;
 import io.github.hectorvent.floci.services.iam.model.SessionCredential;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -95,6 +96,7 @@ class IamServicePersistenceTest {
                 load(dir, "iam-account-aliases.json", new TypeReference<Map<String, String>>() {}),
                 load(dir, "iam-oidc-providers.json", new TypeReference<Map<String, OpenIDConnectProvider>>() {}),
                 load(dir, "iam-slr-deletions.json", new TypeReference<Map<String, String>>() {}),
+                load(dir, "iam-password-policy.json", new TypeReference<Map<String, PasswordPolicy>>() {}),
                 new RegionResolver("us-east-1", "000000000000"),
                 false,
                 null);

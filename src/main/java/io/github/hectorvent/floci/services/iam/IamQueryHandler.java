@@ -96,7 +96,6 @@ public class IamQueryHandler {
 
             // Roles
             case "CreateRole" -> handleCreateRole(params);
-            case "CreateServiceLinkedRole" -> handleCreateServiceLinkedRole(params);
             case "GetRole" -> handleGetRole(params);
             case "DeleteRole" -> handleDeleteRole(params);
             case "ListRoles" -> handleListRoles(params);
@@ -534,16 +533,6 @@ public class IamQueryHandler {
         IamRole role = iamService.createRole(roleName, path, trustPolicy, description, maxSession, tags);
         String result = new XmlBuilder().start("Role").raw(roleXml(role, true)).end("Role").build();
         return Response.ok(AwsQueryResponse.envelope("CreateRole", AwsNamespaces.IAM, result)).build();
-    }
-
-    private Response handleCreateServiceLinkedRole(MultivaluedMap<String, String> params) {
-        String awsServiceName = getParam(params, "AWSServiceName");
-        String customSuffix = getParam(params, "CustomSuffix");
-        String description = getParam(params, "Description");
-        IamRole role = iamService.createServiceLinkedRole(awsServiceName, customSuffix, description);
-        String result = new XmlBuilder().start("Role").raw(roleXml(role)).end("Role").build();
-        return Response.ok(
-                AwsQueryResponse.envelope("CreateServiceLinkedRole", AwsNamespaces.IAM, result)).build();
     }
 
     private Response handleGetRole(MultivaluedMap<String, String> params) {
