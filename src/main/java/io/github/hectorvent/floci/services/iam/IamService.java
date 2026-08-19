@@ -536,48 +536,6 @@ public class IamService implements SessionAccountLookup {
      * @param customSuffix   optional suffix appended as {@code <roleName>_<suffix>} (may be null)
      * @param description    optional role description (may be null)
      */
-    public IamRole createServiceLinkedRole(String awsServiceName, String customSuffix, String description) {
-        String roleName = serviceLinkedRoleName(awsServiceName);
-        if (customSuffix != null && !customSuffix.isBlank()) {
-            roleName = roleName + "_" + customSuffix;
-        }
-        String path = "/aws-service-role/" + awsServiceName + "/";
-        java.util.Optional<IamRole> existing = roles.get(roleName);
-        if (existing.isPresent()) {
-            return existing.get();
-        }
-        String roleId = "AROA" + randomId(16);
-        String arn = iamArn("role", path, roleName);
-        String trustPolicy = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
-                + "\"Principal\":{\"Service\":\"" + awsServiceName + "\"},"
-                + "\"Action\":\"sts:AssumeRole\"}]}";
-        IamRole role = new IamRole(roleId, roleName, path, arn, trustPolicy);
-        role.setDescription(description);
-        roles.put(roleName, role);
-        LOG.infov("Created service-linked role {0} for {1}", roleName, awsServiceName);
-        return role;
-    }
-
-    /**
-     * Derives the standard service-linked role name from a service principal:
-     * {@code AWSServiceRoleFor} followed by the PascalCase of the service short name
-     * (the label before {@code .amazonaws.com}), splitting on any non-alphanumeric char.
-     */
-    private static String serviceLinkedRoleName(String awsServiceName) {
-        String shortName = awsServiceName;
-        int dot = shortName.indexOf('.');
-        if (dot > 0) {
-            shortName = shortName.substring(0, dot);
-        }
-        StringBuilder sb = new StringBuilder("AWSServiceRoleFor");
-        for (String part : shortName.split("[^A-Za-z0-9]+")) {
-            if (part.isEmpty()) continue;
-            sb.append(Character.toUpperCase(part.charAt(0)));
-            if (part.length() > 1) sb.append(part.substring(1));
-        }
-        return sb.toString();
-    }
-
     public IamRole getRole(String roleName) {
         return roles.get(roleName)
                 .orElseThrow(() -> new AwsException("NoSuchEntity",

@@ -61,6 +61,7 @@ class IamPasswordPolicyPersistenceTest {
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
                 load(dir, "iam-password-policy.json"),
+                new InMemoryStorage<>(),
                 new RegionResolver("us-east-1", "000000000000"),
                 false
         );
