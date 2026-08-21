@@ -31,7 +31,7 @@ ID against any other emulated service.
 | `ListCreateAccountStatus` | Lists account-creation status records, optionally by state |
 | `DescribeAccount` | Returns one member account |
 | `ListAccounts` | Lists all accounts in the organization |
-| `ListAccountsWithInvalidEffectivePolicy` | - |
+| `ListAccountsWithInvalidEffectivePolicy` | Always returns an empty list — effective policies are not modeled by the emulator |
 | `ListAccountsForParent` | Lists the accounts directly under a root or OU |
 | `CloseAccount` | Marks a member account SUSPENDED |
 | `RemoveAccountFromOrganization` | Removes a member account (management account only) |
@@ -85,35 +85,18 @@ ID against any other emulated service.
 | Environment variable | Default | Description |
 | --- | --- | --- |
 | `FLOCI_SERVICES_ORGANIZATIONS_ENABLED` | `true` | Enables the service |
-| `FLOCI_SERVICES_ORGANIZATIONS_SCP_ENFORCEMENT_ENABLED` | `false` | When `true` (and IAM enforcement is enabled), attached service control policies participate in IAM policy evaluation |
+| `FLOCI_SERVICES_ORGANIZATIONS_SCP_ENFORCEMENT_ENABLED` | `false` | Read by the IAM enforcement layer; inert unless IAM policy enforcement is also enabled |
 | `FLOCI_SERVICES_ORGANIZATIONS_MANAGEMENT_ACCOUNT_EMAIL` | unset | Email reported for the organization's management account (`DescribeOrganization` master account, `ListAccounts`). Unset falls back to the built-in default |
 | `FLOCI_STORAGE_SERVICES_ORGANIZATIONS_MODE` | inherits `FLOCI_STORAGE_MODE` | Storage mode override |
 | `FLOCI_STORAGE_SERVICES_ORGANIZATIONS_FLUSH_INTERVAL_MS` | `5000` | Hybrid/WAL flush interval |
 
 ## SCP enforcement
 
-With `FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED=true` and
-`FLOCI_SERVICES_ORGANIZATIONS_SCP_ENFORCEMENT_ENABLED=true`, service control policies
-attached to the root, OUs, and accounts participate in IAM policy evaluation: an action
-must be allowed at every level of the account's chain and denied at none, before the
-caller's identity policies are consulted. SCPs never grant permissions on their own, and
-the management account is exempt — both matching AWS. See
-[IAM enforcement](iam.md#service-control-policies-scps) for the evaluation order.
-
-**SCP guardrails and the member's bare account key.** A member account's own bare
-12-digit access key is evaluated as the account root and is **subject to the SCP chain**,
-so an SCP `Deny` (for example, `DenyLeaveOrganization`) blocks that key. What the bare
-key does *not* carry is any identity policy — it is an allow-everything root bounded only
-by SCPs. So to exercise **identity-policy** enforcement (permissions granted or denied by
-policies attached to a principal), use account-routable credentials for the member — most
-naturally the `ASIA…` session from assuming its `OrganizationAccountAccessRole`. Unknown
-`AKIA…` keys, and accounts with no effective SCP ceiling (the management account, or an
-account outside any organization), still bypass enforcement (see the
-[bypass rules](iam.md#bypass-rules) and
-[account-root SCP handling](iam.md#service-control-policies-scps)).
-
-`DescribeEffectivePolicy` applies to the three non-SCP policy types and merges the
-inherited chain with the `@@assign`, `@@append`, and `@@remove` inheritance operators.
+`FLOCI_SERVICES_ORGANIZATIONS_SCP_ENFORCEMENT_ENABLED` is read by the IAM policy-evaluation
+layer, not by this service. On its own, Organizations stores and returns service control
+policies but does not evaluate them, so setting this flag here has no effect until IAM
+enforcement is present. See the IAM service documentation for the evaluation order and the
+conditions under which a caller bypasses enforcement.
 
 ## Example
 

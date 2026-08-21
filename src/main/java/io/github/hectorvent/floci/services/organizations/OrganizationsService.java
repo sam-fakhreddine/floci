@@ -25,6 +25,7 @@ import org.jboss.logging.Logger;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -539,15 +540,30 @@ public class OrganizationsService {
         return taggableResourceTags(ctx.managementAccount(), resourceId);
     }
 
+    /**
+     * Effective policies are not modeled in Floci, so no account can be reported as having an
+     * invalid one and the list is always empty. The management-account check still runs, so the
+     * not-in-organization and non-management error paths match AWS rather than collapsing onto
+     * the success path.
+     */
+    public List<OrgAccount> listAccountsWithInvalidEffectivePolicy(String callerAccount) {
+        requireManagement(callerAccount);
+        return List.of();
+    }
+
     public void tagResource(String callerAccount, String resourceId, Map<String, String> tags) {
         OrgContext ctx = requireManagement(callerAccount);
         String mgmt = ctx.managementAccount();
         Map<String, String> existing = taggableResourceTags(mgmt, resourceId);
-        existing.putAll(tags);
-        if (existing.size() > 50) {
+        // taggableResourceTags hands back the model's live map, so the limit has to be checked
+        // against a copy first: mutating and then throwing would leave the rejected tags applied.
+        Map<String, String> merged = new LinkedHashMap<>(existing);
+        merged.putAll(tags);
+        if (merged.size() > 50) {
             throw new AwsException("ConstraintViolationException",
                     "A resource can have at most 50 tags.", 400);
         }
+        existing.putAll(tags);
         persistTaggable(mgmt, resourceId);
     }
 
@@ -645,6 +661,12 @@ public class OrganizationsService {
             throw new AwsException("ConstraintViolationException",
                     "You can't update an AWS managed policy.", 400);
         }
+        // Validate every field before mutating: the stored policy is handed back by reference, so a
+        // setter that runs before a later validation failure stays visible to DescribePolicy even
+        // though the API reported the update as rejected.
+        if (content != null) {
+            validatePolicyContent(content);
+        }
         if (name != null && !name.isBlank() && !name.equals(policy.getName())) {
             if (policies(mgmt).stream().anyMatch(p -> !p.getId().equals(policyId)
                     && policy.getType().equals(p.getType()) && name.equals(p.getName()))) {
@@ -657,7 +679,6 @@ public class OrganizationsService {
             policy.setDescription(description);
         }
         if (content != null) {
-            validatePolicyContent(content);
             policy.setContent(content);
         }
         policy.setUpdated(now());

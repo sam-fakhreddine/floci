@@ -602,4 +602,64 @@ class OrganizationsServiceTest {
         AwsException gone = assertThrows(AwsException.class, () -> service.describeResourcePolicy(MGMT));
         assertEquals("ResourcePolicyNotFoundException", gone.getErrorCode());
     }
+
+    // ------------------------------------------- rejected writes leave no partial state
+
+    @Test
+    void tagResourceOverflowLeavesExistingTagsUntouched() {
+        service.createOrganization(MGMT, null);
+        String rootId = service.listRoots(MGMT).get(0).getId();
+        String ouId = service.createOrganizationalUnit(MGMT, rootId, "workloads", null).getId();
+
+        Map<String, String> first = new java.util.LinkedHashMap<>();
+        for (int i = 0; i < 45; i++) {
+            first.put("k" + i, "v" + i);
+        }
+        service.tagResource(MGMT, ouId, first);
+        assertEquals(45, service.tagsForResource(MGMT, ouId).size());
+
+        Map<String, String> overflow = new java.util.LinkedHashMap<>();
+        for (int i = 100; i < 110; i++) {
+            overflow.put("k" + i, "v" + i);
+        }
+        AwsException e = assertThrows(AwsException.class,
+                () -> service.tagResource(MGMT, ouId, overflow));
+        assertEquals("ConstraintViolationException", e.getErrorCode());
+
+        // the rejected call must not have applied any of its tags
+        Map<String, String> after = service.tagsForResource(MGMT, ouId);
+        assertEquals(45, after.size());
+        assertFalse(after.containsKey("k100"));
+    }
+
+    @Test
+    void updatePolicyWithInvalidContentLeavesNameAndDescriptionUnchanged() {
+        service.createOrganization(MGMT, null);
+        OrgPolicy policy = service.createPolicy(MGMT, "deny-s3", "no s3",
+                "SERVICE_CONTROL_POLICY", DENY_S3, null);
+
+        AwsException e = assertThrows(AwsException.class, () -> service.updatePolicy(
+                MGMT, policy.getId(), "renamed", "new description", "not-json"));
+        assertEquals("MalformedPolicyDocumentException", e.getErrorCode());
+
+        OrgPolicy after = service.describePolicy(MGMT, policy.getId());
+        assertEquals("deny-s3", after.getName());
+        assertEquals("no s3", after.getDescription());
+        assertEquals(DENY_S3, after.getContent());
+    }
+
+    // ------------------------------------- management-only diagnostics keep their error paths
+
+    @Test
+    void listAccountsWithInvalidEffectivePolicyRejectsCallerWithNoOrganization() {
+        AwsException e = assertThrows(AwsException.class,
+                () -> service.listAccountsWithInvalidEffectivePolicy(MGMT));
+        assertEquals("AWSOrganizationsNotInUseException", e.getErrorCode());
+    }
+
+    @Test
+    void listAccountsWithInvalidEffectivePolicyIsEmptyForManagementAccount() {
+        service.createOrganization(MGMT, null);
+        assertTrue(service.listAccountsWithInvalidEffectivePolicy(MGMT).isEmpty());
+    }
 }
