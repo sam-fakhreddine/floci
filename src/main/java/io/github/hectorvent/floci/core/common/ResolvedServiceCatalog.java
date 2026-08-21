@@ -505,7 +505,7 @@ public class ResolvedServiceCatalog {
                         "controltower", storageMode(config.storage().services().controltower().mode(), config.storage().mode()),
                         config.storage().services().controltower().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
-                        Set.of(), Set.of("controltower"), Set.of(), Set.of(ControlTowerController.class))
+                        Set.of(), Set.of("controltower"), Set.of(), Set.of(ControlTowerController.class)),
                 descriptor("route53resolver", "route53resolver", config.services().route53resolver().enabled(), true,
                         null, null, 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
