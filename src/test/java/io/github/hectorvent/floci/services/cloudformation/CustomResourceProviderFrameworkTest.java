@@ -39,13 +39,15 @@ class CustomResourceProviderFrameworkTest {
 
     private final ObjectMapper mapper = new ObjectMapper();
     private LambdaService lambdaService;
+    private ProviderFrameworkDetector detector;
     private CustomResourceResponseStore store;
     private CloudFormationResourceProvisioner provisioner;
 
     @BeforeEach
     void setUp() {
         lambdaService = mock(LambdaService.class);
-        store = new CustomResourceResponseStore();
+        detector = new ProviderFrameworkDetector(lambdaService);
+        store = new CustomResourceResponseStore(detector);
         ContainerReachableEndpoint endpoint = mock(ContainerReachableEndpoint.class);
         when(endpoint.baseUrl()).thenReturn("http://floci:4566");
 
@@ -164,7 +166,7 @@ class CustomResourceProviderFrameworkTest {
 
     @Test
     void asyncPutThatNeverArrivesFailsCleanlyWithinBudget() {
-        provisioner.setAsyncCustomResourceTimeoutForTesting(Duration.ofMillis(300));
+        detector.setAsyncCustomResourceTimeoutForTesting(Duration.ofMillis(300));
         stubFrameworkOnEvent();
         // onEvent returns without PUTting and nothing ever calls back.
         when(lambdaService.invoke(any(), eq(SERVICE_TOKEN), any(), eq(InvocationType.RequestResponse)))
