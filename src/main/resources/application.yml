@@ -535,6 +535,8 @@ floci:
       enabled: true
     emrserverless:
       enabled: true
+    ssoadmin:
+      enabled: true
     tagging:
       enabled: true
     pipes:
