@@ -332,6 +332,7 @@ floci:
     rum:
       enabled: true
     networkfirewall:
+    servicecatalog:
       enabled: true
     guardduty:
       enabled: true

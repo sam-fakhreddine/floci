@@ -674,6 +674,7 @@ public interface EmulatorConfig {
         RumServiceConfig rum();
         GuardDutyServiceConfig guardduty();
         EmrServerlessServiceConfig emrserverless();
+        ServiceCatalogServiceConfig servicecatalog();
         ServiceQuotasServiceConfig servicequotas();
         RamServiceConfig ram();
         NetworkFirewallServiceConfig networkfirewall();
@@ -750,6 +751,11 @@ public interface EmulatorConfig {
     }
 
     interface RamServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
+    interface ServiceCatalogServiceConfig {
         @WithDefault("true")
         boolean enabled();
     }

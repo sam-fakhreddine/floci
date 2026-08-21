@@ -522,7 +522,11 @@ public class ResolvedServiceCatalog {
                 descriptor("network-firewall", "networkfirewall", config.services().networkfirewall().enabled(), true,
                         null, null, 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
-                        Set.of("NetworkFirewall_20201112."), Set.of("network-firewall"), Set.of(), Set.of())
+                        Set.of("NetworkFirewall_20201112."), Set.of("network-firewall"), Set.of(), Set.of()),
+                descriptor("servicecatalog", "servicecatalog", config.services().servicecatalog().enabled(), true,
+                        "servicecatalog", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
+                        protocols(ServiceProtocol.JSON),
+                        Set.of("AWS242ServiceCatalogService."), Set.of("servicecatalog"), Set.of(), Set.of())
         ));
     }
 
