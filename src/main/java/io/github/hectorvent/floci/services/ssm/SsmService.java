@@ -3,11 +3,13 @@ package io.github.hectorvent.floci.services.ssm;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ssm.model.Parameter;
 import io.github.hectorvent.floci.services.ssm.model.ParameterHistory;
 import io.github.hectorvent.floci.services.ssm.model.PatchBaselineIdentity;
+import io.github.hectorvent.floci.services.ssm.model.SsmDocument;
 import com.fasterxml.jackson.core.type.TypeReference;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -23,6 +25,8 @@ public class SsmService {
 
     private final StorageBackend<String, Parameter> parameterStore;
     private final StorageBackend<String, List<ParameterHistory>> historyStore;
+    private final StorageBackend<String, List<String>> documentPermissionStore;
+    private final StorageBackend<String, SsmDocument> documentStore;
     private final int maxParameterHistory;
     private final RegionResolver regionResolver;
 
@@ -35,6 +39,12 @@ public class SsmService {
                 storageFactory.create("ssm", "ssm-history.json",
                         new TypeReference<>() {
                         }),
+                storageFactory.create("ssm", "ssm-document-permissions.json",
+                        new TypeReference<>() {
+                        }),
+                storageFactory.create("ssm", "ssm-documents.json",
+                        new TypeReference<>() {
+                        }),
                 config.services().ssm().maxParameterHistory(),
                 regionResolver
         );
@@ -45,16 +55,21 @@ public class SsmService {
      */
     SsmService(StorageBackend<String, Parameter> parameterStore,
                StorageBackend<String, List<ParameterHistory>> historyStore,
+               StorageBackend<String, List<String>> documentPermissionStore,
                int maxParameterHistory) {
-        this(parameterStore, historyStore, maxParameterHistory,
-                new RegionResolver("us-east-1", "000000000000"));
+        this(parameterStore, historyStore, documentPermissionStore, new InMemoryStorage<>(),
+                maxParameterHistory, new RegionResolver("us-east-1", "000000000000"));
     }
 
     SsmService(StorageBackend<String, Parameter> parameterStore,
                StorageBackend<String, List<ParameterHistory>> historyStore,
+               StorageBackend<String, List<String>> documentPermissionStore,
+               StorageBackend<String, SsmDocument> documentStore,
                int maxParameterHistory, RegionResolver regionResolver) {
         this.parameterStore = parameterStore;
         this.historyStore = historyStore;
+        this.documentPermissionStore = documentPermissionStore;
+        this.documentStore = documentStore;
         this.maxParameterHistory = maxParameterHistory;
         this.regionResolver = regionResolver;
     }
@@ -242,6 +257,66 @@ public class SsmService {
         LOG.debugv("Removed tags from parameter: {0}", resourceId);
     }
 
+    // ──────────────────────── Document Share Permissions ─────────────────────
+    // SSM documents themselves are not modeled (ListDocuments returns empty), but
+    // document *share* state is tracked against any document name so that callers
+    // like LZA's Custom::SSMShareDocument handler can round-trip
+    // ModifyDocumentPermission -> DescribeDocumentPermission.
+
+    public SsmDocument getDocument(String name, String region) {
+        return documentStore.get(regionKey(region, name))
+                .orElseThrow(() -> new AwsException("InvalidDocument",
+                        "Document " + name + " does not exist.", 400));
+    }
+
+    public SsmDocument createDocument(String name, String content, String documentType, String region) {
+        String storageKey = regionKey(region, name);
+        if (documentStore.get(storageKey).isPresent()) {
+            throw new AwsException("DocumentAlreadyExists",
+                    "Document " + name + " already exists.", 400);
+        }
+        SsmDocument document = new SsmDocument(name, content, documentType);
+        documentStore.put(storageKey, document);
+        return document;
+    }
+
+    public SsmDocument updateDocument(String name, String content, String region) {
+        String storageKey = regionKey(region, name);
+        SsmDocument document = documentStore.get(storageKey)
+                .orElseThrow(() -> new AwsException("InvalidDocument",
+                        "Document " + name + " does not exist.", 400));
+        if (Objects.equals(document.getContent(), content)) {
+            throw new AwsException("DuplicateDocumentContent",
+                    "The content of the association document matches another document. "
+                            + "Change the content of the document and try again.", 400);
+        }
+        document.setContent(content);
+        document.setDocumentVersion(document.getDocumentVersion() + 1);
+        documentStore.put(storageKey, document);
+        return document;
+    }
+
+    public List<String> describeDocumentPermission(String name, String region) {
+        return documentPermissionStore.get(regionKey(region, name))
+                .map(List::copyOf)
+                .orElse(List.of());
+    }
+
+    public void modifyDocumentPermission(String name, List<String> accountIdsToAdd,
+                                         List<String> accountIdsToRemove, String region) {
+        String storageKey = regionKey(region, name);
+        List<String> accountIds = new ArrayList<>(
+                documentPermissionStore.get(storageKey).orElse(List.of()));
+        for (String accountId : accountIdsToAdd) {
+            if (!accountIds.contains(accountId)) {
+                accountIds.add(accountId);
+            }
+        }
+        accountIds.removeAll(accountIdsToRemove);
+        documentPermissionStore.put(storageKey, accountIds);
+        LOG.debugv("Modified document permission for {0}: {1} account(s) shared", name, accountIds.size());
+    }
+
     // ──────────────────────────── Patch Baselines ────────────────────────────
     // AWS provides a fixed set of AWS-owned predefined patch baselines (one default per operating
     // system). These are static reference data, not customer state, so they live in-memory only.
@@ -334,5 +409,14 @@ public class SsmService {
         }
 
         historyStore.put(storageKey, history);
+    }
+
+    public void deleteDocument(String name, String region) {
+        String storageKey = regionKey(region, name);
+        if (!documentStore.get(storageKey).isPresent()) {
+            throw new AwsException("InvalidDocument",
+                    "Document " + name + " does not exist.", 400);
+        }
+        documentStore.delete(storageKey);
     }
 }

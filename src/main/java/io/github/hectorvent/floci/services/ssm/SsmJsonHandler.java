@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.services.ssm.model.InstanceInformation;
 import io.github.hectorvent.floci.services.ssm.model.Parameter;
 import io.github.hectorvent.floci.services.ssm.model.ParameterHistory;
 import io.github.hectorvent.floci.services.ssm.model.PatchBaselineIdentity;
+import io.github.hectorvent.floci.services.ssm.model.SsmDocument;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -63,6 +64,15 @@ public class SsmJsonHandler {
             // Patch Manager (read-only: AWS-owned predefined baselines)
             case "DescribePatchBaselines" -> handleDescribePatchBaselines(request, region);
             case "GetDefaultPatchBaseline" -> handleGetDefaultPatchBaseline(request, region);
+            // Documents
+            case "GetDocument" -> handleGetDocument(request, region);
+            case "DescribeDocument" -> handleDescribeDocument(request, region);
+            case "DeleteDocument" -> handleDeleteDocument(request, region);
+            case "CreateDocument" -> handleCreateDocument(request, region);
+            case "UpdateDocument" -> handleUpdateDocument(request, region);
+            // Document share permissions
+            case "ModifyDocumentPermission" -> handleModifyDocumentPermission(request, region);
+            case "DescribeDocumentPermission" -> handleDescribeDocumentPermission(request, region);
             // Read-only list operations (resources not modeled: empty results)
             case "ListDocuments" -> handleListDocuments(request, region);
             case "ListAssociations" -> handleListAssociations(request, region);
@@ -258,6 +268,79 @@ public class SsmJsonHandler {
         ObjectNode response = objectMapper.createObjectNode();
         response.put("BaselineId", baselineId);
         response.put("OperatingSystem", (operatingSystem == null || operatingSystem.isBlank()) ? "WINDOWS" : operatingSystem);
+        return Response.ok(response).build();
+    }
+
+    private Response handleGetDocument(JsonNode request, String region) {
+        String name = request.path("Name").asText();
+        SsmDocument document = ssmService.getDocument(name, region);
+
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("Name", document.getName());
+        response.put("DocumentType", document.getDocumentType());
+        response.put("DocumentVersion", String.valueOf(document.getDocumentVersion()));
+        response.put("Content", document.getContent());
+        response.put("Status", document.getStatus());
+        return Response.ok(response).build();
+    }
+
+    private Response handleCreateDocument(JsonNode request, String region) {
+        String name = request.path("Name").asText();
+        String content = request.path("Content").asText();
+        String documentType = request.path("DocumentType").asText("Command");
+
+        SsmDocument document = ssmService.createDocument(name, content, documentType, region);
+        return Response.ok(documentDescriptionResponse(document)).build();
+    }
+
+    private Response handleUpdateDocument(JsonNode request, String region) {
+        String name = request.path("Name").asText();
+        String content = request.path("Content").asText();
+
+        SsmDocument document = ssmService.updateDocument(name, content, region);
+        return Response.ok(documentDescriptionResponse(document)).build();
+    }
+
+    private ObjectNode documentDescriptionResponse(SsmDocument document) {
+        ObjectNode response = objectMapper.createObjectNode();
+        ObjectNode description = objectMapper.createObjectNode();
+        description.put("Name", document.getName());
+        description.put("DocumentType", document.getDocumentType());
+        description.put("DocumentVersion", String.valueOf(document.getDocumentVersion()));
+        description.put("Status", document.getStatus());
+        description.put("LatestVersion", String.valueOf(document.getDocumentVersion()));
+        description.put("DefaultVersion", String.valueOf(document.getDocumentVersion()));
+        response.set("DocumentDescription", description);
+        return response;
+    }
+
+    private Response handleModifyDocumentPermission(JsonNode request, String region) {
+        String name = request.path("Name").asText();
+        List<String> accountIdsToAdd = new ArrayList<>();
+        request.path("AccountIdsToAdd").forEach(n -> accountIdsToAdd.add(n.asText()));
+        List<String> accountIdsToRemove = new ArrayList<>();
+        request.path("AccountIdsToRemove").forEach(n -> accountIdsToRemove.add(n.asText()));
+
+        ssmService.modifyDocumentPermission(name, accountIdsToAdd, accountIdsToRemove, region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleDescribeDocumentPermission(JsonNode request, String region) {
+        String name = request.path("Name").asText();
+        List<String> accountIds = ssmService.describeDocumentPermission(name, region);
+
+        ObjectNode response = objectMapper.createObjectNode();
+        ArrayNode ids = objectMapper.createArrayNode();
+        accountIds.forEach(ids::add);
+        response.set("AccountIds", ids);
+        ArrayNode sharingInfo = objectMapper.createArrayNode();
+        for (String accountId : accountIds) {
+            ObjectNode info = objectMapper.createObjectNode();
+            info.put("AccountId", accountId);
+            info.put("SharedDocumentVersion", "$DEFAULT");
+            sharingInfo.add(info);
+        }
+        response.set("AccountSharingInfoList", sharingInfo);
         return Response.ok(response).build();
     }
 
@@ -487,5 +570,29 @@ public class SsmJsonHandler {
         if (info.getLastPingDateTime() != null) node.put("LastPingDateTime", info.getLastPingDateTime().toEpochMilli() / 1000.0);
         if (info.getRegistrationDate() != null) node.put("RegistrationDate", info.getRegistrationDate().toEpochMilli() / 1000.0);
         return node;
+    }
+
+    private Response handleDescribeDocument(JsonNode request, String region) {
+        String name = request.path("Name").asText();
+        SsmDocument document = ssmService.getDocument(name, region);
+
+        ObjectNode response = objectMapper.createObjectNode();
+        ObjectNode documentNode = objectMapper.createObjectNode();
+        documentNode.put("Name", document.getName());
+        documentNode.put("DocumentType", document.getDocumentType());
+        documentNode.put("DocumentVersion", String.valueOf(document.getDocumentVersion()));
+        documentNode.put("Content", document.getContent());
+        documentNode.put("Status", document.getStatus());
+        if (document.getCreatedDate() != null) {
+            documentNode.put("CreatedDate", document.getCreatedDate().toString());
+        }
+        response.set("Document", documentNode);
+        return Response.ok(response).build();
+    }
+
+    private Response handleDeleteDocument(JsonNode request, String region) {
+        String name = request.path("Name").asText();
+        ssmService.deleteDocument(name, region);
+        return Response.ok(objectMapper.createObjectNode()).build();
     }
 }
