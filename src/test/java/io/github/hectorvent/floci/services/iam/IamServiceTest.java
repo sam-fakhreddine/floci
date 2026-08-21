@@ -743,6 +743,28 @@ class IamServiceTest {
         IamPolicy bedrockReadOnly = iamService.getPolicy("arn:aws:iam::aws:policy/AmazonBedrockReadOnly");
         assertEquals("AmazonBedrockReadOnly", bedrockReadOnly.getPolicyName());
         assertEquals("/", bedrockReadOnly.getPath());
+
+        // LZA's OperationsStack attaches these to its AWS Backup service roles.
+        IamPolicy backup = iamService.getPolicy(
+                "arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup");
+        assertEquals("AWSBackupServiceRolePolicyForBackup", backup.getPolicyName());
+        assertEquals("/service-role/", backup.getPath());
+
+        IamPolicy restore = iamService.getPolicy(
+                "arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForRestores");
+        assertEquals("AWSBackupServiceRolePolicyForRestores", restore.getPolicyName());
+        assertEquals("/service-role/", restore.getPath());
+
+        // The S3 variants live at the root path in real AWS, not /service-role/.
+        IamPolicy s3Backup = iamService.getPolicy(
+                "arn:aws:iam::aws:policy/AWSBackupServiceRolePolicyForS3Backup");
+        assertEquals("AWSBackupServiceRolePolicyForS3Backup", s3Backup.getPolicyName());
+        assertEquals("/", s3Backup.getPath());
+
+        IamPolicy s3Restore = iamService.getPolicy(
+                "arn:aws:iam::aws:policy/AWSBackupServiceRolePolicyForS3Restore");
+        assertEquals("AWSBackupServiceRolePolicyForS3Restore", s3Restore.getPolicyName());
+        assertEquals("/", s3Restore.getPath());
     }
 
     @Test
