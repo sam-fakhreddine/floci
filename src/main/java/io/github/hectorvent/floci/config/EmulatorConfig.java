@@ -677,6 +677,12 @@ public interface EmulatorConfig {
 
         ControlTowerServiceConfig controltower();
         Route53ResolverServiceConfig route53resolver();
+        SsoAdminServiceConfig ssoadmin();
+    }
+
+    interface SsoAdminServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
     }
 
     interface IotServiceConfig {
