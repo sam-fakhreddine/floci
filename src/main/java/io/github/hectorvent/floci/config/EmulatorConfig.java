@@ -676,6 +676,7 @@ public interface EmulatorConfig {
         EmrServerlessServiceConfig emrserverless();
 
         ControlTowerServiceConfig controltower();
+        Route53ResolverServiceConfig route53resolver();
     }
 
     interface IotServiceConfig {
@@ -720,6 +721,11 @@ public interface EmulatorConfig {
     }
 
     interface EmrServerlessServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
+    interface Route53ResolverServiceConfig {
         @WithDefault("true")
         boolean enabled();
     }
