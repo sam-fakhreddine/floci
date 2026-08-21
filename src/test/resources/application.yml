@@ -340,6 +340,7 @@ floci:
     emrserverless:
       enabled: true
     controltower:
+    route53resolver:
       enabled: true
     tagging:
       enabled: true
