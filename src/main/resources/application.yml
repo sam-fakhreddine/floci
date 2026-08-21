@@ -67,6 +67,7 @@ quarkus:
       - --initialize-at-run-time=io.github.hectorvent.floci.services.cloudfront.CloudFrontService
       - --initialize-at-run-time=io.github.hectorvent.floci.services.emr.EmrService
       - --initialize-at-run-time=io.github.hectorvent.floci.services.elasticbeanstalk.ElasticBeanstalkService
+      - --initialize-at-run-time=io.github.hectorvent.floci.services.organizations.OrganizationsService
       - --initialize-at-run-time=graphql.util.IdGenerator
       - --initialize-at-run-time=io.github.hectorvent.floci.services.lambda.launcher.LambdaExecutionRoleCredentials
       # snappy-java (Firehose Snappy/HADOOP_SNAPPY delivery) extracts and loads a
@@ -127,6 +128,8 @@ floci:
       lightsail:
         flush-interval-ms: 5000
       codepipeline:
+        flush-interval-ms: 5000
+      organizations:
         flush-interval-ms: 5000
       s3vectors:
         flush-interval-ms: 5000
@@ -470,6 +473,9 @@ floci:
       enabled: true
     codepipeline:
       enabled: true
+    organizations:
+      enabled: true
+      scp-enforcement-enabled: false
     autoscaling:
       enabled: true
     applicationautoscaling:
