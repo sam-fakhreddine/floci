@@ -66,6 +66,11 @@ references a curated image runs without the caller re-tagging anything:
   By default floci uses `amazonlinux2-aarch64-standard:4.0` on ARM and
   `amazonlinux-x86_64-standard:6.0` on x86_64; set
   `FLOCI_SERVICES_CODEBUILD_CURATED_IMAGE_SUBSTITUTE` to override it.
+- **Amazon Linux** curated images map directly to their `public.ecr.aws` mirrors, and floci picks the
+  newest AL2023 curated image for the host architecture.
+- The **Ubuntu `standard` family** is not published to a public registry by AWS, so it is substituted.
+  By default floci uses the newest public Amazon Linux standard image for the host architecture; set
+  `FLOCI_SERVICES_CODEBUILD_CURATED_IMAGE_SUBSTITUTE` to pin a specific substitute image.
 
 ## Build Execution Model
 
@@ -169,6 +174,7 @@ When `artifacts.type=S3`, collected files are uploaded to the configured S3 buck
 |---|---|---|
 | `FLOCI_SERVICES_CODEBUILD_ENABLED` | `true` | Enable or disable the service |
 | `FLOCI_SERVICES_CODEBUILD_CURATED_IMAGE_SUBSTITUTE` | architecture-specific Amazon Linux image | Image substituted for the Ubuntu `standard` curated family (which AWS does not publish publicly) |
+| `FLOCI_SERVICES_CODEBUILD_CURATED_IMAGE_SUBSTITUTE` | newest AL standard image | Image substituted for the Ubuntu `standard` curated family (which AWS does not publish publicly) |
 | `FLOCI_SERVICES_CODEBUILD_MAX_CONCURRENT_BUILDS` | bounded default | Max builds staging a workspace on disk at once; non-positive = unbounded |
 | `FLOCI_SERVICES_CODEBUILD_MAX_CONCURRENT_SOURCE_COPIES` | bounded default | Max builds streaming their source tar at once; non-positive = unbounded |
 | `FLOCI_SERVICES_CODEBUILD_DOCKER_NETWORK` | unset | Docker network to attach build containers to |
