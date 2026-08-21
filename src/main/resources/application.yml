@@ -559,6 +559,8 @@ floci:
       enabled: true
     emrserverless:
       enabled: true
+    controltower:
+      enabled: true
     tagging:
       enabled: true
     pipes:
