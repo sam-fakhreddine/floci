@@ -85,18 +85,23 @@ ID against any other emulated service.
 | Environment variable | Default | Description |
 | --- | --- | --- |
 | `FLOCI_SERVICES_ORGANIZATIONS_ENABLED` | `true` | Enables the service |
-| `FLOCI_SERVICES_ORGANIZATIONS_SCP_ENFORCEMENT_ENABLED` | `false` | Read by the IAM enforcement layer; inert unless IAM policy enforcement is also enabled |
+| `FLOCI_SERVICES_ORGANIZATIONS_SCP_ENFORCEMENT_ENABLED` | `false` | When `true` (and IAM enforcement is enabled), attached service control policies participate in IAM policy evaluation |
 | `FLOCI_SERVICES_ORGANIZATIONS_MANAGEMENT_ACCOUNT_EMAIL` | unset | Email reported for the organization's management account (`DescribeOrganization` master account, `ListAccounts`). Unset falls back to the built-in default |
 | `FLOCI_STORAGE_SERVICES_ORGANIZATIONS_MODE` | inherits `FLOCI_STORAGE_MODE` | Storage mode override |
 | `FLOCI_STORAGE_SERVICES_ORGANIZATIONS_FLUSH_INTERVAL_MS` | `5000` | Hybrid/WAL flush interval |
 
 ## SCP enforcement
 
-`FLOCI_SERVICES_ORGANIZATIONS_SCP_ENFORCEMENT_ENABLED` is read by the IAM policy-evaluation
-layer, not by this service. On its own, Organizations stores and returns service control
-policies but does not evaluate them, so setting this flag here has no effect until IAM
-enforcement is present. See the IAM service documentation for the evaluation order and the
-conditions under which a caller bypasses enforcement.
+With `FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED=true` and
+`FLOCI_SERVICES_ORGANIZATIONS_SCP_ENFORCEMENT_ENABLED=true`, service control policies attached to
+the root, OUs, and accounts participate in IAM policy evaluation: an action must be allowed at every
+level of the account's chain, before the caller's identity policies are consulted. SCPs never grant
+permissions on their own. See
+[Service Control Policies (SCPs)](iam.md#service-control-policies-scps) for the evaluation order,
+the account-root behaviour, and the cases that bypass enforcement.
+
+The evaluation itself lives in the IAM enforcement layer — this service stores the policies and
+resolves the chain, but with IAM enforcement off the flag has no effect.
 
 ## Example
 
