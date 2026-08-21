@@ -10,6 +10,7 @@ import com.github.dockerjava.api.command.InspectVolumeResponse;
 import com.github.dockerjava.api.command.ListVolumesResponse;
 import com.github.dockerjava.api.exception.DockerException;
 import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.exception.NotModifiedException;
 import com.github.dockerjava.api.model.Bind;
 import com.github.dockerjava.api.model.Container;
 import com.github.dockerjava.api.model.ContainerNetwork;
@@ -143,7 +144,7 @@ public class ContainerLifecycleManager {
      * @return information about the running container including resolved endpoints
      */
     public ContainerInfo startCreated(String containerId, ContainerSpec spec) {
-        dockerClient.startContainerCmd(containerId).exec();
+        startAcceptingAlreadyRunning(containerId);
         LOG.infov("Started container {0}", containerId);
 
         if (spec.networkMode() != null && !spec.networkMode().isBlank() && spec.hasPortBindings()) {
@@ -161,6 +162,28 @@ public class ContainerLifecycleManager {
 
         Map<Integer, EndpointInfo> endpoints = resolveEndpoints(containerId, spec);
         return new ContainerInfo(containerId, endpoints);
+    }
+
+    /**
+     * Starts {@code containerId}, treating "already running" as success. Transient socket blips
+     * are retried below this call, at the transport seam ({@link RetryingDockerHttpClient}); no
+     * retry may live here, where it would compound backoff on the transport's already-exhausted
+     * budget.
+     *
+     * <p>The 304 handling is what makes the transport's replay safe: when the daemon honoured a
+     * start whose response was lost to a broken pipe, the replayed start meets HTTP 304 — a
+     * successful response at transport level, which docker-java converts to
+     * {@link NotModifiedException} above it. That reports the outcome we wanted and is swallowed.
+     * Letting it escape would turn a recovered blip into a hard launch failure — the exact bug
+     * the retry exists to remove.
+     */
+    private void startAcceptingAlreadyRunning(String containerId) {
+        try {
+            dockerClient.startContainerCmd(containerId).exec();
+        } catch (NotModifiedException alreadyRunning) {
+            LOG.debugv("Container {0} was already running (304) — treating start as done",
+                    containerId);
+        }
     }
 
     /**
@@ -276,6 +299,13 @@ public class ContainerLifecycleManager {
      * {@code floci_emulator=floci-aws} (plus {@code floci_namespace} when configured) so both
      * {@code docker volume prune --filter label=floci=true} (all emulators) and
      * {@code --filter label=floci_emulator=floci-aws} (this emulator only) work.
+     *
+     * <p>Transient socket blips on both daemon calls here — the existence check and the create —
+     * are retried at the transport seam ({@link RetryingDockerHttpClient}). The existence guard
+     * is what keeps the transport's replay safe: {@code POST /volumes/create} with the same name
+     * is itself idempotent, and when the daemon created the volume but the response was lost to
+     * a broken pipe, the replayed create finds it already there while later calls see it exists
+     * and do nothing — the volume analogue of start treating an HTTP 304 as success.
      */
     public void ensureVolume(String volumeName) {
         if (!volumeExists(volumeName)) {
@@ -480,7 +510,7 @@ public class ContainerLifecycleManager {
         boolean running = Boolean.TRUE.equals(inspect.getState().getRunning());
 
         if (!running) {
-            dockerClient.startContainerCmd(containerId).exec();
+            startAcceptingAlreadyRunning(containerId);
             LOG.infov("Started adopted container {0}", containerId);
             inspect = dockerClient.inspectContainerCmd(containerId).exec();
         }
