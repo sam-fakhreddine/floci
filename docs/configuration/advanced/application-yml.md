@@ -165,6 +165,8 @@ floci:
     organizations:
       enabled: true
       scp-enforcement-enabled: false    # Set to true (with iam.enforcement-enabled) to apply SCPs during policy evaluation
+    networkfirewall:
+      enabled: true
 
     elasticache:
       enabled: true

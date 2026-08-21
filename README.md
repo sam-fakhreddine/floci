@@ -228,6 +228,7 @@ Floci supports local emulation for application services, data services, eventing
 | Databases and caching | RDS, RDS Data API, Neptune, DocumentDB, MemoryDB, ElastiCache |
 | Messaging and transfer | SES, Kinesis, MSK, Amazon MQ, Transfer Family, IoT Core |
 | Security and governance | AWS Organizations, WAF v2, CloudTrail, CloudFront, Resource Groups Tagging API, CloudHSM v2 |
+| Security and governance | AWS Network Firewall, WAF v2, CloudTrail, CloudFront, Resource Groups Tagging API, CloudHSM v2 |
 | Cost and billing | Pricing, Cost Explorer, Cost and Usage Reports, BCM Data Exports |
 | Resilience, backup, and config | AWS FIS, AWS Backup, AWS Config, AppConfig, AppConfigData, CloudFormation, Cloud Control API |
 
@@ -292,6 +293,7 @@ For operation-level compatibility, see the [Services Overview](https://floci.io/
 | CodeDeploy | In-process with Lambda traffic shifting | Deployment groups, configs, lifecycle hooks, auto-rollback |
 | CodePipeline | In-process orchestration | Pipelines, executions, S3 artifacts, approvals, local providers, custom workers |
 | AWS Organizations | In-process | Organization, accounts, OU tree, roots, tagging; global service with empty-region ARNs; member accounts resolve their org |
+| AWS Network Firewall | In-process | DescribeFirewall with stable emulated endpoint attachments for infrastructure tooling |
 | AWS Batch | In-process | Compute environments, job queues, job definitions, job submission and lifecycle |
 | Auto Scaling | In-process with reconciler | Launch configs, ASGs, desired capacity reconciliation, lifecycle hooks |
 | Application Auto Scaling | In-process | Scalable targets, target-tracking and step scaling policies, CloudWatch alarm creation, tagging (policies are stored but inert) |

@@ -509,7 +509,11 @@ public class ResolvedServiceCatalog {
                 descriptor("route53resolver", "route53resolver", config.services().route53resolver().enabled(), true,
                         null, null, 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
-                        Set.of("Route53Resolver."), Set.of("route53resolver"), Set.of(), Set.of())
+                        Set.of("Route53Resolver."), Set.of("route53resolver"), Set.of(), Set.of()),
+                descriptor("network-firewall", "networkfirewall", config.services().networkfirewall().enabled(), true,
+                        null, null, 5000L, null, ServiceProtocol.JSON,
+                        protocols(ServiceProtocol.JSON),
+                        Set.of("NetworkFirewall_20201112."), Set.of("network-firewall"), Set.of(), Set.of())
         ));
     }
 
