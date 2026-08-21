@@ -332,6 +332,7 @@ floci:
     rum:
       enabled: true
     networkfirewall:
+      enabled: true
     servicecatalog:
       enabled: true
     guardduty:
@@ -351,6 +352,7 @@ floci:
     bedrock-agent-core:
       enabled: true
     bedrock-agent-core-control:
+      enabled: true
     servicequotas:
       enabled: true
     ram:
