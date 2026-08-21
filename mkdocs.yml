@@ -135,6 +135,8 @@ nav:
     - CodeDeploy: services/codedeploy.md
     - CodePipeline: services/codepipeline.md
     - AWS Organizations: services/organizations.md
+    - Service Quotas: services/servicequotas.md
+    - AWS RAM: services/ram.md
     - AWS Backup: services/backup.md
     - AWS FIS: services/fis.md
     - CloudTrail: services/cloudtrail.md
