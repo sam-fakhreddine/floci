@@ -259,10 +259,11 @@ class IamServiceTest {
     }
 
     @Test
-    void createServiceLinkedRoleIsIdempotent() {
-        IamRole first = iamService.createServiceLinkedRole("access-analyzer.amazonaws.com", null, null);
-        IamRole second = iamService.createServiceLinkedRole("access-analyzer.amazonaws.com", null, null);
-        assertEquals(first.getRoleId(), second.getRoleId());
+    void createServiceLinkedRoleRejectsDuplicate() {
+        iamService.createServiceLinkedRole("access-analyzer.amazonaws.com", null, null);
+        AwsException ex = assertThrows(AwsException.class, () ->
+                iamService.createServiceLinkedRole("access-analyzer.amazonaws.com", null, null));
+        assertEquals("InvalidInput", ex.getErrorCode());
     }
 
     @Test
