@@ -216,6 +216,14 @@ nothing here performs the TLS handshake they describe.
 | DeleteLoginProfile | Deletes a user's login profile. |
 | UpdateLoginProfile | Updates a user's login profile password settings. |
 
+### Account Password Policy
+
+| Action | Description |
+|--------|-------------|
+| UpdateAccountPasswordPolicy | Creates or replaces the account's password policy. |
+| GetAccountPasswordPolicy | Returns the stored password policy, or `NoSuchEntity` when none is set. |
+| DeleteAccountPasswordPolicy | Deletes the account's password policy. |
+
 ### Policy Simulation
 
 | Action | Description |
@@ -286,11 +294,48 @@ environment:
 
 Policy evaluation follows the standard AWS precedence:
 
-1. An explicit **Deny** in any identity, session, or boundary policy → request is denied (HTTP 403 `AccessDeniedException`)
-2. An explicit **Allow** in an identity policy creates the base grant
-3. If a session policy is present, it must also explicitly allow the request
-4. If a permission boundary is present, it must also explicitly allow the request
-5. No matching effective allow → implicit deny (HTTP 403)
+1. If [SCP enforcement](#service-control-policies-scps) is active, the action must be allowed at **every** organization level (root, OUs on the path, account) and explicitly denied at none — otherwise the request is denied before identity policies are consulted
+2. An explicit **Deny** in any identity, session, or boundary policy → request is denied (HTTP 403 `AccessDeniedException`)
+3. An explicit **Allow** in an identity policy creates the base grant
+4. If a session policy is present, it must also explicitly allow the request
+5. If a permission boundary is present, it must also explicitly allow the request
+6. No matching effective allow → implicit deny (HTTP 403)
+
+### Service control policies (SCPs)
+
+When the caller's account belongs to an [Organizations](organizations.md) organization,
+SCPs attached to the root, the OUs on the account's path, and the account itself can
+participate in evaluation. Two flags must both be on:
+
+```yaml
+floci:
+  services:
+    iam:
+      enforcement-enabled: true
+    organizations:
+      scp-enforcement-enabled: true
+```
+
+(env: `FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED` and
+`FLOCI_SERVICES_ORGANIZATIONS_SCP_ENFORCEMENT_ENABLED`)
+
+SCP semantics match AWS: SCPs never grant permissions — they cap what identity policies
+may allow; the organization's **management account is exempt**; and an account outside
+any organization is unaffected. The `test` credential and unknown access keys are never
+SCP-denied.
+
+**The account-root principal is subject to SCPs.** floci's account root is a bare
+12-digit account-id access key (the LocalStack multi-account convention). It carries no
+registered IAM identity, so it normally takes the unknown-key bypass. But when the access
+key equals its own account ID **and** that account has an effective SCP ceiling
+(`effectiveScpLevels != null` — i.e. it is a non-management member under a root with the
+SCP policy type enabled and at least one attached SCP), floci synthesizes an
+allow-everything root identity and evaluates the request against the SCP chain. In that
+case **SCPs apply and nothing else does** — no identity policies, permission boundary, or
+session policy attaches to the bare account key. If the account has no effective SCP
+ceiling (the management account, an account outside any organization, or the SCP type
+disabled), the bare key still bypasses enforcement entirely, and unknown `AKIA…` keys
+always bypass unconditionally.
 
 ### Bypass rules
 
@@ -302,6 +347,13 @@ These identities always bypass enforcement (backward-compatible defaults):
 | Unknown access key (not in IAM store) | Always allowed — backward-compatible with pre-existing keys |
 | No `Authorization` header | Allowed — unauthenticated path (e.g. health checks) |
 | Unresolvable IAM action for the request | Allowed — unknown mappings are permissive |
+
+**Exception:** a bare 12-digit account-id key that equals its own account and sits under
+an effective SCP ceiling is **not** treated as an unknown key — it is evaluated against
+the SCP chain as the account root (see [Service control policies](#service-control-policies-scps)
+above). Identity-policy enforcement of a member account still requires an assumable,
+account-routable identity such as the `OrganizationAccountAccessRole` session; the bare
+account key carries no identity policies of its own.
 
 ### Supported policy features
 
@@ -320,6 +372,26 @@ These identities always bypass enforcement (backward-compatible defaults):
 - `DateEquals`, `DateNotEquals`, `DateLessThan`, `DateGreaterThan` (and Equals variants)
 - `Bool`, `IpAddress`, `NotIpAddress`, `Null`
 - Supports `...IfExists` variants for all operators.
+
+#### Condition keys floci populates
+
+A `Condition` operator can only match a key floci actually places in the request context.
+floci populates:
+
+- `s3:prefix`, `s3:delimiter`, `s3:max-keys` — from the S3 request parameters.
+- `aws:PrincipalArn` — the caller's ARN, resolved from the signing access key. It is the
+  IAM-user ARN for a user access key and the assumed-role ARN for an STS session. It is
+  **absent** for the bare account-id key (floci's account root) and for unknown keys.
+
+**Any other condition key is absent from the request context.** A plain (non-`IfExists`)
+operator on an absent key makes the whole statement *not apply* — it neither matches nor
+blocks. This is why a `DenyRootUser`-style guardrail keyed on `aws:PrincipalArn` stays
+**inert against the account root**: the account root has no resolvable ARN, so the key is
+absent and the `Deny` never fires. It does fire for real IAM-user and assumed-role callers.
+
+**Caveat:** `resolveCallerArn` hardcodes the assumed-role session name as `floci-session`,
+so `aws:PrincipalArn` for an assumed-role caller will not match a condition that pins a
+different session name. This matches what `sts:GetCallerIdentity` already reports.
 
 **Not yet supported**: `NotPrincipal`, resource-based policies (S3 bucket policy, Lambda resource policy).
 
