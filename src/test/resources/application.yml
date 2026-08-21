@@ -341,6 +341,7 @@ floci:
       enabled: true
     controltower:
     route53resolver:
+    ssoadmin:
       enabled: true
     tagging:
       enabled: true
