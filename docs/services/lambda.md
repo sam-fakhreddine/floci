@@ -33,6 +33,7 @@ Floci Lambda runs your function code locally inside real Docker containers - clo
 | `GetPolicy` | Get the function resource policy |
 | `RemovePermission` | Remove a resource-policy statement |
 | `GetFunctionCodeSigningConfig` | Return code-signing config (always empty) |
+| `ListFunctionsByCodeSigningConfig` | List functions using a code-signing config (always empty) |
 | `CreateFunctionUrlConfig` | Provision a function URL |
 | `GetFunctionUrlConfig` | Read function URL config |
 | `UpdateFunctionUrlConfig` | Update function URL config |
@@ -184,6 +185,7 @@ These AWS Lambda operations have no handler in Floci. Calls will return `404` or
 - Dead-letter, async invoke config, and event invoke config operations
 - `InvokeWithResponseStream`
 - Code signing management (only `GetFunctionCodeSigningConfig` is wired; there is no `PutFunctionCodeSigningConfig` or `CreateCodeSigningConfig`)
+- Code signing management (only `GetFunctionCodeSigningConfig` and `ListFunctionsByCodeSigningConfig` are wired; there is no `PutFunctionCodeSigningConfig` or `CreateCodeSigningConfig`, so the function list is always empty)
 
 ## Configuration
 
@@ -193,8 +195,8 @@ These AWS Lambda operations have no handler in Floci. Calls will return `404` or
 | `FLOCI_SERVICES_LAMBDA_EPHEMERAL` | `false` | Remove containers after each invocation |
 | `FLOCI_SERVICES_LAMBDA_DEFAULT_MEMORY_MB` | `128` | Default function memory (MB) |
 | `FLOCI_SERVICES_LAMBDA_DEFAULT_TIMEOUT_SECONDS` | `3` | Default function timeout (seconds) |
-| `FLOCI_SERVICES_LAMBDA_RUNTIME_API_BASE_PORT` | `9200` | First port in the Lambda Runtime API range |
-| `FLOCI_SERVICES_LAMBDA_RUNTIME_API_MAX_PORT` | `9299` | Last port in the Lambda Runtime API range |
+| `FLOCI_SERVICES_LAMBDA_RUNTIME_API_BASE_PORT` | `12000` | First port in the Lambda Runtime API range |
+| `FLOCI_SERVICES_LAMBDA_RUNTIME_API_MAX_PORT` | `12499` | Last port in the Lambda Runtime API range. One port is held per running container, so the range width caps concurrent executions |
 | `FLOCI_SERVICES_LAMBDA_CODE_PATH` | `./data/lambda-code` | Directory where Lambda ZIP files are stored |
 | `FLOCI_SERVICES_LAMBDA_POLL_INTERVAL_MS` | `1000` | Event-source mapping poll interval (milliseconds) |
 | `FLOCI_SERVICES_LAMBDA_CONTAINER_IDLE_TIMEOUT_SECONDS` | `300` | Idle container shutdown timeout (seconds) |
@@ -235,7 +237,7 @@ correct and needs no configuration.
 
 On unusual network topologies, for example rootless Podman, auto-detection
 can pick an address the Lambda container cannot reach, and invocations fail with
-`connect ECONNREFUSED <ip>:9200`. Set `FLOCI_SERVICES_LAMBDA_DOCKER_HOST_OVERRIDE`
+`connect ECONNREFUSED <ip>:12000`. Set `FLOCI_SERVICES_LAMBDA_DOCKER_HOST_OVERRIDE`
 to the host or IP that containers can actually reach Floci on, and Floci uses it
 verbatim instead of auto-detecting:
 
