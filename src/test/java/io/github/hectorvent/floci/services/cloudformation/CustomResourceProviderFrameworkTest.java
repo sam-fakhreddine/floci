@@ -54,7 +54,7 @@ class CustomResourceProviderFrameworkTest {
         provisioner = new CloudFormationResourceProvisioner(
                 null, null, null, null, lambdaService, null, null, null, null, null,
                 null, null, null, null, null, null, mapper, store, endpoint, null, null, null, null, null, null, null, null, null, null, null, null,
-                null,
+                null, null,
                 new io.github.hectorvent.floci.services.cloudformation.provisioners.CloudFormationResourceRegistry(java.util.List.of()));
     }
 
