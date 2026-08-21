@@ -560,7 +560,9 @@ floci:
     emrserverless:
       enabled: true
     controltower:
+      enabled: true
     route53resolver:
+      enabled: true
     ssoadmin:
       enabled: true
     tagging:
