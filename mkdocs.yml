@@ -134,6 +134,7 @@ nav:
     - AWS Batch: services/batch.md
     - CodeDeploy: services/codedeploy.md
     - CodePipeline: services/codepipeline.md
+    - AWS Organizations: services/organizations.md
     - AWS Backup: services/backup.md
     - AWS FIS: services/fis.md
     - CloudTrail: services/cloudtrail.md

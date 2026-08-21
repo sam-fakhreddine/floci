@@ -291,6 +291,7 @@ public interface EmulatorConfig {
         BatchStorageConfig batch();
         LightsailStorageConfig lightsail();
         CodePipelineStorageConfig codepipeline();
+        OrganizationsStorageConfig organizations();
         S3VectorsStorageConfig s3vectors();
         S3TablesStorageConfig s3tables();
         EcsStorageConfig ecs();
@@ -304,6 +305,8 @@ public interface EmulatorConfig {
         RumStorageConfig rum();
         GuardDutyStorageConfig guardduty();
         EmrServerlessStorageConfig emrserverless();
+
+        ControlTowerStorageConfig controltower();
     }
 
     interface SsmStorageConfig {
@@ -463,6 +466,13 @@ public interface EmulatorConfig {
         long flushIntervalMs();
     }
 
+    interface OrganizationsStorageConfig {
+        Optional<String> mode();
+
+        @WithDefault("5000")
+        long flushIntervalMs();
+    }
+
     interface S3VectorsStorageConfig {
         Optional<String> mode();
 
@@ -527,6 +537,13 @@ public interface EmulatorConfig {
     }
 
     interface RumStorageConfig {
+        Optional<String> mode();
+
+        @WithDefault("5000")
+        long flushIntervalMs();
+    }
+
+    interface ControlTowerStorageConfig {
         Optional<String> mode();
 
         @WithDefault("5000")
@@ -624,6 +641,7 @@ public interface EmulatorConfig {
         CodeBuildServiceConfig codebuild();
         CodeDeployServiceConfig codedeploy();
         CodePipelineServiceConfig codepipeline();
+        OrganizationsServiceConfig organizations();
         AutoScalingServiceConfig autoscaling();
         ApplicationAutoScalingServiceConfig applicationautoscaling();
         ElasticBeanstalkServiceConfig elasticbeanstalk();
@@ -656,6 +674,8 @@ public interface EmulatorConfig {
         RumServiceConfig rum();
         GuardDutyServiceConfig guardduty();
         EmrServerlessServiceConfig emrserverless();
+
+        ControlTowerServiceConfig controltower();
     }
 
     interface IotServiceConfig {
@@ -685,6 +705,11 @@ public interface EmulatorConfig {
     }
 
     interface RumServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
+    interface ControlTowerServiceConfig {
         @WithDefault("true")
         boolean enabled();
     }
@@ -840,6 +865,27 @@ public interface EmulatorConfig {
     interface CodePipelineServiceConfig {
         @WithDefault("true")
         boolean enabled();
+    }
+
+    interface OrganizationsServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+
+        /**
+         * When true (and IAM enforcement is enabled), service control policies attached in
+         * the caller's organization participate in policy evaluation.
+         */
+        @WithDefault("false")
+        boolean scpEnforcementEnabled();
+
+        /**
+         * Override for the management account's email. AWS derives it from the account that
+         * creates the organization; floci has no signup identity, so it otherwise synthesizes
+         * {@code management+<id>@example.com}. Tools that resolve accounts by email (e.g. the
+         * AWS Landing Zone Accelerator) need this to match their config. When empty, the
+         * synthetic default is used.
+         */
+        Optional<String> managementAccountEmail();
     }
 
     interface SsmServiceConfig {
