@@ -17,6 +17,7 @@ import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.cloudformation.model.TemplateSummary;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnRollback;
 import io.github.hectorvent.floci.services.s3.S3Service;
+import io.github.hectorvent.floci.services.ssm.SsmService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -55,6 +56,7 @@ public class CloudFormationService {
 
     private final CloudFormationResourceProvisioner provisioner;
     private final S3Service s3Service;
+    private final SsmService ssmService;
     private final ObjectMapper objectMapper;
     private final EmulatorConfig config;
     private final RegionResolver regionResolver;
@@ -71,11 +73,12 @@ public class CloudFormationService {
 
     @Inject
     public CloudFormationService(CloudFormationResourceProvisioner provisioner, S3Service s3Service,
-                                 ObjectMapper objectMapper, EmulatorConfig config,
+                                 SsmService ssmService, ObjectMapper objectMapper, EmulatorConfig config,
                                  RegionResolver regionResolver, Clock clock,
                                  StorageFactory storageFactory) {
         this.provisioner = provisioner;
         this.s3Service = s3Service;
+        this.ssmService = ssmService;
         this.objectMapper = objectMapper;
         this.config = config;
         this.regionResolver = regionResolver;
@@ -291,6 +294,57 @@ public class CloudFormationService {
                     "ChangeSet [" + changeSetName + "] does not exist", 400);
         }
         return cs;
+    }
+
+    /**
+     * Computes the per-resource changes a change set would apply, by diffing its template against
+     * the stack's currently deployed template. CREATE-type change sets (and stacks that have never
+     * executed a template) report every resource as an Add.
+     */
+    public List<ResourceChange> computeChangeSetChanges(ChangeSet cs, String region) {
+        Stack stack = getStackOrThrow(cs.getStackName(), region);
+        try {
+            JsonNode newResources = parseTemplate(cs.getTemplateBody()).path("Resources");
+            boolean createType = "CREATE".equalsIgnoreCase(cs.getChangeSetType())
+                    || stack.getTemplateBody() == null;
+            JsonNode oldResources = createType
+                    ? objectMapper.createObjectNode()
+                    : parseTemplate(stack.getTemplateBody()).path("Resources");
+            List<ResourceChange> changes = new ArrayList<>();
+            newResources.fields().forEachRemaining(e -> {
+                String logicalId = e.getKey();
+                String resourceType = e.getValue().path("Type").asText();
+                JsonNode oldDef = oldResources.get(logicalId);
+                if (oldDef == null) {
+                    changes.add(new ResourceChange("Add", logicalId, null, resourceType, null));
+                } else if (!oldDef.equals(e.getValue())) {
+                    changes.add(new ResourceChange("Modify", logicalId,
+                            resourcePhysicalId(stack, logicalId), resourceType, "False"));
+                }
+            });
+            oldResources.fields().forEachRemaining(e -> {
+                if (!newResources.has(e.getKey())) {
+                    changes.add(new ResourceChange("Remove", e.getKey(),
+                            resourcePhysicalId(stack, e.getKey()),
+                            e.getValue().path("Type").asText(), null));
+                }
+            });
+            return changes;
+        } catch (AwsException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new AwsException("ValidationError",
+                    "Unable to compute changes for change set " + cs.getChangeSetName()
+                            + ": " + e.getMessage(), 400);
+        }
+    }
+
+    public record ResourceChange(String action, String logicalResourceId, String physicalResourceId,
+                                 String resourceType, String replacement) {}
+
+    private String resourcePhysicalId(Stack stack, String logicalId) {
+        StackResource resource = stack.getResources().get(logicalId);
+        return resource != null ? resource.getPhysicalId() : null;
     }
 
     // ── ExecuteChangeSet ──────────────────────────────────────────────────────
@@ -622,6 +676,43 @@ public class CloudFormationService {
         return resolved;
     }
 
+    /**
+     * Substitutes {@code AWS::SSM::Parameter::Value<String>}-typed parameter values — which carry
+     * an SSM parameter <em>name</em> — with the value stored in Parameter Store for the stack's
+     * account and region, as real CloudFormation does before template processing. Missing
+     * parameters fail the stack operation with the real AWS ValidationError. The related types
+     * {@code AWS::SSM::Parameter::Value<List<String>>} and {@code AWS::SSM::Parameter::Name} are
+     * not resolved and pass through verbatim.
+     */
+    private Map<String, String> resolveSsmParameters(JsonNode template, Map<String, String> params, String region) {
+        JsonNode paramDefs = template.path("Parameters");
+        if (!paramDefs.isObject()) {
+            return params;
+        }
+        Map<String, String> resolved = new HashMap<>(params);
+        List<String> missing = new ArrayList<>();
+        paramDefs.fields().forEachRemaining(e -> {
+            if (!"AWS::SSM::Parameter::Value<String>".equals(e.getValue().path("Type").asText())) {
+                return;
+            }
+            String parameterName = resolved.get(e.getKey());
+            if (parameterName == null || parameterName.isBlank()) {
+                return;
+            }
+            try {
+                resolved.put(e.getKey(), ssmService.getParameter(parameterName, region).getValue());
+            } catch (AwsException ex) {
+                missing.add(parameterName);
+            }
+        });
+        if (!missing.isEmpty()) {
+            throw new AwsException("ValidationError",
+                    "Unable to fetch parameters [" + String.join(",", missing)
+                            + "] from parameter store for this account", 400);
+        }
+        return resolved;
+    }
+
     private void executeTemplate(Stack stack, String templateBody, Map<String, String> params,
                                  boolean isCreate, String region, String accountId) {
         StackUpdateSnapshot previousState = snapshotForUpdate(stack);
@@ -642,7 +733,10 @@ public class CloudFormationService {
             stack.setTemplateBody(templateBody);
 
             // Merge default parameter values from the template with caller-supplied params
-            Map<String, String> resolvedParams = resolveDefaultParameters(template, params);
+            Map<String, String> givenParams = resolveDefaultParameters(template, params);
+            stack.getParameters().clear();
+            stack.getParameters().putAll(givenParams);
+            Map<String, String> resolvedParams = resolveSsmParameters(template, givenParams, region);
 
             // Resolve conditions first
             Map<String, Boolean> conditions = resolveConditions(template, resolvedParams, stack, region, accountId);

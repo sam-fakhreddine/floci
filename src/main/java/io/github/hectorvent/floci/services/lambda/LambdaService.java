@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.CustomResourceLiveness;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.StorageBackedMap;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -73,6 +74,8 @@ public class LambdaService {
     private final DynamoDbStreamsEventSourcePoller dynamodbStreamsPoller;
     private final StorageFactory storageFactory;
     private final LambdaLayerService layerService;
+    /** Null in the constructors tests use, exactly as the other optional collaborators above are. */
+    private final CustomResourceLiveness customResourceLiveness;
     private Map<String, Integer> versionCounters = new ConcurrentHashMap<>();
     private Map<String, FunctionEventInvokeConfig> eventInvokeConfigs = new ConcurrentHashMap<>();
     /**
@@ -142,6 +145,7 @@ public class LambdaService {
         this.dynamodbStreamsPoller = null;
         this.storageFactory = storageFactory;
         this.layerService = null;
+        this.customResourceLiveness = null;
     }
 
     @Inject
@@ -161,7 +165,9 @@ public class LambdaService {
                           KinesisEventSourcePoller kinesisPoller,
                           DynamoDbStreamsEventSourcePoller dynamodbStreamsPoller,
                           StorageFactory storageFactory,
-                          LambdaLayerService layerService) {
+                          LambdaLayerService layerService,
+                          CustomResourceLiveness customResourceLiveness) {
+        this.customResourceLiveness = customResourceLiveness;
         this.functionStore = functionStore;
         this.executorService = executorService;
         this.concurrencyLimiter = concurrencyLimiter;
@@ -677,6 +683,7 @@ public class LambdaService {
         } else {
             fn = resolveInvokeTarget(region, name, qualifier);
         }
+        reportCustomResourceLiveness(payload);
         InvokeResult result = executorService.invoke(fn, payload, type);
         result.setExecutedVersion(fn.getVersion());
         return result;
@@ -691,6 +698,21 @@ public class LambdaService {
         InvokeResult result = executorService.invoke(fn, payload, type);
         result.setExecutedVersion(fn.getVersion());
         return result;
+    }
+
+    /**
+     * Reports that a pending custom resource is still making progress, if this payload belongs to
+     * one. A CDK provider-framework waiter re-invokes {@code framework.isComplete} on a cadence and
+     * echoes the original event -- including its ResponseURL -- into every poll, so a poll landing
+     * here is proof of liveness for that resource's callback token. Resetting the idle budget on it
+     * keeps a long-but-progressing resource (12 org accounts at one per poll) from being cut off
+     * mid-success, without CloudFormation needing to know how much work is left.
+     */
+    private void reportCustomResourceLiveness(byte[] payload) {
+        if (customResourceLiveness == null) {
+            return;
+        }
+        CustomResourceLiveness.tokenIn(payload).ifPresent(customResourceLiveness::touch);
     }
 
     private LambdaFunction resolveInvokeTarget(String region, String name, String qualifier) {
