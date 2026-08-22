@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.github.hectorvent.floci.services.iam.model.IamUser;
 import io.github.hectorvent.floci.services.iam.model.InstanceProfile;
 import io.github.hectorvent.floci.services.iam.model.OpenIDConnectProvider;
+import io.github.hectorvent.floci.services.iam.model.PasswordPolicy;
 import io.github.hectorvent.floci.services.iam.model.PolicyVersion;
 import io.github.hectorvent.floci.services.iam.model.CallerContext;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -86,6 +87,7 @@ public class IamQueryHandler {
             // Groups
             case "CreateGroup" -> handleCreateGroup(params);
             case "GetGroup" -> handleGetGroup(params);
+            case "UpdateGroup" -> handleUpdateGroup(params);
             case "DeleteGroup" -> handleDeleteGroup(params);
             case "ListGroups" -> handleListGroups(params);
             case "AddUserToGroup" -> handleAddUserToGroup(params);
@@ -104,6 +106,8 @@ public class IamQueryHandler {
             case "UpdateAssumeRolePolicy" -> handleUpdateAssumeRolePolicy(params);
             case "TagRole" -> handleTagRole(params);
             case "UntagRole" -> handleUntagRole(params);
+            case "TagInstanceProfile" -> handleTagInstanceProfile(params);
+            case "UntagInstanceProfile" -> handleUntagInstanceProfile(params);
             case "ListRoleTags" -> handleListRoleTags(params);
 
             // Managed Policies
@@ -161,6 +165,16 @@ public class IamQueryHandler {
             case "ListAccessKeys" -> handleListAccessKeys(params, authorization);
             case "UpdateAccessKey" -> handleUpdateAccessKey(params);
             case "GetAccessKeyLastUsed" -> handleGetAccessKeyLastUsed(params);
+
+            // Account Password Policy
+            case "UpdateAccountPasswordPolicy" -> handleUpdateAccountPasswordPolicy(params);
+            case "GetAccountPasswordPolicy" -> handleGetAccountPasswordPolicy(params);
+            case "DeleteAccountPasswordPolicy" -> handleDeleteAccountPasswordPolicy(params);
+            case "ListOrganizationsFeatures" -> handleListOrganizationsFeatures(params);
+            case "EnableOrganizationsRootCredentialsManagement" -> handleEnableOrganizationsRootCredentialsManagement(params);
+            case "EnableOrganizationsRootSessions" -> handleEnableOrganizationsRootSessions(params);
+            case "DisableOrganizationsRootCredentialsManagement" -> handleDisableOrganizationsRootCredentialsManagement(params);
+            case "DisableOrganizationsRootSessions" -> handleDisableOrganizationsRootSessions(params);
 
             // Instance Profiles
             case "CreateInstanceProfile" -> handleCreateInstanceProfile(params);
@@ -462,6 +476,12 @@ public class IamQueryHandler {
         }
         xml.end("Users").elem("IsTruncated", false);
         return Response.ok(AwsQueryResponse.envelope("GetGroup", AwsNamespaces.IAM, xml.build())).build();
+    }
+
+    private Response handleUpdateGroup(MultivaluedMap<String, String> params) {
+        iamService.updateGroup(getParam(params, "GroupName"),
+                getParam(params, "NewGroupName"), getParam(params, "NewPath"));
+        return Response.ok(AwsQueryResponse.envelopeNoResult("UpdateGroup", AwsNamespaces.IAM)).build();
     }
 
     private Response handleDeleteGroup(MultivaluedMap<String, String> params) {
@@ -912,6 +932,94 @@ public class IamQueryHandler {
     }
 
     // =========================================================================
+    // Account Password Policy
+    // =========================================================================
+
+    private Response handleUpdateAccountPasswordPolicy(MultivaluedMap<String, String> params) {
+        PasswordPolicy policy = new PasswordPolicy();
+        policy.setMinimumPasswordLength(getIntParam(params, "MinimumPasswordLength", 6));
+        policy.setRequireSymbols(getBooleanParam(params, "RequireSymbols"));
+        policy.setRequireNumbers(getBooleanParam(params, "RequireNumbers"));
+        policy.setRequireUppercaseCharacters(getBooleanParam(params, "RequireUppercaseCharacters"));
+        policy.setRequireLowercaseCharacters(getBooleanParam(params, "RequireLowercaseCharacters"));
+        policy.setAllowUsersToChangePassword(getBooleanParam(params, "AllowUsersToChangePassword"));
+        policy.setMaxPasswordAge(getIntegerParam(params, "MaxPasswordAge"));
+        policy.setPasswordReusePrevention(getIntegerParam(params, "PasswordReusePrevention"));
+        policy.setHardExpiry(getBooleanParam(params, "HardExpiry"));
+        iamService.updateAccountPasswordPolicy(policy);
+        return Response.ok(AwsQueryResponse.envelopeNoResult("UpdateAccountPasswordPolicy", AwsNamespaces.IAM)).build();
+    }
+
+    private Response handleGetAccountPasswordPolicy(MultivaluedMap<String, String> params) {
+        PasswordPolicy policy = iamService.getAccountPasswordPolicy();
+        var xml = new XmlBuilder()
+                .start("PasswordPolicy")
+                .elem("MinimumPasswordLength", (long) policy.getMinimumPasswordLength())
+                .elem("RequireSymbols", policy.isRequireSymbols())
+                .elem("RequireNumbers", policy.isRequireNumbers())
+                .elem("RequireUppercaseCharacters", policy.isRequireUppercaseCharacters())
+                .elem("RequireLowercaseCharacters", policy.isRequireLowercaseCharacters())
+                .elem("AllowUsersToChangePassword", policy.isAllowUsersToChangePassword())
+                .elem("ExpirePasswords", policy.getMaxPasswordAge() != null);
+        if (policy.getMaxPasswordAge() != null) {
+            xml.elem("MaxPasswordAge", policy.getMaxPasswordAge().longValue());
+        }
+        if (policy.getPasswordReusePrevention() != null) {
+            xml.elem("PasswordReusePrevention", policy.getPasswordReusePrevention().longValue());
+        }
+        String result = xml.elem("HardExpiry", policy.isHardExpiry()).end("PasswordPolicy").build();
+        return Response.ok(AwsQueryResponse.envelope("GetAccountPasswordPolicy", AwsNamespaces.IAM, result)).build();
+    }
+
+    private Response handleDeleteAccountPasswordPolicy(MultivaluedMap<String, String> params) {
+        iamService.deleteAccountPasswordPolicy();
+        return Response.ok(AwsQueryResponse.envelopeNoResult("DeleteAccountPasswordPolicy", AwsNamespaces.IAM)).build();
+    }
+
+    // =========================================================================
+    // Centralized root access management (org-scoped, IAM Query endpoint)
+    // =========================================================================
+
+    private Response handleListOrganizationsFeatures(MultivaluedMap<String, String> params) {
+        return rootFeaturesResponse("ListOrganizationsFeatures", iamService.listOrganizationsFeatures());
+    }
+
+    private Response handleEnableOrganizationsRootCredentialsManagement(MultivaluedMap<String, String> params) {
+        return rootFeaturesResponse("EnableOrganizationsRootCredentialsManagement",
+                iamService.enableOrganizationsRootCredentialsManagement());
+    }
+
+    private Response handleEnableOrganizationsRootSessions(MultivaluedMap<String, String> params) {
+        return rootFeaturesResponse("EnableOrganizationsRootSessions",
+                iamService.enableOrganizationsRootSessions());
+    }
+
+    private Response handleDisableOrganizationsRootCredentialsManagement(MultivaluedMap<String, String> params) {
+        return rootFeaturesResponse("DisableOrganizationsRootCredentialsManagement",
+                iamService.disableOrganizationsRootCredentialsManagement());
+    }
+
+    private Response handleDisableOrganizationsRootSessions(MultivaluedMap<String, String> params) {
+        return rootFeaturesResponse("DisableOrganizationsRootSessions",
+                iamService.disableOrganizationsRootSessions());
+    }
+
+    /**
+     * Builds the shared {@code <EnabledFeatures><member>..</member></EnabledFeatures>} result used by
+     * both {@code ListOrganizationsFeatures} and the enable/disable ops. The org-scoped
+     * {@code OrganizationId} is intentionally omitted — LZA's root-user-management module reads only
+     * the enabled-feature set, and omitting it avoids coupling the IAM endpoint to Organizations.
+     */
+    private Response rootFeaturesResponse(String action, List<String> features) {
+        XmlBuilder xml = new XmlBuilder().start("EnabledFeatures");
+        for (String feature : features) {
+            xml.elem("member", feature);
+        }
+        String result = xml.end("EnabledFeatures").build();
+        return Response.ok(AwsQueryResponse.envelope(action, AwsNamespaces.IAM, result)).build();
+    }
+
+    // =========================================================================
     // Instance Profiles
     // =========================================================================
 
@@ -1259,6 +1367,20 @@ public class IamQueryHandler {
         }
     }
 
+    private Integer getIntegerParam(MultivaluedMap<String, String> params, String name) {
+        String value = params.getFirst(name);
+        if (value == null) return null;
+        try {
+            return Integer.valueOf(value);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    private boolean getBooleanParam(MultivaluedMap<String, String> params, String name) {
+        return Boolean.parseBoolean(params.getFirst(name));
+    }
+
     Response xmlErrorResponse(String code, String message, int status) {
         return AwsQueryResponse.error(code, message, AwsNamespaces.IAM, status);
     }
@@ -1266,5 +1388,15 @@ public class IamQueryHandler {
     private String isoDate(Instant instant) {
         if (instant == null) return "";
         return DateTimeFormatter.ISO_INSTANT.format(instant);
+    }
+
+    private Response handleTagInstanceProfile(MultivaluedMap<String, String> params) {
+        iamService.tagInstanceProfile(getParam(params, "InstanceProfileName"), extractTags(params));
+        return Response.ok(AwsQueryResponse.envelopeNoResult("TagInstanceProfile", AwsNamespaces.IAM)).build();
+    }
+
+    private Response handleUntagInstanceProfile(MultivaluedMap<String, String> params) {
+        iamService.untagInstanceProfile(getParam(params, "InstanceProfileName"), extractTagKeys(params));
+        return Response.ok(AwsQueryResponse.envelopeNoResult("UntagInstanceProfile", AwsNamespaces.IAM)).build();
     }
 }

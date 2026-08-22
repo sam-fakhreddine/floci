@@ -16,6 +16,8 @@ import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.github.hectorvent.floci.services.iam.model.IamUser;
 import io.github.hectorvent.floci.services.iam.model.InstanceProfile;
 import io.github.hectorvent.floci.services.iam.model.OpenIDConnectProvider;
+import io.github.hectorvent.floci.services.iam.model.OrganizationRootFeatures;
+import io.github.hectorvent.floci.services.iam.model.PasswordPolicy;
 import io.github.hectorvent.floci.services.iam.model.PolicyVersion;
 import io.github.hectorvent.floci.services.iam.model.CallerContext;
 import io.github.hectorvent.floci.services.iam.model.SessionCredential;
@@ -75,6 +77,10 @@ public class IamService implements SessionAccountLookup {
     /** CustomSuffix as AWS constrains it: 1-64 characters of {@code [\w+=,.@-]}. */
     private static final Pattern CUSTOM_SUFFIX_PATTERN = Pattern.compile("[\\w+=,.@-]{1,64}");
     private static final int ROLE_NAME_MAX_LENGTH = 64;
+    private static final String PASSWORD_POLICY_KEY = "account-password-policy";
+    private static final String ROOT_FEATURES_KEY = "org-root-features";
+    public static final String FEATURE_ROOT_CREDENTIALS = "RootCredentialsManagement";
+    public static final String FEATURE_ROOT_SESSIONS = "RootSessions";
 
     private final StorageBackend<String, IamUser> users;
     private final StorageBackend<String, IamGroup> groups;
@@ -98,6 +104,8 @@ public class IamService implements SessionAccountLookup {
     private final StorageBackend<String, OpenIDConnectProvider> oidcProviders;
     /** Deletion is synchronous, so an issued task id is a completed one; the value is its role. */
     private final StorageBackend<String, String> serviceLinkedRoleDeletions;
+    private final StorageBackend<String, PasswordPolicy> passwordPolicies;
+    private final StorageBackend<String, OrganizationRootFeatures> orgRootFeatures;
     private final RegionResolver regionResolver;
     private final boolean seedDeployerPrincipal;
     private final String seededAccountAlias;
@@ -122,6 +130,8 @@ public class IamService implements SessionAccountLookup {
             storageFactory.create("iam", "iam-account-aliases.json", new TypeReference<>() {}),
             storageFactory.create("iam", "iam-oidc-providers.json", new TypeReference<>() {}),
             storageFactory.create("iam", "iam-slr-deletions.json", new TypeReference<>() {}),
+            storageFactory.create("iam", "iam-password-policy.json", new TypeReference<>() {}),
+            storageFactory.create("iam", "iam-org-root-features.json", new TypeReference<>() {}),
             regionResolver,
             config.services().iam().seedDeployerPrincipal(),
             config.services().iam().accountAlias().orElse(null)
@@ -136,7 +146,9 @@ public class IamService implements SessionAccountLookup {
                StorageBackend<String, InstanceProfile> instanceProfiles,
                StorageBackend<String, SessionCredential> sessions,
                RegionResolver regionResolver) {
-        this(users, groups, roles, policies, accessKeys, instanceProfiles, sessions, regionResolver, false);
+        this(users, groups, roles, policies, accessKeys, instanceProfiles, sessions,
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), regionResolver, false, null);
     }
 
     IamService(StorageBackend<String, IamUser> users,
@@ -150,7 +162,46 @@ public class IamService implements SessionAccountLookup {
                boolean seedDeployerPrincipal) {
         this(users, groups, roles, policies, accessKeys, instanceProfiles, sessions,
                 new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
-                regionResolver, seedDeployerPrincipal, null);
+                new InMemoryStorage<>(), new InMemoryStorage<>(), regionResolver, seedDeployerPrincipal, null);
+    }
+
+    // 8-backend constructor (no org-root-features): kept for existing callers/tests;
+    // delegates with an in-memory root-features backend.
+    IamService(StorageBackend<String, IamUser> users,
+               StorageBackend<String, IamGroup> groups,
+               StorageBackend<String, IamRole> roles,
+               StorageBackend<String, IamPolicy> policies,
+               StorageBackend<String, AccessKey> accessKeys,
+               StorageBackend<String, InstanceProfile> instanceProfiles,
+               StorageBackend<String, SessionCredential> sessions,
+               StorageBackend<String, String> accountAliases,
+               StorageBackend<String, OpenIDConnectProvider> oidcProviders,
+               StorageBackend<String, String> serviceLinkedRoleDeletions,
+               StorageBackend<String, PasswordPolicy> passwordPolicies,
+               RegionResolver regionResolver,
+               boolean seedDeployerPrincipal,
+               String seededAccountAlias) {
+        this(users, groups, roles, policies, accessKeys, instanceProfiles, sessions,
+                accountAliases, oidcProviders, serviceLinkedRoleDeletions, passwordPolicies,
+                new InMemoryStorage<>(), regionResolver, seedDeployerPrincipal, seededAccountAlias);
+    }
+
+    // 9-backend constructor (no alias/OIDC/SLR backends): kept for existing callers/tests;
+    // delegates with in-memory backends for the omitted stores.
+    IamService(StorageBackend<String, IamUser> users,
+               StorageBackend<String, IamGroup> groups,
+               StorageBackend<String, IamRole> roles,
+               StorageBackend<String, IamPolicy> policies,
+               StorageBackend<String, AccessKey> accessKeys,
+               StorageBackend<String, InstanceProfile> instanceProfiles,
+               StorageBackend<String, SessionCredential> sessions,
+               StorageBackend<String, PasswordPolicy> passwordPolicies,
+               StorageBackend<String, OrganizationRootFeatures> orgRootFeatures,
+               RegionResolver regionResolver,
+               boolean seedDeployerPrincipal) {
+        this(users, groups, roles, policies, accessKeys, instanceProfiles, sessions,
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                passwordPolicies, orgRootFeatures, regionResolver, seedDeployerPrincipal, null);
     }
 
     IamService(StorageBackend<String, IamUser> users,
@@ -163,6 +214,8 @@ public class IamService implements SessionAccountLookup {
                StorageBackend<String, String> accountAliases,
                StorageBackend<String, OpenIDConnectProvider> oidcProviders,
                StorageBackend<String, String> serviceLinkedRoleDeletions,
+               StorageBackend<String, PasswordPolicy> passwordPolicies,
+               StorageBackend<String, OrganizationRootFeatures> orgRootFeatures,
                RegionResolver regionResolver,
                boolean seedDeployerPrincipal,
                String seededAccountAlias) {
@@ -176,6 +229,8 @@ public class IamService implements SessionAccountLookup {
         this.accountAliases = accountAliases;
         this.oidcProviders = oidcProviders;
         this.serviceLinkedRoleDeletions = serviceLinkedRoleDeletions;
+        this.passwordPolicies = passwordPolicies;
+        this.orgRootFeatures = orgRootFeatures;
         this.regionResolver = regionResolver;
         this.seedDeployerPrincipal = seedDeployerPrincipal;
         this.seededAccountAlias = seededAccountAlias;
@@ -374,6 +429,27 @@ public class IamService implements SessionAccountLookup {
                         "The group with name " + groupName + " cannot be found.", 404));
     }
 
+    public void updateGroup(String groupName, String newGroupName, String newPath) {
+        IamGroup group = getGroup(groupName);
+        if (newGroupName != null && !newGroupName.equals(groupName)) {
+            if (groups.get(newGroupName).isPresent()) {
+                throw new AwsException("EntityAlreadyExists",
+                        "Group with name " + newGroupName + " already exists.", 409);
+            }
+            groups.delete(groupName);
+            group.setGroupName(newGroupName);
+            if (newPath != null) group.setPath(normalizePath(newPath));
+            group.setArn(iamArn("group", group.getPath(), newGroupName));
+            groups.put(newGroupName, group);
+        } else {
+            if (newPath != null) {
+                group.setPath(normalizePath(newPath));
+                group.setArn(iamArn("group", group.getPath(), groupName));
+            }
+            groups.put(groupName, group);
+        }
+    }
+
     public void deleteGroup(String groupName) {
         IamGroup group = getGroup(groupName);
         if (!group.getAttachedPolicyArns().isEmpty() || !group.getInlinePolicies().isEmpty()) {
@@ -446,6 +522,20 @@ public class IamService implements SessionAccountLookup {
         return role;
     }
 
+    /**
+     * Creates a service-linked role for an AWS service, mirroring the IAM
+     * {@code CreateServiceLinkedRole} API. The role name is derived from the service
+     * principal (e.g. {@code access-analyzer.amazonaws.com} -> {@code AWSServiceRoleForAccessAnalyzer})
+     * and the role is placed under the reserved {@code /aws-service-role/<serviceName>/} path
+     * with a trust policy allowing the service principal to assume it.
+     *
+     * <p>Idempotent: if the role already exists it is returned unchanged (AWS returns
+     * {@code InvalidInput} in that case, but LZA custom resources rely on create-or-return).</p>
+     *
+     * @param awsServiceName the service principal, e.g. {@code access-analyzer.amazonaws.com}
+     * @param customSuffix   optional suffix appended as {@code <roleName>_<suffix>} (may be null)
+     * @param description    optional role description (may be null)
+     */
     public IamRole getRole(String roleName) {
         return roles.get(roleName)
                 .orElseThrow(() -> new AwsException("NoSuchEntity",
@@ -1225,6 +1315,73 @@ public class IamService implements SessionAccountLookup {
     }
 
     // =========================================================================
+    // Account Password Policy
+    // =========================================================================
+
+    public void updateAccountPasswordPolicy(PasswordPolicy policy) {
+        passwordPolicies.put(PASSWORD_POLICY_KEY, policy);
+        LOG.infov("Updated account password policy for account {0}", regionResolver.getAccountId());
+    }
+
+    public PasswordPolicy getAccountPasswordPolicy() {
+        return passwordPolicies.get(PASSWORD_POLICY_KEY)
+                .orElseThrow(() -> new AwsException("NoSuchEntity",
+                        "The Password Policy with domain name " + regionResolver.getAccountId()
+                                + " cannot be found.", 404));
+    }
+
+    public void deleteAccountPasswordPolicy() {
+        getAccountPasswordPolicy();
+        passwordPolicies.delete(PASSWORD_POLICY_KEY);
+        LOG.infov("Deleted account password policy for account {0}", regionResolver.getAccountId());
+    }
+
+    // =========================================================================
+    // Centralized root access management (org-scoped, IAM Query endpoint)
+    // =========================================================================
+
+    /** Currently-enabled centralized root features, in enablement order. Empty for a fresh org. */
+    public List<String> listOrganizationsFeatures() {
+        return new ArrayList<>(currentRootFeatures().getEnabledFeatures());
+    }
+
+    public List<String> enableOrganizationsRootCredentialsManagement() {
+        return addRootFeature(FEATURE_ROOT_CREDENTIALS);
+    }
+
+    public List<String> enableOrganizationsRootSessions() {
+        return addRootFeature(FEATURE_ROOT_SESSIONS);
+    }
+
+    public List<String> disableOrganizationsRootCredentialsManagement() {
+        return removeRootFeature(FEATURE_ROOT_CREDENTIALS);
+    }
+
+    public List<String> disableOrganizationsRootSessions() {
+        return removeRootFeature(FEATURE_ROOT_SESSIONS);
+    }
+
+    private OrganizationRootFeatures currentRootFeatures() {
+        return orgRootFeatures.get(ROOT_FEATURES_KEY).orElseGet(OrganizationRootFeatures::new);
+    }
+
+    private List<String> addRootFeature(String feature) {
+        OrganizationRootFeatures features = currentRootFeatures();
+        features.getEnabledFeatures().add(feature);
+        orgRootFeatures.put(ROOT_FEATURES_KEY, features);
+        LOG.infov("Enabled centralized root feature {0}", feature);
+        return new ArrayList<>(features.getEnabledFeatures());
+    }
+
+    private List<String> removeRootFeature(String feature) {
+        OrganizationRootFeatures features = currentRootFeatures();
+        features.getEnabledFeatures().remove(feature);
+        orgRootFeatures.put(ROOT_FEATURES_KEY, features);
+        LOG.infov("Disabled centralized root feature {0}", feature);
+        return new ArrayList<>(features.getEnabledFeatures());
+    }
+
+    // =========================================================================
     // Instance Profiles
     // =========================================================================
 
@@ -2001,5 +2158,17 @@ public class IamService implements SessionAccountLookup {
             sb.append(secretChars.charAt(ThreadLocalRandom.current().nextInt(secretChars.length())));
         }
         return sb.toString();
+    }
+
+    public void tagInstanceProfile(String instanceProfileName, Map<String, String> newTags) {
+        InstanceProfile profile = getInstanceProfile(instanceProfileName);
+        profile.getTags().putAll(newTags);
+        instanceProfiles.put(instanceProfileName, profile);
+    }
+
+    public void untagInstanceProfile(String instanceProfileName, List<String> tagKeys) {
+        InstanceProfile profile = getInstanceProfile(instanceProfileName);
+        tagKeys.forEach(profile.getTags()::remove);
+        instanceProfiles.put(instanceProfileName, profile);
     }
 }

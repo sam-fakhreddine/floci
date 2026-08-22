@@ -244,6 +244,36 @@ class IamServiceTest {
     }
 
     @Test
+    void createServiceLinkedRoleForAccessAnalyzer() {
+        IamRole role = iamService.createServiceLinkedRole(
+                "access-analyzer.amazonaws.com", null, "Access Analyzer SLR");
+
+        assertEquals("AWSServiceRoleForAccessAnalyzer", role.getRoleName());
+        assertEquals("/aws-service-role/access-analyzer.amazonaws.com/", role.getPath());
+        assertTrue(role.getRoleId().startsWith("AROA"));
+        assertEquals(
+                "arn:aws:iam::000000000000:role/aws-service-role/access-analyzer.amazonaws.com/AWSServiceRoleForAccessAnalyzer",
+                role.getArn());
+        assertTrue(role.getAssumeRolePolicyDocument().contains("access-analyzer.amazonaws.com"),
+                "trust policy should allow the service principal");
+    }
+
+    @Test
+    void createServiceLinkedRoleRejectsDuplicate() {
+        iamService.createServiceLinkedRole("access-analyzer.amazonaws.com", null, null);
+        AwsException ex = assertThrows(AwsException.class, () ->
+                iamService.createServiceLinkedRole("access-analyzer.amazonaws.com", null, null));
+        assertEquals("InvalidInput", ex.getErrorCode());
+    }
+
+    @Test
+    void createServiceLinkedRoleWithCustomSuffix() {
+        IamRole role = iamService.createServiceLinkedRole(
+                "access-analyzer.amazonaws.com", "myapp", null);
+        assertEquals("AWSServiceRoleForAccessAnalyzer_myapp", role.getRoleName());
+    }
+
+    @Test
     void deleteRoleWithAttachedPolicyFails() {
         iamService.createRole("LambdaExec", "/", "{}", null, 0, null);
         String policyArn = iamService.createPolicy("P", "/", null, "{}", null).getArn();
