@@ -444,6 +444,10 @@ These services spawn Docker containers. They require access to the Docker socket
 | `FLOCI_SERVICES_GLUE_ENABLED` | `true` | Enable the Glue service |
 | `FLOCI_SERVICES_APPSYNC_ENABLED` | `true` | Enable the AppSync service |
 | `FLOCI_SERVICES_BEDROCK_RUNTIME_ENABLED` | `true` | Enable the Bedrock Runtime service |
+| `FLOCI_SERVICES_BEDROCK_AGENT_CORE_CONTROL_ENABLED` | `true` | Enable the Bedrock AgentCore control plane (agent runtimes, gateways, memory, workload identity) |
+| `FLOCI_SERVICES_BEDROCK_AGENT_CORE_ENABLED` | `true` | Enable the Bedrock AgentCore data plane (`InvokeAgentRuntime` stub) |
+| `FLOCI_SERVICES_BEDROCK_AGENT_CORE_INVOKE_RESPONSE` | `{"output":"yes"}` | Canned body returned by `InvokeAgentRuntime` |
+| `FLOCI_SERVICES_BEDROCK_AGENT_CORE_VALIDATE_RUNTIME_EXISTS` | `false` | When `true`, `InvokeAgentRuntime` rejects unknown runtime ARNs |
 | `FLOCI_SERVICES_TEXTRACT_ENABLED` | `true` | Enable the Textract service |
 | `FLOCI_SERVICES_TRANSFER_ENABLED` | `true` | Enable the Transfer Family service |
 | `FLOCI_SERVICES_ROUTE53_ENABLED` | `true` | Enable the Route 53 service |
@@ -453,8 +457,12 @@ These services spawn Docker containers. They require access to the Docker socket
 | `FLOCI_SERVICES_CODEBUILD_ENABLED` | `true` | Enable the CodeBuild service |
 | `FLOCI_SERVICES_CODEBUILD_DOCKER_NETWORK` | _(none)_ | Docker network for CodeBuild build containers |
 | `FLOCI_SERVICES_CODEDEPLOY_ENABLED` | `true` | Enable the CodeDeploy service |
+| `FLOCI_SERVICES_NETWORKFIREWALL_ENABLED` | `true` | Enable the AWS Network Firewall service |
+| `FLOCI_SERVICES_SERVICEQUOTAS_ENABLED` | `true` | Enable the Service Quotas service |
+| `FLOCI_SERVICES_RAM_ENABLED` | `true` | Enable the AWS RAM service |
 | `FLOCI_SERVICES_BACKUP_ENABLED` | `true` | Enable the AWS Backup service |
 | `FLOCI_SERVICES_BACKUP_JOB_COMPLETION_DELAY_SECONDS` | `3` | Simulated delay before backup jobs transition to `COMPLETED` |
 | `FLOCI_SERVICES_FIS_ENABLED` | `true` | Enable the AWS Fault Injection Service management API |
+| `FLOCI_SERVICES_RESOURCEEXPLORER2_ENABLED` | `true` | Enable the Resource Explorer 2 service |
 | `FLOCI_SERVICES_APPCONFIG_ENABLED` | `true` | Enable the AppConfig service |
 | `FLOCI_SERVICES_APPCONFIGDATA_ENABLED` | `true` | Enable the AppConfig Data service |

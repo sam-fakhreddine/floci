@@ -157,11 +157,16 @@ floci:
         flush-interval-ms: 5000
       rum:
         flush-interval-ms: 5000
+      resourceexplorer2:
+        mode: hybrid
+        flush-interval-ms: 5000
       fis:
         flush-interval-ms: 5000
       guardduty:
         flush-interval-ms: 5000
       emrserverless:
+        flush-interval-ms: 5000
+      lakeformation:
         flush-interval-ms: 5000
 
   dns:
@@ -353,6 +358,7 @@ floci:
     stepfunctions:
       enabled: true
       allow-plaintext-http: false
+      mock-config-file: ${SFN_MOCK_CONFIG:}
     swf:
       enabled: true
       timeout-sweep-enabled: true
@@ -507,6 +513,8 @@ floci:
       enabled: true
     cloudcontrol:
       enabled: true
+    resourceexplorer2:
+      enabled: true
     cloudfront:
       enabled: true
       allowed-private-origin-hosts: []
@@ -529,11 +537,25 @@ floci:
       enabled: true
     cloudhsmv2:
       enabled: true
+    efs:
+      enabled: true
+    organizations:
+      enabled: true
     rum:
+      enabled: true
+    networkfirewall:
+      enabled: true
+    servicecatalog:
       enabled: true
     guardduty:
       enabled: true
     emrserverless:
+      enabled: true
+    ssoadmin:
+      enabled: true
+    controltower:
+      enabled: true
+    lakeformation:
       enabled: true
     tagging:
       enabled: true
@@ -550,4 +572,8 @@ floci:
       # invoke-response: '{"output":"yes"}'   # Body returned by InvokeAgentRuntime
       # validate-runtime-exists: false        # true = reject unknown runtime ARNs
     bedrock-agent-core-control:
+      enabled: true
+    servicequotas:
+      enabled: true
+    ram:
       enabled: true

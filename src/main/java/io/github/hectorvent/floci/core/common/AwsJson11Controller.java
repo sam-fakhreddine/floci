@@ -23,6 +23,7 @@ import io.github.hectorvent.floci.services.ce.CostExplorerJsonHandler;
 import io.github.hectorvent.floci.services.cloudtrail.CloudTrailJsonHandler;
 import io.github.hectorvent.floci.services.applicationautoscaling.ApplicationAutoScalingJsonHandler;
 import io.github.hectorvent.floci.services.cloudcontrol.CloudControlJsonHandler;
+import io.github.hectorvent.floci.services.ssoadmin.SsoAdminJsonHandler;
 import io.github.hectorvent.floci.services.configservice.ConfigServiceJsonHandler;
 import io.github.hectorvent.floci.services.cur.CurJsonHandler;
 import io.github.hectorvent.floci.services.pricing.PricingJsonHandler;
@@ -40,6 +41,10 @@ import io.github.hectorvent.floci.services.kinesis.KinesisJsonHandler;
 import io.github.hectorvent.floci.services.kinesisanalytics.KinesisAnalyticsV2JsonHandler;
 import io.github.hectorvent.floci.services.kms.KmsJsonHandler;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerJsonHandler;
+import io.github.hectorvent.floci.services.organizations.OrganizationsJsonHandler;
+import io.github.hectorvent.floci.services.networkfirewall.NetworkFirewallJsonHandler;
+import io.github.hectorvent.floci.services.servicecatalog.ServiceCatalogJsonHandler;
+import io.github.hectorvent.floci.services.servicequotas.ServiceQuotasJsonHandler;
 import io.github.hectorvent.floci.services.ssm.Ec2MessagesJsonHandler;
 import io.github.hectorvent.floci.services.ssm.SsmJsonHandler;
 import jakarta.inject.Inject;
@@ -102,9 +107,14 @@ public class AwsJson11Controller {
     private final ConfigServiceJsonHandler configServiceJsonHandler;
     private final CloudTrailJsonHandler cloudTrailJsonHandler;
     private final LightsailJsonHandler lightsailJsonHandler;
+    private final NetworkFirewallJsonHandler networkFirewallJsonHandler;
+    private final ServiceCatalogJsonHandler serviceCatalogJsonHandler;
     private final CloudControlJsonHandler cloudControlJsonHandler;
     private final ApplicationAutoScalingJsonHandler applicationAutoScalingJsonHandler;
     private final CloudHsmV2JsonHandler cloudHsmV2JsonHandler;
+    private final OrganizationsJsonHandler organizationsJsonHandler;
+    private final SsoAdminJsonHandler ssoAdminJsonHandler;
+    private final ServiceQuotasJsonHandler serviceQuotasJsonHandler;
 
     @Inject
     public AwsJson11Controller(ObjectMapper objectMapper, ResolvedServiceCatalog catalog,
@@ -139,9 +149,14 @@ public class AwsJson11Controller {
                                ConfigServiceJsonHandler configServiceJsonHandler,
                                CloudTrailJsonHandler cloudTrailJsonHandler,
                                LightsailJsonHandler lightsailJsonHandler,
+                               NetworkFirewallJsonHandler networkFirewallJsonHandler,
+                               ServiceCatalogJsonHandler serviceCatalogJsonHandler,
                                CloudControlJsonHandler cloudControlJsonHandler,
                                ApplicationAutoScalingJsonHandler applicationAutoScalingJsonHandler,
-                               CloudHsmV2JsonHandler cloudHsmV2JsonHandler){
+                               CloudHsmV2JsonHandler cloudHsmV2JsonHandler,
+                               OrganizationsJsonHandler organizationsJsonHandler,
+                               SsoAdminJsonHandler ssoAdminJsonHandler,
+                               ServiceQuotasJsonHandler serviceQuotasJsonHandler) {
         this.objectMapper = objectMapper;
         this.strictBodyReader = objectMapper.reader().with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
         this.catalog = catalog;
@@ -180,9 +195,14 @@ public class AwsJson11Controller {
         this.configServiceJsonHandler = configServiceJsonHandler;
         this.cloudTrailJsonHandler = cloudTrailJsonHandler;
         this.lightsailJsonHandler = lightsailJsonHandler;
+        this.networkFirewallJsonHandler = networkFirewallJsonHandler;
+        this.serviceCatalogJsonHandler = serviceCatalogJsonHandler;
         this.cloudControlJsonHandler = cloudControlJsonHandler;
         this.applicationAutoScalingJsonHandler = applicationAutoScalingJsonHandler;
         this.cloudHsmV2JsonHandler = cloudHsmV2JsonHandler;
+        this.organizationsJsonHandler = organizationsJsonHandler;
+        this.ssoAdminJsonHandler = ssoAdminJsonHandler;
+        this.serviceQuotasJsonHandler = serviceQuotasJsonHandler;
     }
 
     @POST
@@ -253,8 +273,19 @@ public class AwsJson11Controller {
                 case "cloudtrail" -> cloudTrailJsonHandler.handle(action, request, region);
                 case "application-autoscaling" -> applicationAutoScalingJsonHandler.handle(action, request, region);
                 case "lightsail" -> lightsailJsonHandler.handle(action, request, region);
+                case "network-firewall" -> networkFirewallJsonHandler.handle(
+                        action, request, region, regionResolver.getAccountId());
+                case "servicecatalog" -> serviceCatalogJsonHandler.handle(
+                        action, request, region, regionResolver.getAccountId());
                 case "cloudcontrol" -> cloudControlJsonHandler.handle(action, request, region);
                 case "cloudhsmv2" -> cloudHsmV2JsonHandler.handle(action, request, region);
+                // Organizations is global and account-scoped rather than region-scoped: every
+                // action is authorized against the calling account, so pass that instead of region.
+                case "organizations" ->
+                        organizationsJsonHandler.handle(action, request, regionResolver.getAccountId());
+                case "sso" -> ssoAdminJsonHandler.handle(action, request, regionResolver.getAccountId());
+                case "servicequotas" -> serviceQuotasJsonHandler.handle(
+                        action, request, region, regionResolver.getAccountId());
                 default -> null;
             };
             // catalog.matchTarget is protocol-agnostic: a JSON 1.0 target

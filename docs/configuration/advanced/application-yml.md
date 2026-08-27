@@ -155,6 +155,15 @@ floci:
       enforcement-enabled: false        # Set to true to enforce IAM policies on all requests
       seed-deployer-principal: false    # Set to true to create a local floci-deployer admin principal
 
+    networkfirewall:
+      enabled: true
+
+    servicequotas:
+      enabled: true
+
+    ram:
+      enabled: true
+
     elasticache:
       enabled: true
       proxy-base-port: 6379
@@ -231,6 +240,9 @@ floci:
       # docker network is inherited from floci.services.docker-network
 
     ec2:
+      enabled: true
+
+    efs:
       enabled: true
 
     ecs:
