@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.core.common;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.appconfig.AppConfigController;
 import io.github.hectorvent.floci.services.backup.BackupController;
+import io.github.hectorvent.floci.services.resourceexplorer2.ResourceExplorer2Controller;
 import io.github.hectorvent.floci.services.appconfig.AppConfigDataController;
 import io.github.hectorvent.floci.services.batch.BatchController;
 import io.github.hectorvent.floci.services.bedrockruntime.BedrockRuntimeController;
@@ -30,9 +31,12 @@ import io.github.hectorvent.floci.services.ses.SesController;
 import io.github.hectorvent.floci.services.appsync.AppSyncController;
 import io.github.hectorvent.floci.services.rdsdata.RdsDataController;
 import io.github.hectorvent.floci.services.guardduty.GuardDutyController;
+import io.github.hectorvent.floci.services.aps.ApsController;
+import io.github.hectorvent.floci.services.controltower.ControlTowerController;
 import io.github.hectorvent.floci.services.rum.RumController;
 import io.github.hectorvent.floci.services.s3vectors.S3VectorsController;
 import io.github.hectorvent.floci.services.s3tables.S3TablesController;
+import io.github.hectorvent.floci.services.efs.EfsController;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
@@ -152,6 +156,11 @@ public class ResolvedServiceCatalog {
                         5000L, AwsNamespaces.RDS, ServiceProtocol.QUERY,
                         protocols(ServiceProtocol.QUERY),
                         Set.of(), Set.of("docdb"), Set.of(), Set.of()),
+                descriptor("redshift", "redshift", config.services().redshift().enabled(), true,
+                        "redshift", storageMode(config.storage().services().redshift().mode(), config.storage().mode()),
+                        5000L, AwsNamespaces.REDSHIFT, ServiceProtocol.QUERY,
+                        protocols(ServiceProtocol.QUERY),
+                        Set.of(), Set.of("redshift"), Set.of(), Set.of()),
                 
                 descriptor("events", "eventbridge", config.services().eventbridge().enabled(), true,
                         "eventbridge", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
@@ -331,6 +340,14 @@ public class ResolvedServiceCatalog {
                         "elbv2", config.storage().mode(), 5000L, AwsNamespaces.ELB_V2, ServiceProtocol.QUERY,
                         protocols(ServiceProtocol.QUERY),
                         Set.of(), Set.of("elasticloadbalancing"), Set.of(), Set.of()),
+                // Classic (v1) ELB shares the elasticloadbalancing endpoint and credential scope
+                // with ELBv2 above, so it claims neither here; AwsQueryController splits the two on
+                // the request's Version parameter. Listed so the service and its config knob are
+                // visible in status.
+                descriptor("elb", "elb", config.services().elb().enabled(), true,
+                        "elb", config.storage().mode(), 5000L, AwsNamespaces.ELB_CLASSIC, ServiceProtocol.QUERY,
+                        protocols(ServiceProtocol.QUERY),
+                        Set.of(), Set.of(), Set.of(), Set.of()),
                 descriptor("codebuild", "codebuild", config.services().codebuild().enabled(), true,
                         "codebuild", storageMode(config.storage().services().codebuild().mode(), config.storage().mode()),
                         config.storage().services().codebuild().flushIntervalMs(), null, ServiceProtocol.JSON,
@@ -352,6 +369,15 @@ public class ResolvedServiceCatalog {
                         config.storage().services().codepipeline().flushIntervalMs(), null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
                         Set.of("CodePipeline_20150709."), Set.of("codepipeline"), Set.of(), Set.of()),
+                descriptor("servicequotas", "servicequotas", config.services().servicequotas().enabled(), true,
+                        null, null, 5000L, null, ServiceProtocol.JSON,
+                        protocols(ServiceProtocol.JSON),
+                        Set.of("ServiceQuotasV20190624."), Set.of("servicequotas"), Set.of(), Set.of()),
+                descriptor("ram", "ram", config.services().ram().enabled(), true,
+                        null, null, 5000L, null, ServiceProtocol.REST_JSON,
+                        protocols(ServiceProtocol.REST_JSON),
+                        Set.of(), Set.of("ram"), Set.of(),
+                        Set.of(io.github.hectorvent.floci.services.ram.RamController.class)),
                 descriptor("config", "configservice", config.services().configservice().enabled(), true,
                         "config", storageMode(config.storage().services().config().mode(), config.storage().mode()),
                         config.storage().services().config().flushIntervalMs(), null, ServiceProtocol.JSON,
@@ -373,6 +399,13 @@ public class ResolvedServiceCatalog {
                         null, null, 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
                         Set.of("CloudApiService."), Set.of("cloudcontrolapi"), Set.of(), Set.of()),
+                // SSO Admin (IAM Identity Center) signs with scope "sso"; its Smithy target
+                // prefix is the AWS-internal codename SWBExternalService (cf. config's
+                // StarlingDoveService above).
+                descriptor("sso", "ssoadmin", config.services().ssoadmin().enabled(), true,
+                        null, null, 5000L, null, ServiceProtocol.JSON,
+                        protocols(ServiceProtocol.JSON),
+                        Set.of("SWBExternalService."), Set.of("sso"), Set.of(), Set.of()),
                 descriptor("autoscaling", "autoscaling", config.services().autoscaling().enabled(), true,
                         "autoscaling", config.storage().mode(), 5000L, AwsNamespaces.AUTOSCALING, ServiceProtocol.QUERY,
                         protocols(ServiceProtocol.QUERY),
@@ -396,6 +429,15 @@ public class ResolvedServiceCatalog {
                         config.storage().services().backup().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
                         Set.of(), Set.of("backup"), Set.of(), Set.of(BackupController.class)),
+                descriptor("resource-explorer-2", "resourceexplorer2",
+                        config.services().resourceexplorer2().enabled(), true,
+                        "resourceexplorer2",
+                        storageMode(config.storage().services().resourceexplorer2().mode(), config.storage().mode()),
+                        config.storage().services().resourceexplorer2().flushIntervalMs(),
+                        null, ServiceProtocol.REST_JSON,
+                        protocols(ServiceProtocol.REST_JSON),
+                        Set.of(), Set.of("resource-explorer-2"), Set.of(),
+                        Set.of(ResourceExplorer2Controller.class)),
                 descriptor("fis", "fis", config.services().fis().enabled(), true,
                         "fis", storageMode(config.storage().services().fis().mode(), config.storage().mode()),
                         config.storage().services().fis().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
@@ -417,6 +459,14 @@ public class ResolvedServiceCatalog {
                         null, null, 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
                         Set.of("Textract."), Set.of("textract"), Set.of(), Set.of()),
+                descriptor("comprehend", "comprehend", config.services().comprehend().enabled(), true,
+                        null, null, 5000L, null, ServiceProtocol.JSON,
+                        protocols(ServiceProtocol.JSON),
+                        Set.of("Comprehend_20171127."), Set.of("comprehend"), Set.of(), Set.of()),
+                descriptor("rekognition", "rekognition", config.services().rekognition().enabled(), true,
+                        null, null, 5000L, null, ServiceProtocol.JSON,
+                        protocols(ServiceProtocol.JSON),
+                        Set.of("RekognitionService."), Set.of("rekognition"), Set.of(), Set.of()),
                 descriptor("pricing", "pricing", config.services().pricing().enabled(), true,
                         null, null, 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
@@ -426,6 +476,10 @@ public class ResolvedServiceCatalog {
                         config.storage().services().transcribe().flushIntervalMs(), null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
                         Set.of("Transcribe."), Set.of("transcribe"), Set.of(), Set.of()),
+                descriptor("translate", "translate", config.services().translate().enabled(), true,
+                        null, null, 5000L, null, ServiceProtocol.JSON,
+                        protocols(ServiceProtocol.JSON),
+                        Set.of("AWSShineFrontendService_20170701."), Set.of("translate"), Set.of(), Set.of()),
                 descriptor("ce", "ce", config.services().ce().enabled(), true,
                         null, null, 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
@@ -476,6 +530,10 @@ public class ResolvedServiceCatalog {
                         "cloudhsmv2", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
                         Set.of("BaldrApiService."), Set.of("cloudhsm"), Set.of(), Set.of()),
+                descriptor("organizations", "organizations", config.services().organizations().enabled(), true,
+                        "organizations", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
+                        protocols(ServiceProtocol.JSON),
+                        Set.of("AWSOrganizationsV20161128."), Set.of("organizations"), Set.of(), Set.of()),
                 descriptor("rum", "rum", config.services().rum().enabled(), true,
                         "rum", storageMode(config.storage().services().rum().mode(), config.storage().mode()),
                         config.storage().services().rum().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
@@ -486,7 +544,52 @@ public class ResolvedServiceCatalog {
                         storageMode(config.storage().services().guardduty().mode(), config.storage().mode()),
                         config.storage().services().guardduty().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
-                        Set.of(), Set.of("guardduty"), Set.of(), Set.of(GuardDutyController.class))
+                        Set.of(), Set.of("guardduty"), Set.of(), Set.of(GuardDutyController.class)),
+                descriptor("route53resolver", "route53resolver", config.services().route53resolver().enabled(), true,
+                        "route53resolver", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
+                        protocols(ServiceProtocol.JSON),
+                        Set.of("Route53Resolver."), Set.of("route53resolver"), Set.of(), Set.of()),
+                descriptor("connect", "connect", config.services().connect().enabled(), true,
+                        "connect", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
+                        protocols(ServiceProtocol.REST_JSON),
+                        Set.of(), Set.of("connect"), Set.of(),
+                        Set.of(io.github.hectorvent.floci.services.connect.ConnectController.class)),
+                descriptor("network-firewall", "networkfirewall", config.services().networkfirewall().enabled(), true,
+                        "networkfirewall", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
+                        protocols(ServiceProtocol.JSON),
+                        Set.of("NetworkFirewall_20201112."), Set.of("network-firewall"), Set.of(), Set.of()),
+                descriptor("servicecatalog", "servicecatalog", config.services().servicecatalog().enabled(), true,
+                        "servicecatalog", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
+                        protocols(ServiceProtocol.JSON),
+                        Set.of("AWS242ServiceCatalogService."), Set.of("servicecatalog"), Set.of(), Set.of()),
+                descriptor("controltower", "controltower", config.services().controltower().enabled(), true,
+                        "controltower", storageMode(config.storage().services().controltower().mode(), config.storage().mode()),
+                        config.storage().services().controltower().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
+                        protocols(ServiceProtocol.REST_JSON),
+                        Set.of(), Set.of("controltower"), Set.of(), Set.of(ControlTowerController.class)),
+                descriptor("aps", "aps", config.services().aps().enabled(), true,
+                        "aps", storageMode(config.storage().services().aps().mode(), config.storage().mode()),
+                        config.storage().services().aps().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
+                        protocols(ServiceProtocol.REST_JSON),
+                        Set.of(), Set.of("aps"), Set.of(), Set.of(ApsController.class)),
+                descriptor("lakeformation", "lakeformation", config.services().lakeformation().enabled(), true,
+                        "lakeformation",
+                        storageMode(config.storage().services().lakeformation().mode(), config.storage().mode()),
+                        config.storage().services().lakeformation().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
+                        protocols(ServiceProtocol.REST_JSON),
+                        Set.of(), Set.of("lakeformation"), Set.of(), Set.of(io.github.hectorvent.floci.services.lakeformation.LakeFormationController.class)),
+                descriptor("efs", "efs", config.services().efs().enabled(), true,
+                        "efs",
+                        storageMode(config.storage().services().efs().mode(), config.storage().mode()),
+                        config.storage().services().efs().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
+                        protocols(ServiceProtocol.REST_JSON),
+                        Set.of(), Set.of("elasticfilesystem"), Set.of(), Set.of(EfsController.class)),
+                descriptor("codeguru-reviewer", "codegurureviewer",
+                        config.services().codegurureviewer().enabled(), true,
+                        "codegurureviewer", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
+                        protocols(ServiceProtocol.REST_JSON),
+                        Set.of(), Set.of("codeguru-reviewer"), Set.of(),
+                        Set.of(io.github.hectorvent.floci.services.codegurureviewer.CodeGuruReviewerController.class))
         ));
     }
 

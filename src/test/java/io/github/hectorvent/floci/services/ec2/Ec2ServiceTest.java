@@ -6,16 +6,20 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager;
+import io.github.hectorvent.floci.services.ec2.model.Address;
 import io.github.hectorvent.floci.services.ec2.model.BlockDeviceMapping;
 import io.github.hectorvent.floci.services.ec2.model.EbsBlockDevice;
 import io.github.hectorvent.floci.services.ec2.model.GroupIdentifier;
 import io.github.hectorvent.floci.services.ec2.model.Image;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
+import io.github.hectorvent.floci.services.ec2.model.NetworkInterfaceListResult;
 import io.github.hectorvent.floci.services.ec2.model.IpPermission;
 import io.github.hectorvent.floci.services.ec2.model.Ipv6Range;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroupRule;
 import io.github.hectorvent.floci.services.ec2.model.UserIdGroupPair;
+import io.github.hectorvent.floci.services.ec2.model.InstanceState;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
+import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
 import io.github.hectorvent.floci.services.ec2.model.ManagedPrefixList;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroupRule;
 import io.github.hectorvent.floci.services.ec2.model.PrefixListId;
@@ -39,9 +43,9 @@ import io.github.hectorvent.floci.services.ec2.model.Vpc;
 import io.github.hectorvent.floci.services.ec2.model.VpcEndpoint;
 import io.github.hectorvent.floci.services.ec2.model.Volume;
 import io.github.hectorvent.floci.services.ec2.model.VolumeAttachment;
-import io.github.hectorvent.floci.services.ec2.model.InstanceState;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -78,6 +82,132 @@ class Ec2ServiceTest {
         service.terminateInstances("us-east-1", List.of(instanceId));
         assertFalse(service.isInstanceContainerRunning(instanceId));
         verifyNoInteractions(containerManager);
+    }
+
+    @Test
+    void describeNetworkInterfacesGroupIdFilterSkipsNullGroupEntry() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory());
+        Reservation reservation = service.runInstances("us-east-1", "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(), null, null);
+        Instance inst = reservation.getInstances().getFirst();
+        String groupId = inst.getNetworkInterfaces().getFirst().getGroups().getFirst().getGroupId();
+        // A null entry in an interface's group list must not crash the group-id filter: the interface
+        // is still matched on its real group and the null is skipped. Regression: matchesFilter
+        // dereferenced the entry with no null-guard, so DescribeNetworkInterfaces returned a 500 that
+        // hung a Terraform/Pulumi security-group delete (it polls this call until the group is gone).
+        inst.getNetworkInterfaces().getFirst().getGroups().add(null);
+
+        NetworkInterfaceListResult result = service.describeNetworkInterfaces("us-east-1", List.of(),
+                Map.of("group-id", List.of(groupId)), 0, null);
+
+        assertEquals(1, result.networkInterfaces().size());
+    }
+
+    @Test
+    void awaitContainerLaunchReportsTerminatedContainer() {
+        Ec2Service service = new Ec2Service(mockConfig(false), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        Instance instance = new Instance();
+        instance.setInstanceId("i-terminated");
+        instance.setState(InstanceState.terminated());
+
+        AwsException error = assertThrows(AwsException.class, () -> service.awaitContainerLaunch(instance));
+
+        assertEquals("InternalError", error.getErrorCode());
+        assertTrue(error.getMessage().contains("container terminated during launch"));
+    }
+
+    @Test
+    void awaitContainerLaunchTimesOutWhileInstanceIsPending() {
+        Ec2ContainerManager containerManager = mock(Ec2ContainerManager.class);
+        Ec2Service service = new Ec2Service(mockConfig(false), containerManager,
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        Instance instance = new Instance();
+        instance.setInstanceId("i-pending");
+        instance.setState(InstanceState.pending());
+        when(containerManager.cancelLaunch(instance)).thenReturn(true);
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.awaitContainerLaunch(instance, Duration.ZERO));
+
+        assertEquals("InternalError", error.getErrorCode());
+        assertTrue(error.getMessage().contains("did not reach running state before the launch timeout"));
+        verify(containerManager).cancelLaunch(instance);
+    }
+
+    /**
+     * A container-backed launch that fails or is cancelled terminates the instance inside the
+     * container manager, never passing through TerminateInstances, so an ENI the launch had
+     * already marked in-use would stay pinned to an instance that no longer runs, and could
+     * never be reused. The attachment is reconciled when the interface is next read instead.
+     */
+    @Test
+    void anInterfaceIsReleasedWhenItsInstanceDiedWithoutTerminateInstances() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        String subnetId = service.describeSubnets("us-east-1", List.of(), Map.of())
+                .getFirst().getSubnetId();
+        NetworkInterface eni = service.createNetworkInterface("us-east-1", subnetId, null,
+                null, List.of(), List.of(), List.of());
+
+        Reservation reservation = service.runInstances("us-east-1", "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(), null, null, null,
+                eni.getNetworkInterfaceId(), 0);
+        Instance instance = reservation.getInstances().getFirst();
+        assertEquals("in-use", service.describeNetworkInterfaces("us-east-1",
+                List.of(eni.getNetworkInterfaceId()), Map.of(), 0, null)
+                .networkInterfaces().getFirst().getStatus());
+
+        // What a failed launch leaves behind: terminated, with no TerminateInstances call.
+        instance.setState(InstanceState.terminated());
+
+        NetworkInterface afterFailure = service.describeNetworkInterfaces("us-east-1",
+                List.of(eni.getNetworkInterfaceId()), Map.of(), 0, null)
+                .networkInterfaces().getFirst();
+        assertEquals("available", afterFailure.getStatus());
+        assertNull(afterFailure.getAttachment());
+        // The dead instance lets go of its copy too. Leaving it there would have the terminated
+        // instance still reporting an interface that a later launch is free to take, so two
+        // instance records would claim it.
+        assertTrue(instance.getNetworkInterfaces().stream()
+                .noneMatch(e -> eni.getNetworkInterfaceId().equals(e.getNetworkInterfaceId())));
+
+        // And it really is free: a second launch can take it, which the in-use check would refuse.
+        Reservation retry = service.runInstances("us-east-1", "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(), null, null, null,
+                eni.getNetworkInterfaceId(), 0);
+        assertEquals(1, retry.getInstances().size());
+    }
+
+    /**
+     * A NetworkInterface can carry a real GroupIdentifier entry whose groupId is null (a name-only
+     * association). The group-id filter must skip that entry instead of NPE-ing on
+     * {@code null.matches(...)} in the shared value matcher, while a real group on the same interface
+     * still matches. The null entry is evaluated first so the filter actually exercises the null path.
+     */
+    @Test
+    void describeNetworkInterfacesGroupIdFilterToleratesNullGroupId() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        String subnetId = service.describeSubnets("us-east-1", List.of(), Map.of())
+                .getFirst().getSubnetId();
+        NetworkInterface eni = service.createNetworkInterface("us-east-1", subnetId, null,
+                null, List.of(), List.of(), List.of());
+        eni.getGroups().add(new GroupIdentifier(null, "name-only"));
+        eni.getGroups().add(new GroupIdentifier("sg-realgroup000000", "real"));
+
+        List<NetworkInterface> matched = service.describeNetworkInterfaces("us-east-1", List.of(),
+                Map.of("group-id", List.of("sg-realgroup000000")), 0, null).networkInterfaces();
+
+        assertTrue(matched.stream()
+                .anyMatch(n -> eni.getNetworkInterfaceId().equals(n.getNetworkInterfaceId())));
     }
 
     @Test
@@ -186,28 +316,92 @@ class Ec2ServiceTest {
                 mock(Ec2PortForwardManager.class),
                 mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
                 new InMemoryStorageFactory());
-        LaunchTemplate template = service.createLaunchTemplate("us-east-1", "app-template",
-                "ami-source", "t3.micro", "app-key", List.of("sg-source"),
-                "source-user-data", "c291cmNlLXVzZXItZGF0YQ==",
-                "arn:aws:iam::000000000000:instance-profile/app-profile",
-                List.of(), List.of(new Tag("Role", "source")));
+        LaunchTemplateData source = new LaunchTemplateData();
+        source.setImageId("ami-source");
+        source.setInstanceType("t3.micro");
+        source.setKeyName("app-key");
+        source.setSecurityGroupIds(List.of("sg-source"));
+        source.setUserData("source-user-data");
+        source.setEncodedUserData("c291cmNlLXVzZXItZGF0YQ==");
+        source.setIamInstanceProfile(new LaunchTemplateData.IamInstanceProfile(
+                "arn:aws:iam::000000000000:instance-profile/app-profile", null));
+        source.setTagSpecifications(List.of(
+                new LaunchTemplateData.TagSpecification("instance", List.of(new Tag("Role", "source")))));
+        LaunchTemplate template = service.createLaunchTemplate("us-east-1", "app-template", source, List.of());
 
-        service.createLaunchTemplateVersion("us-east-1", template.getLaunchTemplateId(), null,
-                "1", null, "t3.small", null, List.of(), null, null, null, List.of());
+        LaunchTemplateData override = new LaunchTemplateData();
+        override.setInstanceType("t3.small");
+        service.createLaunchTemplateVersion("us-east-1", template.getLaunchTemplateId(), null, "1", override);
 
         LaunchTemplate version = service.describeLaunchTemplateVersions(
                 "us-east-1", template.getLaunchTemplateId(), null, List.of("2")).getFirst();
-        assertEquals("ami-source", version.getImageId());
-        assertEquals("t3.small", version.getInstanceType());
-        assertEquals("app-key", version.getKeyName());
-        assertEquals(List.of("sg-source"), version.getSecurityGroupIds());
-        assertEquals("source-user-data", version.getUserData());
-        assertEquals("c291cmNlLXVzZXItZGF0YQ==", version.getEncodedUserData());
-        assertEquals("arn:aws:iam::000000000000:instance-profile/app-profile", version.getIamInstanceProfileArn());
+        LaunchTemplateData data = version.getData();
+        assertEquals("ami-source", data.getImageId());
+        assertEquals("t3.small", data.getInstanceType());
+        assertEquals("app-key", data.getKeyName());
+        assertEquals(List.of("sg-source"), data.getSecurityGroupIds());
+        assertEquals("source-user-data", data.getUserData());
+        assertEquals("c291cmNlLXVzZXItZGF0YQ==", data.getEncodedUserData());
+        assertEquals("arn:aws:iam::000000000000:instance-profile/app-profile",
+                data.getIamInstanceProfile().getArn());
         assertEquals("2", version.getLatestVersionNumber());
-        assertEquals(1, version.getInstanceTags().size());
-        assertEquals("Role", version.getInstanceTags().getFirst().getKey());
-        assertEquals("source", version.getInstanceTags().getFirst().getValue());
+        assertEquals(1, data.getInstanceTags().size());
+        assertEquals("Role", data.getInstanceTags().getFirst().getKey());
+        assertEquals("source", data.getInstanceTags().getFirst().getValue());
+    }
+
+    @Test
+    void launchTemplateVersionWithoutSourceVersionDoesNotInheritFromLatest() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory());
+        LaunchTemplateData source = new LaunchTemplateData();
+        source.setImageId("ami-source");
+        source.setInstanceType("t3.micro");
+        source.setKeyName("app-key");
+        source.setSecurityGroupIds(List.of("sg-source"));
+        LaunchTemplate template = service.createLaunchTemplate("us-east-1", "no-source-template", source, List.of());
+
+        LaunchTemplateData override = new LaunchTemplateData();
+        override.setInstanceType("t3.small");
+        // No SourceVersion at all — AWS documents this as "no source specified, no inheritance",
+        // not as an implicit fallback onto the latest version.
+        service.createLaunchTemplateVersion("us-east-1", template.getLaunchTemplateId(), null, null, override);
+
+        LaunchTemplate version = service.describeLaunchTemplateVersions(
+                "us-east-1", template.getLaunchTemplateId(), null, List.of("2")).getFirst();
+        LaunchTemplateData data = version.getData();
+        assertEquals("t3.small", data.getInstanceType());
+        assertNull(data.getImageId(), "omitted SourceVersion must not inherit ImageId from version 1");
+        assertNull(data.getKeyName(), "omitted SourceVersion must not inherit KeyName from version 1");
+        assertEquals(List.of(), data.getSecurityGroupIds(),
+                "omitted SourceVersion must not inherit SecurityGroupIds from version 1");
+    }
+
+    @Test
+    void launchTemplateVersionDescriptionRoundTrips() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory());
+        LaunchTemplateData source = new LaunchTemplateData();
+        source.setImageId("ami-source");
+        LaunchTemplate template = service.createLaunchTemplate(
+                "us-east-1", "described-template", source, List.of(), "initial version");
+
+        LaunchTemplateData override = new LaunchTemplateData();
+        override.setInstanceType("t3.small");
+        LaunchTemplate created = service.createLaunchTemplateVersion(
+                "us-east-1", template.getLaunchTemplateId(), null, "1", override, "second version");
+        assertEquals("second version", created.getVersionDescription());
+
+        LaunchTemplate v1 = service.describeLaunchTemplateVersions(
+                "us-east-1", template.getLaunchTemplateId(), null, List.of("1")).getFirst();
+        LaunchTemplate v2 = service.describeLaunchTemplateVersions(
+                "us-east-1", template.getLaunchTemplateId(), null, List.of("2")).getFirst();
+        assertEquals("initial version", v1.getVersionDescription());
+        assertEquals("second version", v2.getVersionDescription());
     }
 
     @Test
@@ -354,10 +548,10 @@ class Ec2ServiceTest {
                 Map.of("vpc-id", List.of(Ec2Service.defaultVpcId("us-east-1")))).getFirst().getSubnetId();
         VpcEndpoint endpoint = service.createVpcEndpoint("us-east-1", Ec2Service.defaultVpcId("us-east-1"),
                 "com.amazonaws.us-east-1.s3", "Interface",
-                List.of(), List.of(subnetId), List.of(), null, List.of());
+                List.of(), List.of(subnetId), List.of(), null, null, List.of());
         service.createVpcEndpoint("us-east-1", Ec2Service.defaultVpcId("us-east-1"),
                 "com.amazonaws.us-east-1.dynamodb", "Gateway",
-                List.of(), List.of(), List.of(), null, List.of());
+                List.of(), List.of(), List.of(), null, null, List.of());
 
         List<NetworkInterface> enis = service.endpointNetworkInterfaces("us-east-1");
 
@@ -2695,6 +2889,112 @@ class Ec2ServiceTest {
 
     private static List<String> cidrsOf(List<TransitGatewayRoute> routes) {
         return routes.stream().map(TransitGatewayRoute::getDestinationCidrBlock).sorted().toList();
+    }
+
+
+    // ─── Elastic IP reachability ──────────────────────────────────────────────
+
+    /**
+     * An allocated EIP's 54.x.x.x address is invented and routes nowhere. Terraform surfaces it
+     * as aws_eip.x.public_ip and Terratest dials it, so association must re-point it at the
+     * address the instance can actually be reached on.
+     */
+    @Test
+    void associateAddressRepointsTheEipAtAReachableAddress() {
+        Ec2ContainerManager containerManager = mock(Ec2ContainerManager.class);
+        when(containerManager.reachablePublicAddress(argThat(i -> i != null))).thenReturn("192.168.215.9");
+        Ec2Service service = eipService(containerManager);
+        String instanceId = launchOne(service);
+
+        Address allocated = service.allocateAddress("us-east-1");
+        String inventedIp = allocated.getPublicIp();
+        Address associated = service.associateAddress("us-east-1", allocated.getAllocationId(), instanceId);
+
+        assertEquals("192.168.215.9", associated.getPublicIp());
+        assertNotEquals(inventedIp, associated.getPublicIp());
+        assertEquals("192.168.215.9",
+                service.describeInstances("us-east-1", List.of(instanceId), Map.of())
+                        .getFirst().getInstances().getFirst().getPublicIpAddress());
+    }
+
+    /**
+     * DescribeAddresses is where Terraform refreshes public_ip, and Docker hands out a new
+     * bridge IP after a stop/start, so the association has to be re-resolved on read.
+     */
+    @Test
+    void describeAddressesReResolvesAnAssociatedEipAfterTheContainerIpChanges() {
+        Ec2ContainerManager containerManager = mock(Ec2ContainerManager.class);
+        when(containerManager.reachablePublicAddress(argThat(i -> i != null))).thenReturn("192.168.215.9");
+        Ec2Service service = eipService(containerManager);
+        String instanceId = launchOne(service);
+        Address allocated = service.allocateAddress("us-east-1");
+        service.associateAddress("us-east-1", allocated.getAllocationId(), instanceId);
+
+        when(containerManager.reachablePublicAddress(argThat(i -> i != null))).thenReturn("192.168.215.42");
+
+        Address refreshed = service.describeAddresses("us-east-1", List.of(allocated.getAllocationId()), Map.of())
+                .getFirst();
+        assertEquals("192.168.215.42", refreshed.getPublicIp());
+    }
+
+    /**
+     * The re-resolution must run BEFORE the filter pass: a public-ip filter is judged against
+     * the address the response will carry, not the one persisted before the restart. A
+     * regression back to filter-before-refresh makes the current IP miss and the stale IP hit.
+     */
+    @Test
+    void describeAddressesFiltersOnTheRefreshedAssociationState() {
+        Ec2ContainerManager containerManager = mock(Ec2ContainerManager.class);
+        when(containerManager.reachablePublicAddress(argThat(i -> i != null))).thenReturn("192.168.215.9");
+        Ec2Service service = eipService(containerManager);
+        String instanceId = launchOne(service);
+        Address allocated = service.allocateAddress("us-east-1");
+        service.associateAddress("us-east-1", allocated.getAllocationId(), instanceId);
+
+        // The container restarts and Docker hands the instance a different bridge IP.
+        when(containerManager.reachablePublicAddress(argThat(i -> i != null))).thenReturn("192.168.215.42");
+
+        List<Address> byCurrentIp = service.describeAddresses("us-east-1", List.of(),
+                Map.of("public-ip", List.of("192.168.215.42")));
+        assertEquals(1, byCurrentIp.size());
+        assertEquals(allocated.getAllocationId(), byCurrentIp.getFirst().getAllocationId());
+        assertEquals("192.168.215.42", byCurrentIp.getFirst().getPublicIp());
+
+        assertTrue(service.describeAddresses("us-east-1", List.of(),
+                Map.of("public-ip", List.of("192.168.215.9"))).isEmpty());
+    }
+
+    /** With no instance behind it there is nothing reachable left, so the allocation is restored. */
+    @Test
+    void disassociateAddressRestoresTheAllocatedAddress() {
+        Ec2ContainerManager containerManager = mock(Ec2ContainerManager.class);
+        when(containerManager.reachablePublicAddress(argThat(i -> i != null))).thenReturn("192.168.215.9");
+        Ec2Service service = eipService(containerManager);
+        String instanceId = launchOne(service);
+        Address allocated = service.allocateAddress("us-east-1");
+        String inventedIp = allocated.getPublicIp();
+        Address associated = service.associateAddress("us-east-1", allocated.getAllocationId(), instanceId);
+
+        service.disassociateAddress("us-east-1", associated.getAssociationId());
+
+        Address after = service.describeAddresses("us-east-1", List.of(allocated.getAllocationId()), Map.of())
+                .getFirst();
+        assertEquals(inventedIp, after.getPublicIp());
+        assertNull(after.getInstanceId());
+        assertNull(after.getAssociationId());
+    }
+
+    private static Ec2Service eipService(Ec2ContainerManager containerManager) {
+        return new Ec2Service(mockConfig(true), containerManager,
+                mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory());
+    }
+
+    private static String launchOne(Ec2Service service) {
+        return service.runInstances("us-east-1", "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(), null, null)
+                .getInstances().getFirst().getInstanceId();
     }
 
     private static EmulatorConfig mockConfig(boolean ec2Mock) {

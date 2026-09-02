@@ -33,6 +33,7 @@ Floci Lambda runs your function code locally inside real Docker containers - clo
 | `GetPolicy` | Get the function resource policy |
 | `RemovePermission` | Remove a resource-policy statement |
 | `GetFunctionCodeSigningConfig` | Return code-signing config (always empty) |
+| `ListFunctionsByCodeSigningConfig` | Validates the ARN; no code-signing config can exist, so every well-formed ARN returns `ResourceNotFoundException` |
 | `CreateFunctionUrlConfig` | Provision a function URL |
 | `GetFunctionUrlConfig` | Read function URL config |
 | `UpdateFunctionUrlConfig` | Update function URL config |
@@ -43,6 +44,7 @@ Floci Lambda runs your function code locally inside real Docker containers - clo
 | `PutFunctionConcurrency` | Set reserved concurrent executions |
 | `GetFunctionConcurrency` | Get reserved concurrent executions |
 | `DeleteFunctionConcurrency` | Clear reserved concurrent executions |
+| `GetAccountSettings` | Account limits plus usage derived from the caller's stored functions |
 
 ## Hot-Reloading via Reactive S3 Sync
 
@@ -164,9 +166,32 @@ services:
 
 Function URLs are also reachable directly on `/{proxy:.*}` under the Lambda URL controller, which routes the request into the normal `Invoke` path.
 
-**Layers:** `PublishLayerVersion`, `GetLayerVersion`, `ListLayerVersions`, `ListLayers`, and
-`DeleteLayerVersion` are implemented, with real local storage under
-`{lambda.codePath}/layers/{name}/{version}`. `CreateFunction`/`UpdateFunctionConfiguration`
+**Versions:** `CreateFunction` and `UpdateFunctionCode` honour `Publish`, publishing a version
+and reporting it in the response's `Version`. The two differ in the ARN they return, matching the
+live service: `CreateFunction` keeps the unqualified `FunctionArn` while `UpdateFunctionCode`
+returns the qualified one (`...:function:name:2`), as `PublishVersion` does. Without `Publish`
+both answer for `$LATEST` and create nothing. `UpdateFunctionConfiguration` has no `Publish`
+parameter in the AWS API and none here.
+
+`DeleteFunction` honours `Qualifier` — it removes that published version only, leaving `$LATEST`,
+the other versions and the function's aliases in place; without a qualifier the whole function
+goes. Matching the live service, deleting `$LATEST` by qualifier and naming an alias are both
+rejected with `InvalidParameterValueException`, a version an alias points at is a
+`ResourceConflictException`, and a version that does not exist is a silent success rather than
+a 404.
+
+**Layers:** `PublishLayerVersion`, `GetLayerVersion`, `GetLayerVersionByArn`, `ListLayerVersions`,
+`ListLayers`, and `DeleteLayerVersion` are implemented, with real local storage under
+`{lambda.codePath}/layers/{name}/{version}`. `ListLayers` and `ListLayerVersions` honour
+`CompatibleRuntime`, `CompatibleArchitecture`, `MaxItems` (1-50, defaulting to 50) and `Marker`,
+and always emit `NextMarker`, null on the last page. Under a filter, `LatestMatchingVersion` is
+the newest version that matches rather than the newest overall, and a layer with no matching
+version is omitted; a version published without `CompatibleArchitectures` matches neither
+architecture. `Marker` is opaque and signed with a key generated at startup, so a fabricated,
+edited or previous-run token is rejected with `InvalidParameterValueException` rather than
+applied as a cursor. One divergence: a parameter sent with an empty value
+(`?CompatibleRuntime=`) is treated as absent rather than rejected, because RESTEasy binds an
+empty query value as null. `CreateFunction`/`UpdateFunctionConfiguration`
 validate each `Layers` ARN eagerly against that storage, matching real AWS - an unresolvable ARN
 is rejected with `InvalidParameterValueException`, not silently accepted. Only resolves layers
 published into this same local Floci instance; a real AWS-owned layer ARN (e.g. the AWS AppConfig
@@ -178,12 +203,11 @@ a name you control and reference that ARN instead.
 
 These AWS Lambda operations have no handler in Floci. Calls will return `404` or an error:
 
-- Layer permissions and cross-account ARN lookup (`GetLayerVersionByArn`, `AddLayerVersionPermission`, `RemoveLayerVersionPermission`, `GetLayerVersionPolicy`)
+- Layer permissions (`AddLayerVersionPermission`, `RemoveLayerVersionPermission`, `GetLayerVersionPolicy`)
 - Provisioned concurrency (`PutProvisionedConcurrencyConfig`, `GetProvisionedConcurrencyConfig`, `ListProvisionedConcurrencyConfigs`, `DeleteProvisionedConcurrencyConfig`)
 - Dead-letter, async invoke config, and event invoke config operations
 - `InvokeWithResponseStream`
-- Code signing management (only `GetFunctionCodeSigningConfig` is wired; there is no `PutFunctionCodeSigningConfig` or `CreateCodeSigningConfig`)
-- Account and regional settings (`GetAccountSettings`)
+- Code signing management (only `GetFunctionCodeSigningConfig` and `ListFunctionsByCodeSigningConfig` are wired; there is no `PutFunctionCodeSigningConfig` or `CreateCodeSigningConfig`, so no code-signing config can exist and `ListFunctionsByCodeSigningConfig` reports every well-formed ARN as `ResourceNotFoundException` — a malformed ARN or an out-of-range `MaxItems` is rejected with `InvalidParameterValueException` first)
 
 ## Configuration
 
@@ -193,8 +217,8 @@ These AWS Lambda operations have no handler in Floci. Calls will return `404` or
 | `FLOCI_SERVICES_LAMBDA_EPHEMERAL` | `false` | Remove containers after each invocation |
 | `FLOCI_SERVICES_LAMBDA_DEFAULT_MEMORY_MB` | `128` | Default function memory (MB) |
 | `FLOCI_SERVICES_LAMBDA_DEFAULT_TIMEOUT_SECONDS` | `3` | Default function timeout (seconds) |
-| `FLOCI_SERVICES_LAMBDA_RUNTIME_API_BASE_PORT` | `9200` | First port in the Lambda Runtime API range |
-| `FLOCI_SERVICES_LAMBDA_RUNTIME_API_MAX_PORT` | `9299` | Last port in the Lambda Runtime API range |
+| `FLOCI_SERVICES_LAMBDA_RUNTIME_API_BASE_PORT` | `12000` | First port in the Lambda Runtime API range |
+| `FLOCI_SERVICES_LAMBDA_RUNTIME_API_MAX_PORT` | `12499` | Last port in the Lambda Runtime API range. One port is held per running container, so the range width caps concurrent executions |
 | `FLOCI_SERVICES_LAMBDA_CODE_PATH` | `./data/lambda-code` | Directory where Lambda ZIP files are stored |
 | `FLOCI_SERVICES_LAMBDA_POLL_INTERVAL_MS` | `1000` | Event-source mapping poll interval (milliseconds) |
 | `FLOCI_SERVICES_LAMBDA_CONTAINER_IDLE_TIMEOUT_SECONDS` | `300` | Idle container shutdown timeout (seconds) |
@@ -206,6 +230,7 @@ These AWS Lambda operations have no handler in Floci. Calls will return `404` or
 | `FLOCI_SERVICES_LAMBDA_EXTRA_HOSTS` | *(unset)* | Comma-separated `hostname:ip` entries added to each Lambda container's `/etc/hosts`; `ip` may be `host-gateway`, mirroring `docker run --add-host` |
 | `FLOCI_SERVICES_LAMBDA_DOCKER_HOST_OVERRIDE` | *(unset)* | Explicit host/IP that spawned Lambda containers use to reach Floci's Runtime API, bypassing auto-detection |
 | `FLOCI_SERVICES_LAMBDA_CONTAINER_NAME_PREFIX` | `floci` | Base name prefix for spawned Lambda containers and code volumes (e.g. `acme` → `acme-<function>-<id>` containers, `acme-code-<function>-<hash>` volumes). Must be a valid Docker name segment (`[A-Za-z0-9][A-Za-z0-9_.-]*`); invalid values are ignored with a warning |
+| `FLOCI_SERVICES_LAMBDA_CODE_VOLUME_POPULATE_CONCURRENCY` | `max(2, cpus/2)` | Maximum concurrent first-time code-volume populates. See the note below |
 | `FLOCI_SERVICES_LAMBDA_EXECUTOR` | `docker` | Execution backend: `docker` (containers) or `kubernetes` (pods) |
 | `FLOCI_SERVICES_LAMBDA_KUBERNETES_NAMESPACE` | `default` | Namespace Lambda pods are created in |
 | `FLOCI_SERVICES_LAMBDA_KUBERNETES_LABELS` | *(unset)* | Extra pod labels as comma-separated `key=value` entries |
@@ -225,6 +250,25 @@ These AWS Lambda operations have no handler in Floci. Calls will return `404` or
     docker volume prune --filter label=floci=true
     ```
 
+!!! note "Concurrent cold starts of large functions"
+    A function whose unpacked code is at least 32 MB has that code streamed once into a
+    read-only Docker volume, so later cold starts mount it instead of copying. Those
+    first-time *populates* are capped — a burst of them overwhelms the Docker daemon — and
+    the default cap is `max(2, cpus/2)`, derived from the CPU count the JVM sees.
+
+    Because the JVM honours the container's cgroup CPU quota, running Floci with a small CPU
+    allocation collapses the cap to 2, and a burst of cold starts across *distinct* large
+    functions completes in waves of two rather than in parallel. Six such functions invoked
+    at once take roughly three times the wall-clock of one. Raise the cap to decouple it from
+    the CPU allocation:
+
+    ```bash
+    FLOCI_SERVICES_LAMBDA_CODE_VOLUME_POPULATE_CONCURRENCY=8
+    ```
+
+    Only first-time populates are gated. Warm containers, already-populated volumes, and
+    functions under 32 MB are never serialised by this.
+
 ### Runtime API host override
 
 When a Lambda container starts, it calls back into Floci's Runtime API to fetch
@@ -235,7 +279,7 @@ correct and needs no configuration.
 
 On unusual network topologies, for example rootless Podman, auto-detection
 can pick an address the Lambda container cannot reach, and invocations fail with
-`connect ECONNREFUSED <ip>:9200`. Set `FLOCI_SERVICES_LAMBDA_DOCKER_HOST_OVERRIDE`
+`connect ECONNREFUSED <ip>:12000`. Set `FLOCI_SERVICES_LAMBDA_DOCKER_HOST_OVERRIDE`
 to the host or IP that containers can actually reach Floci on, and Floci uses it
 verbatim instead of auto-detecting:
 
@@ -438,6 +482,10 @@ on its container IP. All Lambda containers launched by Floci are configured to
 use it as their DNS resolver. The embedded DNS server:
 
 - Resolves `*.localhost.floci.io` → Floci's Docker network IP
+- With `FLOCI_DNS_SPOOF_AWS_ENDPOINTS=true`, also resolves `amazonaws.com` and
+  every subdomain to Floci's IP, so clients built with explicit real-AWS
+  endpoints land on the emulator — see
+  [Transparent endpoints](../configuration/environment-variables.md#transparent-endpoints)
 - Forwards all other queries to the upstream resolver(s) from `/etc/resolv.conf`,
   falling back to public resolvers so **public hostnames** (e.g.
   `business-api.tiktok.com`) resolve from inside Lambda containers
@@ -445,6 +493,44 @@ use it as their DNS resolver. The embedded DNS server:
 No extra configuration or `cap_add` is needed because Docker containers have
 `CAP_NET_BIND_SERVICE` in their default capability set, so Floci (running as a
 non-root user) can bind UDP/53 without any changes to your Compose file.
+
+### VpcConfig, SnapStart and LoggingConfig
+
+All three round-trip through `CreateFunction`, `UpdateFunctionConfiguration`,
+`GetFunctionConfiguration`, `GetFunction`, `ListFunctions` and `PublishVersion`.
+
+The response shapes are **not** the request shapes, and Floci follows the AWS model
+rather than echoing the request back:
+
+| Field | Request shape | Response shape | Extra members Floci fills in |
+|---|---|---|---|
+| `VpcConfig` | `VpcConfig` | `VpcConfigResponse` | `VpcId`, resolved from the first subnet via EC2 |
+| `SnapStart` | `SnapStart` | `SnapStartResponse` | `OptimizationStatus` — `On` only for a published version with `ApplyOn=PublishedVersions`, `Off` for `$LATEST` |
+| `LoggingConfig` | `LoggingConfig` | `LoggingConfig` | — |
+
+`SnapStart` and `LoggingConfig` are always present in a response, as on AWS: an
+unset function reads back `SnapStart={ApplyOn: None, OptimizationStatus: Off}` and
+`LoggingConfig={LogFormat: Text, LogGroup: /aws/lambda/<name>}`. With
+`LogFormat=JSON`, `ApplicationLogLevel` and `SystemLogLevel` are also returned,
+defaulting to `INFO`. Terraform treats these as `Computed` blocks, so a missing one
+is a permanent diff rather than a cosmetic omission.
+
+`LoggingConfig` is replaced wholesale on update, not merged — an update naming only
+`LogFormat` resets `LogGroup` to the default.
+
+`LogGroup` is validated against AWS's documented constraint: 1-512 characters matching
+`[.\-_/#A-Za-z0-9]+`. `ApplicationLogLevel` and `SystemLogLevel` are accepted with any
+`LogFormat` but are only ever stored — and therefore only ever returned — when the
+resolved format is `JSON`; supplying them with `LogFormat=Text` is not an error, it is
+simply a no-op, matching the fact that the response never surfaces them for Text.
+
+`VpcConfig` is omitted entirely while the function is not attached to a VPC.
+Subnets that EC2 does not know about are still accepted and returned; only `VpcId`
+is left off in that case.
+
+`RuntimeVersionConfig.RuntimeVersionArn` is returned for managed (non-image)
+runtimes. Its value is derived from the runtime name, so it is stable across
+restarts.
 
 ### File system configs
 

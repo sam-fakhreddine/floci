@@ -223,6 +223,68 @@ class LambdaServiceTest {
     }
 
     @Test
+    void updateFunctionConfigurationRejectsMalformedRoleArn() {
+        service.createFunction(REGION, baseRequest("update-role-function"));
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.updateFunctionConfiguration(REGION, "update-role-function",
+                        Map.of("Role", "not-an-arn")));
+
+        assertEquals("InvalidParameterValueException", error.getErrorCode());
+        assertEquals("arn:aws:iam::000000000000:role/test-role",
+                service.getFunction(REGION, "update-role-function").getRole());
+    }
+
+    @Test
+    void updateFunctionConfigurationAcceptsValidRoleArn() {
+        service.createFunction(REGION, baseRequest("update-role-valid-function"));
+
+        LambdaFunction updated = service.updateFunctionConfiguration(REGION, "update-role-valid-function",
+                Map.of("Role", "arn:aws:iam::000000000000:role/new-role"));
+
+        assertEquals("arn:aws:iam::000000000000:role/new-role", updated.getRole());
+    }
+
+    @Test
+    void updateFunctionConfigurationRejectsHandlerWithWhitespace() {
+        service.createFunction(REGION, baseRequest("update-handler-function"));
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.updateFunctionConfiguration(REGION, "update-handler-function",
+                        Map.of("Handler", "index handler")));
+
+        assertEquals("InvalidParameterValueException", error.getErrorCode());
+        assertEquals("index.handler",
+                service.getFunction(REGION, "update-handler-function").getHandler());
+    }
+
+    @Test
+    void updateFunctionConfigurationRejectsHandlerLongerThan128Chars() {
+        service.createFunction(REGION, baseRequest("update-handler-length-function"));
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.updateFunctionConfiguration(REGION, "update-handler-length-function",
+                        Map.of("Handler", "h".repeat(129))));
+
+        assertEquals("InvalidParameterValueException", error.getErrorCode());
+    }
+
+    @Test
+    void updateFunctionConfigurationRejectsExplicitNullHandler() {
+        service.createFunction(REGION, baseRequest("update-handler-null-function"));
+        Map<String, Object> request = new java.util.HashMap<>();
+        request.put("Handler", null);
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.updateFunctionConfiguration(REGION, "update-handler-null-function", request));
+
+        assertEquals("InvalidParameterValueException", error.getErrorCode());
+        assertEquals("index.handler",
+                service.getFunction(REGION, "update-handler-null-function").getHandler(),
+                "an explicit null must not silently clear the handler");
+    }
+
+    @Test
     void createFunctionFailsWhenMissingFunctionName() {
         Map<String, Object> req = baseRequest("x");
         req.remove("FunctionName");
@@ -515,6 +577,28 @@ class LambdaServiceTest {
         // Updating with no-op (no zip or image uri) still bumps revision
         LambdaFunction updated = service.updateFunctionCode(REGION, "update-fn", Map.of());
         assertNotEquals(originalRevision, updated.getRevisionId());
+    }
+
+    @Test
+    void updateFunctionCodeAppliesArchitectures() {
+        Map<String, Object> req = baseRequest("arch-fn");
+        req.put("Architectures", List.of("arm64"));
+        service.createFunction(REGION, req);
+
+        LambdaFunction updated = service.updateFunctionCode(REGION, "arch-fn",
+                Map.of("Architectures", List.of("x86_64")));
+        assertEquals(List.of("x86_64"), updated.getArchitectures());
+        assertEquals(List.of("x86_64"), service.getFunction(REGION, "arch-fn").getArchitectures());
+    }
+
+    @Test
+    void updateFunctionCodeWithoutArchitecturesKeepsExisting() {
+        Map<String, Object> req = baseRequest("arch-keep-fn");
+        req.put("Architectures", List.of("arm64"));
+        service.createFunction(REGION, req);
+
+        LambdaFunction updated = service.updateFunctionCode(REGION, "arch-keep-fn", Map.of());
+        assertEquals(List.of("arm64"), updated.getArchitectures());
     }
 
     @Test
@@ -884,5 +968,230 @@ class LambdaServiceTest {
                 .collect(java.util.stream.Collectors.toSet());
 
         assertEquals(expectedStatementIds, actualStatementIds);
+    }
+
+    @Test
+    void publishVersionWaitsForAConcurrentHolderOfTheFunctionsConcurrencyLock() throws Exception {
+        // publishVersion reads codeLocalPath and persists a snapshot of it with no
+        // synchronization against extractZipCodeBytes's own reclaim-the-legacy-directory
+        // decision (which runs under this same per-function lock, e.g. from deleteFunction).
+        // Without publishVersion also taking that lock, a version could be published in the
+        // narrow window between that decision and the actual delete, persisting a snapshot
+        // that references a directory which is about to be removed as "unused". Proving
+        // publishVersion blocks on this lock closes that window regardless of the exact
+        // interleaving, rather than relying on timing to catch it in the act.
+        LambdaFunction fn = service.createFunction(REGION, baseRequest("lock-race-fn"));
+        Object lock = service.lockForConcurrencyOp(fn.getFunctionArn());
+
+        ExecutorService pool = Executors.newFixedThreadPool(1);
+        CountDownLatch acquired = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        Thread holder = new Thread(() -> {
+            synchronized (lock) {
+                acquired.countDown();
+                try {
+                    release.await();
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        });
+        try {
+            holder.start();
+            assertTrue(acquired.await(2, java.util.concurrent.TimeUnit.SECONDS));
+
+            Future<LambdaFunction> publishFuture = pool.submit(
+                    () -> service.publishVersion(REGION, "lock-race-fn", null));
+            assertThrows(java.util.concurrent.TimeoutException.class,
+                    () -> publishFuture.get(200, java.util.concurrent.TimeUnit.MILLISECONDS),
+                    "publishVersion must block while another operation holds this function's lock");
+
+            release.countDown();
+            holder.join();
+            assertNotNull(publishFuture.get(2, java.util.concurrent.TimeUnit.SECONDS));
+        } finally {
+            release.countDown();
+            pool.shutdownNow();
+        }
+    }
+
+    // ──────────────────────────── Request-shape validation ────────────────────────────
+
+    @Test
+    void createFunctionRejectsUnknownRuntime() {
+        Map<String, Object> request = baseRequest("bad-runtime-fn");
+        request.put("Runtime", "cobol99");
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.createFunction(REGION, request));
+        assertEquals("ValidationException", error.getErrorCode());
+    }
+
+    @Test
+    void updateFunctionConfigurationRejectsUnknownRuntime() {
+        service.createFunction(REGION, baseRequest("update-bad-runtime-fn"));
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.updateFunctionConfiguration(REGION, "update-bad-runtime-fn",
+                        Map.of("Runtime", "cobol99")));
+        assertEquals("ValidationException", error.getErrorCode());
+    }
+
+    @Test
+    void createFunctionRejectsMalformedRoleArn() {
+        Map<String, Object> request = baseRequest("bad-role-fn");
+        request.put("Role", "not-an-arn");
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.createFunction(REGION, request));
+        assertEquals("ValidationException", error.getErrorCode());
+    }
+
+    @Test
+    void createFunctionRejectsHandlerWithWhitespace() {
+        Map<String, Object> request = baseRequest("bad-handler-fn");
+        request.put("Handler", "index handler");
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.createFunction(REGION, request));
+        assertEquals("ValidationException", error.getErrorCode());
+    }
+
+    @Test
+    void createFunctionRejectsDescriptionOverMaxLength() {
+        Map<String, Object> request = baseRequest("bad-description-fn");
+        request.put("Description", "x".repeat(257));
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.createFunction(REGION, request));
+        assertEquals("ValidationException", error.getErrorCode());
+    }
+
+    @Test
+    void createFunctionRejectsMalformedKmsKeyArn() {
+        Map<String, Object> request = baseRequest("bad-kms-fn");
+        request.put("KMSKeyArn", "not-an-arn");
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.createFunction(REGION, request));
+        assertEquals("ValidationException", error.getErrorCode());
+    }
+
+    @Test
+    void createFunctionRejectsMalformedLayerArn() {
+        Map<String, Object> request = baseRequest("bad-layer-fn");
+        request.put("Layers", List.of("not-a-layer-arn"));
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.createFunction(REGION, request));
+        assertEquals("ValidationException", error.getErrorCode());
+    }
+
+    @Test
+    void createFunctionRejectsMoreThanFiveLayers() {
+        Map<String, Object> request = baseRequest("too-many-layers-fn");
+        List<String> layers = new java.util.ArrayList<>();
+        for (int i = 0; i < 6; i++) {
+            layers.add("arn:aws:lambda:us-east-1:000000000000:layer:l" + i + ":1");
+        }
+        request.put("Layers", layers);
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.createFunction(REGION, request));
+        assertEquals("ValidationException", error.getErrorCode());
+    }
+
+    @Test
+    void updateFunctionConfigurationRejectsMalformedLayerArn() {
+        service.createFunction(REGION, baseRequest("update-bad-layer-fn"));
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.updateFunctionConfiguration(REGION, "update-bad-layer-fn",
+                        Map.of("Layers", List.of("not-a-layer-arn"))));
+        assertEquals("ValidationException", error.getErrorCode());
+    }
+
+    @Test
+    void createFunctionRejectsUnknownArchitecture() {
+        Map<String, Object> request = baseRequest("bad-arch-fn");
+        request.put("Architectures", List.of("mips"));
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.createFunction(REGION, request));
+        assertEquals("ValidationException", error.getErrorCode());
+    }
+
+    @Test
+    void createFunctionRejectsMoreThanOneArchitecture() {
+        Map<String, Object> request = baseRequest("too-many-arch-fn");
+        request.put("Architectures", List.of("x86_64", "arm64"));
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.createFunction(REGION, request));
+        assertEquals("ValidationException", error.getErrorCode());
+    }
+
+    @Test
+    void updateFunctionCodeAppliesValidArchitecture() {
+        service.createFunction(REGION, baseRequest("update-code-arch-fn"));
+
+        LambdaFunction updated = service.updateFunctionCode(REGION, "update-code-arch-fn",
+                Map.of("Architectures", List.of("arm64")));
+
+        assertEquals(List.of("arm64"), updated.getArchitectures());
+    }
+
+    @Test
+    void updateFunctionCodeRejectsUnknownArchitecture() {
+        service.createFunction(REGION, baseRequest("update-code-bad-arch-fn"));
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.updateFunctionCode(REGION, "update-code-bad-arch-fn",
+                        Map.of("Architectures", List.of("mips"))));
+        assertEquals("ValidationException", error.getErrorCode());
+    }
+
+    @Test
+    void deleteAliasRejectsMalformedName() {
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.deleteAlias(REGION, "some-fn", "123"));
+        assertEquals("ValidationException", error.getErrorCode());
+    }
+
+    @Test
+    void createFunctionUrlConfigRejectsUnknownAuthType() {
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.createFunctionUrlConfig(REGION, "any-fn", null,
+                        Map.of("AuthType", "BOGUS")));
+        assertEquals("ValidationException", error.getErrorCode());
+    }
+
+    @Test
+    void createFunctionUrlConfigRejectsUnknownInvokeMode() {
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.createFunctionUrlConfig(REGION, "any-fn", null,
+                        Map.of("InvokeMode", "BOGUS")));
+        assertEquals("ValidationException", error.getErrorCode());
+    }
+
+    @Test
+    void createFunctionUrlConfigRejectsAllNumericQualifier() {
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.createFunctionUrlConfig(REGION, "any-fn", "123", Map.of()));
+        assertEquals("ValidationException", error.getErrorCode());
+    }
+
+    @Test
+    void listEventSourceMappingsRejectsMalformedFunctionName() {
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.listEventSourceMappings("not a valid name!"));
+        assertEquals("ValidationException", error.getErrorCode());
+    }
+
+    @Test
+    void listEventSourceMappingsRejectsMalformedEventSourceArn() {
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.listEventSourceMappings(null, "not-an-arn"));
+        assertEquals("ValidationException", error.getErrorCode());
     }
 }

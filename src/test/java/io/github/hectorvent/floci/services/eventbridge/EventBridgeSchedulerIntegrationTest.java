@@ -300,6 +300,8 @@ class EventBridgeSchedulerIntegrationTest {
             @Override
             public String ecrBaseUri() { return ""; }
             @Override
+            public Optional<String> aiMockConfigFile() { return Optional.empty(); }
+            @Override
             public StorageConfig storage() { return null; }
             @Override
             public DnsConfig dns() {
@@ -310,6 +312,8 @@ class EventBridgeSchedulerIntegrationTest {
                     public boolean containerFallbackEnabled() { return true; }
                     @Override
                     public List<String> containerFallbackServers() { return List.of("8.8.8.8", "8.8.4.4"); }
+                    @Override
+                    public boolean spoofAwsEndpoints() { return false; }
                 };
             }
             @Override

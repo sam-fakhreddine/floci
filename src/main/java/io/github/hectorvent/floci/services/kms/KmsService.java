@@ -1,9 +1,13 @@
 package io.github.hectorvent.floci.services.kms;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ReservedTags;
+import io.github.hectorvent.floci.core.resource.ExplorerResource;
+import io.github.hectorvent.floci.core.resource.ResourceProvider;
+import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.kms.model.KmsAlias;
@@ -26,10 +30,13 @@ import org.bouncycastle.asn1.x509.AlgorithmIdentifier;
 import org.bouncycastle.asn1.x509.DigestInfo;
 import org.bouncycastle.asn1.x509.SubjectPublicKeyInfo;
 import org.bouncycastle.crypto.params.ECDomainParameters;
+import org.bouncycastle.crypto.params.Ed25519PublicKeyParameters;
+import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters;
 import org.bouncycastle.crypto.params.ECPrivateKeyParameters;
 import org.bouncycastle.crypto.params.ECPublicKeyParameters;
 import org.bouncycastle.crypto.params.ParametersWithRandom;
 import org.bouncycastle.crypto.signers.ECDSASigner;
+import org.bouncycastle.crypto.signers.Ed25519phSigner;
 import org.bouncycastle.jcajce.provider.asymmetric.ec.BCECPrivateKey;
 import org.bouncycastle.jcajce.provider.asymmetric.ec.BCECPublicKey;
 import org.bouncycastle.jcajce.provider.asymmetric.ec.KeyFactorySpi;
@@ -47,6 +54,7 @@ import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.*;
+import java.security.interfaces.EdECPrivateKey;
 import java.security.spec.ECGenParameterSpec;
 import java.security.spec.PKCS8EncodedKeySpec;
 import java.security.spec.X509EncodedKeySpec;
@@ -58,7 +66,7 @@ import static io.github.hectorvent.floci.services.kms.model.KmsMessageType.DIGES
 import static io.github.hectorvent.floci.services.kms.model.KmsMessageType.RAW;
 
 @ApplicationScoped
-public class KmsService {
+public class KmsService implements ResourceProvider {
 
     private static final Logger LOG = Logger.getLogger(KmsService.class);
 
@@ -191,6 +199,11 @@ public class KmsService {
                     key.setPrivateKeyEncoded(Base64.getEncoder().encodeToString(pair.getPrivate().getEncoded()));
                     key.setPublicKeyEncoded(Base64.getEncoder().encodeToString(pair.getPublic().getEncoded()));
                 }
+                case ED25519 -> {
+                    var pair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+                    key.setPrivateKeyEncoded(Base64.getEncoder().encodeToString(pair.getPrivate().getEncoded()));
+                    key.setPublicKeyEncoded(Base64.getEncoder().encodeToString(pair.getPublic().getEncoded()));
+                }
                 case ECC -> {
                     String curveName = spec.curveName();
 
@@ -268,12 +281,79 @@ public class KmsService {
         return keyStore.scan(k -> k.startsWith(prefix));
     }
 
+    /** GrantOperation enum from the KMS model (kms/2014-11-01/service-2.json). */
+    private static final Set<String> GRANT_OPERATIONS = new LinkedHashSet<>(List.of(
+            "Decrypt", "Encrypt", "GenerateDataKey", "GenerateDataKeyWithoutPlaintext",
+            "ReEncryptFrom", "ReEncryptTo", "Sign", "Verify", "GetPublicKey", "CreateGrant",
+            "RetireGrant", "DescribeKey", "GenerateDataKeyPair", "GenerateDataKeyPairWithoutPlaintext",
+            "GenerateMac", "VerifyMac", "DeriveSharedSecret"));
+
+    /** GrantNameType pattern/length from the KMS model (kms/2014-11-01/service-2.json). */
+    private static final java.util.regex.Pattern GRANT_NAME_PATTERN =
+            java.util.regex.Pattern.compile("^[a-zA-Z0-9:/_-]+$");
+
+    /** GrantConstraintSourceArnType pattern from the KMS model (kms/2014-11-01/service-2.json). */
+    private static final java.util.regex.Pattern GRANT_CONSTRAINT_SOURCE_ARN_PATTERN =
+            java.util.regex.Pattern.compile("^arn:aws[a-z0-9-]*:[a-z0-9-]+:[a-z0-9-]*:[0-9]{12}:.+$");
+
+    private static final Set<String> GRANT_CONSTRAINT_MEMBERS =
+            Set.of("EncryptionContextSubset", "EncryptionContextEquals", "SourceArn");
+
+    /** Validates a CreateGrant Constraints map against the modeled GrantConstraints shape. */
+    private void validateGrantConstraints(Map<String, Object> constraints) {
+        if (constraints == null) {
+            return;
+        }
+        for (String member : constraints.keySet()) {
+            if (!GRANT_CONSTRAINT_MEMBERS.contains(member)) {
+                throw new AwsException("ValidationException",
+                        "1 validation error detected: Unknown parameter in 'constraints': \"" + member
+                                + "\", must be one of: " + String.join(", ", GRANT_CONSTRAINT_MEMBERS), 400);
+            }
+        }
+        for (String encryptionContextMember : List.of("EncryptionContextSubset", "EncryptionContextEquals")) {
+            Object value = constraints.get(encryptionContextMember);
+            if (value == null) {
+                continue;
+            }
+            if (!(value instanceof Map<?, ?> map)) {
+                throw new AwsException("ValidationException",
+                        "1 validation error detected: Value at 'constraints." + encryptionContextMember
+                                + "' failed to satisfy constraint: Member must be a map of string to string", 400);
+            }
+            for (Map.Entry<?, ?> entry : map.entrySet()) {
+                if (!(entry.getKey() instanceof String) || !(entry.getValue() instanceof String)) {
+                    throw new AwsException("ValidationException",
+                            "1 validation error detected: Value at 'constraints." + encryptionContextMember
+                                    + "' failed to satisfy constraint: Member must be a map of string to string", 400);
+                }
+            }
+        }
+        Object sourceArn = constraints.get("SourceArn");
+        if (sourceArn != null) {
+            if (!(sourceArn instanceof String sourceArnValue)
+                    || sourceArnValue.length() < 20 || sourceArnValue.length() > 512
+                    || !GRANT_CONSTRAINT_SOURCE_ARN_PATTERN.matcher(sourceArnValue).matches()) {
+                throw new AwsException("ValidationException",
+                        "1 validation error detected: Value at 'constraints.sourceArn' failed to satisfy "
+                                + "constraint: Member must satisfy regular expression pattern: "
+                                + "^arn:aws[a-z0-9-]*:[a-z0-9-]+:[a-z0-9-]*:[0-9]{12}:.+$", 400);
+            }
+        }
+    }
+
     public KmsGrant createGrant(String keyId, String granteePrincipal, List<String> operations, String region) {
-        return createGrant(keyId, granteePrincipal, operations, null, region);
+        return createGrant(keyId, granteePrincipal, operations, null, null, null, region);
     }
 
     public KmsGrant createGrant(String keyId, String granteePrincipal, List<String> operations,
                                 String retiringPrincipal, String region) {
+        return createGrant(keyId, granteePrincipal, operations, retiringPrincipal, null, null, region);
+    }
+
+    public KmsGrant createGrant(String keyId, String granteePrincipal, List<String> operations,
+                                String retiringPrincipal, String name, Map<String, Object> constraints,
+                                String region) {
         if (keyId == null || keyId.isBlank()) {
             throw new AwsException("ValidationException", "KeyId is required", 400);
         }
@@ -283,6 +363,33 @@ public class KmsService {
         if (operations == null || operations.isEmpty()) {
             throw new AwsException("ValidationException", "Operations is required", 400);
         }
+        for (String operation : operations) {
+            if (!GRANT_OPERATIONS.contains(operation)) {
+                throw new AwsException("ValidationException",
+                        "1 validation error detected: Value '" + operation + "' at 'operations' failed to satisfy "
+                                + "constraint: Member must satisfy enum value set: ["
+                                + String.join(", ", GRANT_OPERATIONS) + "]", 400);
+            }
+        }
+        if (name != null) {
+            if (name.isEmpty()) {
+                throw new AwsException("ValidationException",
+                        "1 validation error detected: Value '" + name + "' at 'name' failed to satisfy "
+                                + "constraint: Member must have length greater than or equal to 1", 400);
+            }
+            if (name.length() > 256) {
+                throw new AwsException("ValidationException",
+                        "1 validation error detected: Value '" + name + "' at 'name' failed to satisfy "
+                                + "constraint: Member must have length less than or equal to 256", 400);
+            }
+            if (!GRANT_NAME_PATTERN.matcher(name).matches()) {
+                throw new AwsException("ValidationException",
+                        "1 validation error detected: Value '" + name + "' at 'name' failed to satisfy "
+                                + "constraint: Member must satisfy regular expression pattern: "
+                                + "^[a-zA-Z0-9:/_-]+$", 400);
+            }
+        }
+        validateGrantConstraints(constraints);
 
         KmsKey key = resolveKey(keyId, region);
         String grantId = UUID.randomUUID().toString();
@@ -292,11 +399,13 @@ public class KmsService {
         KmsGrant grant = new KmsGrant();
         grant.setGrantId(grantId);
         grant.setGrantToken(Base64.getUrlEncoder().withoutPadding().encodeToString(tokenBytes));
+        grant.setName(name);
         grant.setKeyId(key.getKeyId());
         grant.setKeyArn(key.getArn());
         grant.setGranteePrincipal(granteePrincipal);
         grant.setRetiringPrincipal(retiringPrincipal);
         grant.setOperations(new ArrayList<>(operations));
+        grant.setConstraints(constraints == null ? null : new HashMap<>(constraints));
 
         grantStore.put(region + "::" + grantId, grant);
         LOG.infov("Created KMS grant: {0} for key {1} in {2}", grantId, key.getKeyId(), region);
@@ -461,6 +570,12 @@ public class KmsService {
         result.put("GranteePrincipal", grant.getGranteePrincipal());
         result.put("Operations", grant.getOperations());
         result.put("CreationDate", grant.getCreationDate());
+        if (grant.getName() != null) {
+            result.put("Name", grant.getName());
+        }
+        if (grant.getConstraints() != null) {
+            result.put("Constraints", grant.getConstraints());
+        }
         if (grant.getRetiringPrincipal() != null) {
             result.put("RetiringPrincipal", grant.getRetiringPrincipal());
         }
@@ -667,6 +782,7 @@ public class KmsService {
     // Legacy v1 (kms:<keyId>:<base64>) still accepted on Decrypt for persistent-store back-compat.
     private static final String BLOB_PREFIX_V2 = "kms:v2:";
     private static final String BLOB_PREFIX_V1 = "kms:";
+    private static final int SHA_512_DIGEST_BYTES = 64;
     private static final int NONCE_BYTES = 8;
     private static final int MIN_MAC_MESSAGE_BYTES = 1;
     private static final int MAX_MAC_MESSAGE_BYTES = 4096;
@@ -822,8 +938,16 @@ public class KmsService {
             throw new AwsException("UnsupportedOperationException", "Unsupported key spec for signing.", 400);
         }
 
+        var ed25519 = kmsKey.getKeySpec().getKeyType() == KmsKeySpec.KeyType.ED25519;
+        if (ed25519) {
+            validateEd25519Request(kmsKey.getKeySpec(), algorithm, messageType, message);
+        }
+
         try {
             PrivateKey privateKey = loadPrivateKey(kmsKey.getPrivateKeyEncoded(), kmsKey.getKeySpec());
+            if (ed25519) {
+                return signEd25519(privateKey, message, algorithm);
+            }
             String jcaAlgo = switch (messageType) {
                 // If message is already a digest, we need a "NONEwith..." algorithm
                 case DIGEST -> "NONEwith" + (kmsKey.getKeySpec().getKeyType() == KmsKeySpec.KeyType.RSA ? "RSA" : "ECDSA");
@@ -857,8 +981,16 @@ public class KmsService {
             return false;
         }
 
+        var ed25519 = kmsKey.getKeySpec().getKeyType() == KmsKeySpec.KeyType.ED25519;
+        if (ed25519) {
+            validateEd25519Request(kmsKey.getKeySpec(), algorithm, messageType, message);
+        }
+
         try {
             PublicKey publicKey = loadPublicKey(kmsKey.getPublicKeyEncoded(), kmsKey.getKeySpec());
+            if (ed25519) {
+                return verifyEd25519(publicKey, message, signature, algorithm);
+            }
             String jcaAlgo = KmsKeySpec.getSignVerifyAlgorithm(algorithm).getJavaName();
 
             if (DIGEST.equals(messageType)) {
@@ -1056,6 +1188,83 @@ public class KmsService {
         return KmsKeySpec.ECC_SECG_P256K1 == spec;
     }
 
+    /**
+     * Validates what an Ed25519 key accepts, matching the errors real KMS returns.
+     *
+     * <p>ED25519_SHA_512 only takes {@code MessageType=RAW} and ED25519_PH_SHA_512 only takes
+     * {@code MessageType=DIGEST}, whose value has to be exactly one SHA-512 digest. Real KMS
+     * rejects the other pairing and a wrong digest length with a ValidationException, and rejects
+     * any other signing algorithm with an InvalidKeyUsageException. Sign and Verify both enforce
+     * all three.
+     */
+    private static void validateEd25519Request(KmsKeySpec spec, String algorithm, KmsMessageType messageType,
+                                               byte[] message) {
+        var algo = KmsKeySpec.getSignVerifyAlgorithm(algorithm);
+        if (algo != KmsKeySpec.Algorithm.ED25519_SHA_512 && algo != KmsKeySpec.Algorithm.ED25519_PH_SHA_512) {
+            throw new AwsException("InvalidKeyUsageException",
+                    "Algorithm " + algorithm + " is incompatible with key spec " + spec.name() + ".", 400);
+        }
+        var required = algo == KmsKeySpec.Algorithm.ED25519_SHA_512 ? KmsMessageType.RAW : KmsMessageType.DIGEST;
+        if (messageType != required) {
+            throw new AwsException("ValidationException",
+                    "Message type " + messageType + " is incompatible with algorithm " + algorithm + ".", 400);
+        }
+        if (algo == KmsKeySpec.Algorithm.ED25519_PH_SHA_512 && message.length != SHA_512_DIGEST_BYTES) {
+            throw new AwsException("ValidationException",
+                    "Digest is invalid length for algorithm " + algorithm + ".", 400);
+        }
+    }
+
+    /**
+     * Signs with an Ed25519 key.
+     *
+     * <p>ED25519_SHA_512 is pure Ed25519 over the message. ED25519_PH_SHA_512 is RFC 8032
+     * Ed25519ph, and real KMS applies the SHA-512 pre-hash to the bytes the caller sends rather
+     * than treating them as an already computed digest. That is measurably different from
+     * MessageType=DIGEST on RSA and ECDSA keys, where the bytes are signed as they arrive.
+     *
+     * <p>The JDK has no Ed25519ph, so that branch uses BouncyCastle's lightweight signer,
+     * instantiated directly rather than resolved through a JCA provider, the same way the
+     * secp256k1 path does.
+     */
+    private static byte[] signEd25519(PrivateKey privateKey, byte[] message, String algorithm) throws Exception {
+        if (KmsKeySpec.Algorithm.ED25519_SHA_512.name().equals(algorithm)) {
+            var signature = Signature.getInstance("Ed25519");
+            signature.initSign(privateKey);
+            signature.update(message);
+            return signature.sign();
+        }
+        var signer = new Ed25519phSigner(new byte[0]);
+        signer.init(true, new Ed25519PrivateKeyParameters(ed25519Seed(privateKey), 0));
+        signer.update(message, 0, message.length);
+        return signer.generateSignature();
+    }
+
+    private static boolean verifyEd25519(PublicKey publicKey, byte[] message, byte[] signature, String algorithm)
+            throws Exception {
+        if (KmsKeySpec.Algorithm.ED25519_SHA_512.name().equals(algorithm)) {
+            var verifier = Signature.getInstance("Ed25519");
+            verifier.initVerify(publicKey);
+            verifier.update(message);
+            return verifier.verify(signature);
+        }
+        var verifier = new Ed25519phSigner(new byte[0]);
+        verifier.init(false, new Ed25519PublicKeyParameters(ed25519Point(publicKey), 0));
+        verifier.update(message, 0, message.length);
+        return verifier.verifySignature(signature);
+    }
+
+    private static byte[] ed25519Seed(PrivateKey privateKey) throws InvalidKeyException {
+        if (privateKey instanceof EdECPrivateKey edEC) {
+            return edEC.getBytes().orElseThrow(() -> new InvalidKeyException("Ed25519 private key is not extractable"));
+        }
+        throw new InvalidKeyException("Expected an Ed25519 private key but got " + privateKey.getAlgorithm());
+    }
+
+    private static byte[] ed25519Point(PublicKey publicKey) {
+        return SubjectPublicKeyInfo.getInstance(publicKey.getEncoded()).getPublicKeyData().getBytes();
+    }
+
     private static boolean isPKCS1v1_5(KmsKeySpec.Algorithm spec) {
         return spec == KmsKeySpec.Algorithm.RSASSA_PKCS1_V1_5_SHA_256
                 || spec == KmsKeySpec.Algorithm.RSASSA_PKCS1_V1_5_SHA_384
@@ -1120,7 +1329,11 @@ public class KmsService {
     }
 
     private static KeyFactory buildKeyFactory(KmsKeySpec spec) throws Exception {
-        return KeyFactory.getInstance(spec.getKeyType() == KmsKeySpec.KeyType.RSA ? "RSA" : "EC");
+        return KeyFactory.getInstance(switch (spec.getKeyType()) {
+            case RSA -> "RSA";
+            case ED25519 -> "Ed25519";
+            default -> "EC";
+        });
     }
 
     private KmsKey resolveKey(String keyIdOrArn, String region) {
@@ -1165,4 +1378,26 @@ public class KmsService {
         }
     }
 
+    @Override
+    public List<ExplorerResource> getResources() {
+        List<ExplorerResource> resources = new ArrayList<>();
+        for (KmsKey key : keyStore.scan(k -> true)) {
+            String arn = key.getArn();
+            if (arn == null) {
+                continue;
+            }
+            AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
+            resources.add(new ExplorerResource(
+                    arn, "kms:key", "kms",
+                    parsed.region(), parsed.accountId(),
+                    key.getCreationDate() > 0 ? Instant.ofEpochSecond(key.getCreationDate()) : Instant.now(),
+                    key.getTags() != null ? key.getTags() : Map.of()));
+        }
+        return resources;
+    }
+
+    @Override
+    public Set<SupportedResourceType> getSupportedResourceTypes() {
+        return Set.of(new SupportedResourceType("kms:key", "kms", true));
+    }
 }

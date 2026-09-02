@@ -121,6 +121,18 @@ Floci's embedded DNS server always resolves the following wildcard suffixes to F
 | Variable | Default | Description |
 |---|---|---|
 | `FLOCI_DNS_EXTRA_SUFFIXES` | _(none)_ | Comma-separated list of additional hostname suffixes to resolve to Floci's container IP. Use this for custom domains beyond the built-in ones above (e.g. a private internal suffix). |
+| `FLOCI_DNS_SPOOF_AWS_ENDPOINTS` | `false` | Resolve `amazonaws.com` and every subdomain to Floci's container IP inside spawned containers (transparent endpoint injection). See below. |
+
+### Transparent endpoints
+
+Some tools construct SDK clients with explicit real-AWS endpoints (e.g. `https://sts.us-east-1.amazonaws.com`), which override `AWS_ENDPOINT_URL` — those calls escape the emulator and fail against real AWS. With `FLOCI_DNS_SPOOF_AWS_ENDPOINTS=true`, the embedded DNS server answers A queries for `amazonaws.com` and every subdomain at any depth (`sts.amazonaws.com`, `organizations.us-east-1.amazonaws.com`, virtual-hosted S3 like `my-bucket.s3.us-east-1.amazonaws.com`) with Floci's container IP, matching LocalStack's transparent endpoint injection. All other queries keep the normal forward/fallback behavior.
+
+Combine it with `FLOCI_TLS_ENABLED=true` so hardcoded `https://` endpoints work end to end:
+
+- the TLS proxy already serves HTTPS on port 443, where those clients connect;
+- the generated self-signed certificate additionally covers `*.amazonaws.com` and `*.<default-region>.amazonaws.com` (flipping the flag regenerates the certificate);
+- CodeBuild containers get Floci's certificate staged in and a combined CA bundle — Floci's certificate plus the files referenced by any pre-existing `NODE_EXTRA_CA_CERTS`/`AWS_CA_BUNDLE` — exported through those same variables before any buildspec phase runs, so images that ship their own egress CAs keep working;
+- the `AWS_ENDPOINT_URL` injected into CodeBuild containers switches to `https://` (same host and port), because clients like the CDK toolkit pass a shared `https.Agent` into their SDK options and Node rejects `http:` URLs on an `https.Agent`.
 
 ---
 
@@ -174,6 +186,7 @@ See [Initialization Hooks](./initialization-hooks.md) for lifecycle phases and s
 |---|---|---|
 | `FLOCI_SERVICES_S3_ENABLED` | `true` | Enable the S3 service |
 | `FLOCI_SERVICES_S3_DEFAULT_PRESIGN_EXPIRY_SECONDS` | `3600` | Default pre-signed URL expiry when none is specified |
+| `FLOCI_SERVICES_S3_GLOBAL_BUCKET_NAMESPACE` | `false` | When `true`, bucket/object resolution spans every account's partition so a bucket created in one account is visible cross-account (a single global namespace), matching real S3's global bucket names. Off by default keeps buckets isolated per account |
 
 ### DynamoDB
 
@@ -189,13 +202,14 @@ See [Initialization Hooks](./initialization-hooks.md) for lifecycle phases and s
 | `FLOCI_SERVICES_LAMBDA_EPHEMERAL` | `false` | Remove Lambda containers immediately after each invocation |
 | `FLOCI_SERVICES_LAMBDA_DEFAULT_MEMORY_MB` | `128` | Default memory allocation for functions that don't specify one |
 | `FLOCI_SERVICES_LAMBDA_DEFAULT_TIMEOUT_SECONDS` | `3` | Default invocation timeout in seconds |
-| `FLOCI_SERVICES_LAMBDA_RUNTIME_API_BASE_PORT` | `9200` | First port in the Lambda Runtime API port range |
-| `FLOCI_SERVICES_LAMBDA_RUNTIME_API_MAX_PORT` | `9299` | Last port in the Lambda Runtime API port range |
+| `FLOCI_SERVICES_LAMBDA_RUNTIME_API_BASE_PORT` | `12000` | First port in the Lambda Runtime API port range |
+| `FLOCI_SERVICES_LAMBDA_RUNTIME_API_MAX_PORT` | `12499` | Last port in the Lambda Runtime API port range. One port is held per running Lambda container, so the range width is the concurrent-execution ceiling |
 | `FLOCI_SERVICES_LAMBDA_CODE_PATH` | `./data/lambda-code` | Container path where Lambda deployment ZIPs are stored |
 | `FLOCI_SERVICES_LAMBDA_POLL_INTERVAL_MS` | `1000` | How often (ms) the SQS and Kinesis event source pollers check for new messages |
 | `FLOCI_SERVICES_LAMBDA_CONTAINER_IDLE_TIMEOUT_SECONDS` | `300` | Seconds of inactivity before an idle Lambda container is removed |
 | `FLOCI_SERVICES_LAMBDA_REGION_CONCURRENCY_LIMIT` | `1000` | Maximum concurrent Lambda invocations across all functions in a region |
 | `FLOCI_SERVICES_LAMBDA_UNRESERVED_CONCURRENCY_MIN` | `100` | Minimum unreserved concurrency pool |
+| `FLOCI_SERVICES_LAMBDA_CODE_VOLUME_POPULATE_CONCURRENCY` | `max(2, cpus/2)` | Maximum concurrent first-time code-volume populates (functions whose unpacked code is at least 32 MB). The default is derived from the CPU count the JVM sees, so a CPU-constrained Floci container collapses it to 2 and concurrent cold starts of distinct functions serialise into pairs; set this to decouple the cap from the CPU allocation |
 | `FLOCI_SERVICES_LAMBDA_HOT_RELOAD_ENABLED` | `false` | Watch Lambda code directories for changes and reload without redeployment |
 | `FLOCI_SERVICES_LAMBDA_HOT_RELOAD_ALLOWED_PATHS` | _(none)_ | Comma-separated host paths that hot-reload is allowed to watch |
 | `FLOCI_SERVICES_LAMBDA_DOCKER_NETWORK` | _(none)_ | Docker network for Lambda containers (overrides `FLOCI_SERVICES_DOCKER_NETWORK`) |
@@ -335,6 +349,7 @@ These services spawn Docker containers. They require access to the Docker socket
 | `FLOCI_SERVICES_ELASTICACHE_PROXY_MAX_PORT` | `6399` | Last port in the ElastiCache proxy range |
 | `FLOCI_SERVICES_ELASTICACHE_DEFAULT_IMAGE` | `valkey/valkey:8` | Default Docker image for cache clusters |
 | `FLOCI_SERVICES_ELASTICACHE_DOCKER_NETWORK` | _(none)_ | Docker network for ElastiCache containers (overrides `FLOCI_SERVICES_DOCKER_NETWORK`) |
+| `FLOCI_SERVICES_ELASTICACHE_CLUSTER_ANNOUNCE_HOSTNAME` | _(none)_ | Hostname cluster-mode nodes announce in `MOVED`/`ASK` redirects and topology responses, and report as the `ConfigurationEndpoint`. Set to a name every client resolves (e.g. `localhost.floci.io`) when `FLOCI_HOSTNAME` only resolves inside Floci's Docker network. Defaults to `FLOCI_HOSTNAME` |
 
 ### RDS
 
@@ -444,6 +459,10 @@ These services spawn Docker containers. They require access to the Docker socket
 | `FLOCI_SERVICES_GLUE_ENABLED` | `true` | Enable the Glue service |
 | `FLOCI_SERVICES_APPSYNC_ENABLED` | `true` | Enable the AppSync service |
 | `FLOCI_SERVICES_BEDROCK_RUNTIME_ENABLED` | `true` | Enable the Bedrock Runtime service |
+| `FLOCI_SERVICES_BEDROCK_AGENT_CORE_CONTROL_ENABLED` | `true` | Enable the Bedrock AgentCore control plane (agent runtimes, gateways, memory, workload identity) |
+| `FLOCI_SERVICES_BEDROCK_AGENT_CORE_ENABLED` | `true` | Enable the Bedrock AgentCore data plane (`InvokeAgentRuntime` stub) |
+| `FLOCI_SERVICES_BEDROCK_AGENT_CORE_INVOKE_RESPONSE` | `{"output":"yes"}` | Canned body returned by `InvokeAgentRuntime` |
+| `FLOCI_SERVICES_BEDROCK_AGENT_CORE_VALIDATE_RUNTIME_EXISTS` | `false` | When `true`, `InvokeAgentRuntime` rejects unknown runtime ARNs |
 | `FLOCI_SERVICES_TEXTRACT_ENABLED` | `true` | Enable the Textract service |
 | `FLOCI_SERVICES_TRANSFER_ENABLED` | `true` | Enable the Transfer Family service |
 | `FLOCI_SERVICES_ROUTE53_ENABLED` | `true` | Enable the Route 53 service |
@@ -452,9 +471,15 @@ These services spawn Docker containers. They require access to the Docker socket
 | `FLOCI_SERVICES_AUTOSCALING_ENABLED` | `true` | Enable the Auto Scaling service |
 | `FLOCI_SERVICES_CODEBUILD_ENABLED` | `true` | Enable the CodeBuild service |
 | `FLOCI_SERVICES_CODEBUILD_DOCKER_NETWORK` | _(none)_ | Docker network for CodeBuild build containers |
+| `FLOCI_SERVICES_CODEBUILD_CURATED_IMAGE_SUBSTITUTE` | _(newest public Amazon Linux standard for the host arch)_ | Image run in place of curated `aws/codebuild/*` names that AWS does not publish publicly (the Ubuntu `standard` family); Amazon Linux curated names map to their public.ecr.aws mirrors directly |
+| `FLOCI_SERVICES_CODEBUILD_MAX_CONCURRENT_BUILDS` | `4` | Maximum number of builds whose workspace may be staged on disk at once; caps the fan-out of a parallel stage on a constrained host. Unset means 4; a non-positive value means unbounded |
 | `FLOCI_SERVICES_CODEDEPLOY_ENABLED` | `true` | Enable the CodeDeploy service |
+| `FLOCI_SERVICES_NETWORKFIREWALL_ENABLED` | `true` | Enable the AWS Network Firewall service |
+| `FLOCI_SERVICES_SERVICEQUOTAS_ENABLED` | `true` | Enable the Service Quotas service |
+| `FLOCI_SERVICES_RAM_ENABLED` | `true` | Enable the AWS RAM service |
 | `FLOCI_SERVICES_BACKUP_ENABLED` | `true` | Enable the AWS Backup service |
 | `FLOCI_SERVICES_BACKUP_JOB_COMPLETION_DELAY_SECONDS` | `3` | Simulated delay before backup jobs transition to `COMPLETED` |
 | `FLOCI_SERVICES_FIS_ENABLED` | `true` | Enable the AWS Fault Injection Service management API |
+| `FLOCI_SERVICES_RESOURCEEXPLORER2_ENABLED` | `true` | Enable the Resource Explorer 2 service |
 | `FLOCI_SERVICES_APPCONFIG_ENABLED` | `true` | Enable the AppConfig service |
 | `FLOCI_SERVICES_APPCONFIGDATA_ENABLED` | `true` | Enable the AppConfig Data service |

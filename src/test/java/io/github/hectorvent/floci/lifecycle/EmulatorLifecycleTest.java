@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.lifecycle.InitLifecycleState;
 import io.github.hectorvent.floci.lifecycle.inithook.InitializationHook;
 import io.github.hectorvent.floci.lifecycle.inithook.InitializationHooksRunner;
+import io.github.hectorvent.floci.services.elasticache.ElastiCacheService;
 import io.github.hectorvent.floci.services.elasticache.container.ElastiCacheContainerManager;
 import io.github.hectorvent.floci.services.elasticache.container.ElastiCacheMemcachedContainerManager;
 import io.github.hectorvent.floci.services.elasticache.proxy.ElastiCacheProxyManager;
@@ -59,7 +60,10 @@ class EmulatorLifecycleTest {
     @Mock private EmulatorConfig.ServicesConfig servicesConfig;
     @Mock private EmulatorConfig.Ec2ServiceConfig ec2ServiceConfig;
     @Mock private EmulatorConfig.ElbV2ServiceConfig elbv2ServiceConfig;
+    @Mock private EmulatorConfig.ElbServiceConfig elbServiceConfig;
     @Mock private IamService iamService;
+    @Mock private EmulatorConfig.ElastiCacheServiceConfig elastiCacheServiceConfig;
+    @Mock private ElastiCacheService elastiCacheService;
     @Mock private ElastiCacheContainerManager elastiCacheContainerManager;
     @Mock private ElastiCacheMemcachedContainerManager elastiCacheMemcachedContainerManager;
     @Mock private ElastiCacheProxyManager elastiCacheProxyManager;
@@ -74,6 +78,7 @@ class EmulatorLifecycleTest {
     @Mock private io.github.hectorvent.floci.services.kinesisanalytics.container.FlinkContainerManager flinkContainerManager;
     @Mock private RdsService rdsService;
     @Mock private io.github.hectorvent.floci.services.elbv2.ElbV2Service elbV2Service;
+    @Mock private io.github.hectorvent.floci.services.elb.ElbClassicService elbClassicService;
     @Mock private InitializationHooksRunner initializationHooksRunner;
     @Mock private SqsEventSourcePoller sqsPoller;
     @Mock private KinesisEventSourcePoller kinesisPoller;
@@ -97,18 +102,22 @@ class EmulatorLifecycleTest {
         Mockito.lenient().when(ec2ServiceConfig.enabled()).thenReturn(false);
         Mockito.lenient().when(servicesConfig.elbv2()).thenReturn(elbv2ServiceConfig);
         Mockito.lenient().when(elbv2ServiceConfig.enabled()).thenReturn(false);
+        Mockito.lenient().when(servicesConfig.elasticache()).thenReturn(elastiCacheServiceConfig);
+        Mockito.lenient().when(elastiCacheServiceConfig.enabled()).thenReturn(false);
+        Mockito.lenient().when(servicesConfig.elb()).thenReturn(elbServiceConfig);
+        Mockito.lenient().when(elbServiceConfig.enabled()).thenReturn(false);
         Mockito.lenient().when(config.tls()).thenReturn(tlsConfig);
         Mockito.lenient().when(tlsConfig.enabled()).thenReturn(false);
         Mockito.lenient().when(config.port()).thenReturn(4566);
 
         emulatorLifecycle = new EmulatorLifecycle(
                 storageFactory, serviceRegistry, config,
-                iamService,
+                iamService, elastiCacheService,
                 elastiCacheContainerManager, elastiCacheMemcachedContainerManager,
                 elastiCacheProxyManager, rdsContainerManager, rdsProxyManager,
                 memoryDbContainerManager, memoryDbProxyManager,
                 docDbContainerManager, neptuneContainerManager, neptuneProxyManager,
-                rabbitMqManager, flinkContainerManager, rdsService, elbV2Service,
+                rabbitMqManager, flinkContainerManager, rdsService, elbV2Service, elbClassicService,
                 initializationHooksRunner, sqsPoller, kinesisPoller, dynamodbStreamsPoller,
                 pipesService, ec2MetadataServer, ecrRegistryManager, flociUiManager, initLifecycleState,
                 schemaCreationWorker, containerTeardowns, persistentPathValidator);
@@ -168,6 +177,35 @@ class EmulatorLifecycleTest {
         emulatorLifecycle.onStart(Mockito.mock(StartupEvent.class));
 
         Mockito.verify(elbV2Service, Mockito.never()).restorePersistedRuntime();
+    }
+
+    @Test
+    @DisplayName("Should restore ElastiCache persisted runtime after loading storage when elasticache is enabled")
+    void shouldRestoreElastiCachePersistedRuntimeAfterStorageLoad() {
+        stubStorageConfig();
+        when(elastiCacheServiceConfig.enabled()).thenReturn(true);
+        when(elastiCacheService.restorePersistedRuntime())
+                .thenReturn(java.util.concurrent.CompletableFuture.completedFuture(null));
+        when(initializationHooksRunner.hasHooks(InitializationHook.START)).thenReturn(false);
+        when(initializationHooksRunner.hasHooks(InitializationHook.READY)).thenReturn(false);
+
+        emulatorLifecycle.onStart(Mockito.mock(StartupEvent.class));
+
+        var inOrder = Mockito.inOrder(storageFactory, elastiCacheService);
+        inOrder.verify(storageFactory).loadAll();
+        inOrder.verify(elastiCacheService).restorePersistedRuntime();
+    }
+
+    @Test
+    @DisplayName("Should not restore ElastiCache persisted runtime when elasticache is disabled")
+    void shouldNotRestoreElastiCachePersistedRuntimeWhenDisabled() {
+        stubStorageConfig();
+        when(initializationHooksRunner.hasHooks(InitializationHook.START)).thenReturn(false);
+        when(initializationHooksRunner.hasHooks(InitializationHook.READY)).thenReturn(false);
+
+        emulatorLifecycle.onStart(Mockito.mock(StartupEvent.class));
+
+        Mockito.verify(elastiCacheService, Mockito.never()).restorePersistedRuntime();
     }
 
     @Test

@@ -13,6 +13,7 @@ import io.github.hectorvent.floci.services.floci.ui.FlociUiManager;
 import io.github.hectorvent.floci.services.amazonmq.container.RabbitMqManager;
 import io.github.hectorvent.floci.services.kinesisanalytics.container.FlinkContainerManager;
 import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.elasticache.ElastiCacheService;
 import io.github.hectorvent.floci.services.elasticache.container.ElastiCacheContainerManager;
 import io.github.hectorvent.floci.services.elasticache.container.ElastiCacheMemcachedContainerManager;
 import io.github.hectorvent.floci.services.elasticache.proxy.ElastiCacheProxyManager;
@@ -24,6 +25,7 @@ import io.github.hectorvent.floci.services.neptune.container.NeptuneContainerMan
 import io.github.hectorvent.floci.services.neptune.proxy.NeptuneProxyManager;
 import io.github.hectorvent.floci.services.pipes.PipesService;
 import io.github.hectorvent.floci.services.appsync.graphql.SchemaCreationWorker;
+import io.github.hectorvent.floci.services.elb.ElbClassicService;
 import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
 import io.github.hectorvent.floci.services.rds.RdsService;
 import io.github.hectorvent.floci.services.memorydb.container.MemoryDbContainerManager;
@@ -66,6 +68,7 @@ public class EmulatorLifecycle {
     private final ServiceRegistry serviceRegistry;
     private final EmulatorConfig config;
     private final IamService iamService;
+    private final ElastiCacheService elastiCacheService;
     private final ElastiCacheContainerManager elastiCacheContainerManager;
     private final ElastiCacheMemcachedContainerManager elastiCacheMemcachedContainerManager;
     private final ElastiCacheProxyManager elastiCacheProxyManager;
@@ -80,6 +83,7 @@ public class EmulatorLifecycle {
     private final FlinkContainerManager flinkContainerManager;
     private final RdsService rdsService;
     private final ElbV2Service elbV2Service;
+    private final ElbClassicService elbClassicService;
     private final InitializationHooksRunner initializationHooksRunner;
     private final SqsEventSourcePoller sqsPoller;
     private final KinesisEventSourcePoller kinesisPoller;
@@ -97,6 +101,7 @@ public class EmulatorLifecycle {
     public EmulatorLifecycle(StorageFactory storageFactory, ServiceRegistry serviceRegistry,
                              EmulatorConfig config,
                              IamService iamService,
+                             ElastiCacheService elastiCacheService,
                              ElastiCacheContainerManager elastiCacheContainerManager,
                              ElastiCacheMemcachedContainerManager elastiCacheMemcachedContainerManager,
                              ElastiCacheProxyManager elastiCacheProxyManager,
@@ -111,6 +116,7 @@ public class EmulatorLifecycle {
                              FlinkContainerManager flinkContainerManager,
                              RdsService rdsService,
                              ElbV2Service elbV2Service,
+                             ElbClassicService elbClassicService,
                              InitializationHooksRunner initializationHooksRunner,
                              SqsEventSourcePoller sqsPoller,
                              KinesisEventSourcePoller kinesisPoller,
@@ -127,6 +133,7 @@ public class EmulatorLifecycle {
         this.serviceRegistry = serviceRegistry;
         this.config = config;
         this.iamService = iamService;
+        this.elastiCacheService = elastiCacheService;
         this.elastiCacheContainerManager = elastiCacheContainerManager;
         this.elastiCacheMemcachedContainerManager = elastiCacheMemcachedContainerManager;
         this.elastiCacheProxyManager = elastiCacheProxyManager;
@@ -141,6 +148,7 @@ public class EmulatorLifecycle {
         this.flinkContainerManager = flinkContainerManager;
         this.rdsService = rdsService;
         this.elbV2Service = elbV2Service;
+        this.elbClassicService = elbClassicService;
         this.initializationHooksRunner = initializationHooksRunner;
         this.sqsPoller = sqsPoller;
         this.kinesisPoller = kinesisPoller;
@@ -189,8 +197,17 @@ public class EmulatorLifecycle {
         dynamodbStreamsPoller.startPersistedPollers();
         pipesService.startPersistedPollers();
         rdsService.restorePersistedRuntime();
+        if (config.services().elasticache().enabled()) {
+            elastiCacheService.restorePersistedRuntime().exceptionally(ex -> {
+                LOG.warnv("ElastiCache cluster-mode restore failed: {0}", ex.getMessage());
+                return null;
+            });
+        }
         if (config.services().elbv2().enabled()) {
             elbV2Service.restorePersistedRuntime();
+        }
+        if (config.services().elb().enabled()) {
+            elbClassicService.restorePersistedRuntime();
         }
 
         if (config.services().ec2().enabled() && !config.services().ec2().mock()) {

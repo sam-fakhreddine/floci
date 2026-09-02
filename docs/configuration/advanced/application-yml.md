@@ -88,6 +88,13 @@ floci:
     # extra-suffixes:
     #   - localhost.localstack.cloud
 
+    # Transparent endpoint injection: resolve amazonaws.com and every subdomain to
+    # Floci's container IP inside spawned containers, so SDK clients built with
+    # explicit real-AWS endpoints (which override AWS_ENDPOINT_URL) land on the
+    # emulator. Combine with tls.enabled for clients that hardcode https://.
+    # Via env var: FLOCI_DNS_SPOOF_AWS_ENDPOINTS=true
+    spoof-aws-endpoints: false
+
   auth:
     validate-signatures: false               # Set to true to verify S3 presigned URL signatures
     presign-secret: local-emulator-secret    # HMAC secret for S3 pre-signed URL verification
@@ -131,8 +138,8 @@ floci:
       ephemeral: false                        # true = remove container after each invocation
       default-memory-mb: 128
       default-timeout-seconds: 3
-      runtime-api-base-port: 9200             # Port range for Lambda Runtime API
-      runtime-api-max-port: 9299
+      runtime-api-base-port: 12000            # Port range for Lambda Runtime API
+      runtime-api-max-port: 12499             # One port per running container = concurrency ceiling
       code-path: ./data/lambda-code           # Where ZIP archives are stored
       poll-interval-ms: 1000
       container-idle-timeout-seconds: 300     # Remove idle containers after this
@@ -154,6 +161,15 @@ floci:
       enabled: true
       enforcement-enabled: false        # Set to true to enforce IAM policies on all requests
       seed-deployer-principal: false    # Set to true to create a local floci-deployer admin principal
+
+    networkfirewall:
+      enabled: true
+
+    servicequotas:
+      enabled: true
+
+    ram:
+      enabled: true
 
     elasticache:
       enabled: true
@@ -233,6 +249,9 @@ floci:
     ec2:
       enabled: true
 
+    efs:
+      enabled: true
+
     ecs:
       enabled: true
       mock: false                             # true = tasks go to RUNNING without Docker (useful for CI)
@@ -289,6 +308,7 @@ All keys in this table are declared on `EmulatorConfig` and accept environment v
 | `FLOCI_SERVICES_ECS_DOCKER_NETWORK`                | *(unset)*        | Docker network for ECS task containers                        |
 | `FLOCI_SERVICES_ECS_DEFAULT_MEMORY_MB`             | `512`            | Default memory (MB) when task definition omits it             |
 | `FLOCI_SERVICES_ECS_DEFAULT_CPU_UNITS`             | `256`            | Default CPU units when task definition omits it               |
+| `FLOCI_SERVICES_CODEBUILD_MAX_CONCURRENT_BUILDS`   | `4`    | Max builds staging a workspace on disk at once; caps a parallel stage's fan-out on a constrained host |
 | `FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED`           | `false`          | Enforce IAM identity-based policies on every request when `true` |
 | `FLOCI_SERVICES_OPENSEARCH_MOCK`                   | `false`          | Skip Docker; domains appear active immediately (useful for CI)   |
 | `FLOCI_SERVICES_OPENSEARCH_KEEP_RUNNING_ON_SHUTDOWN` | `false`        | Leave OpenSearch containers running after Floci stops            |

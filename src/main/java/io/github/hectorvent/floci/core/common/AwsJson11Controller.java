@@ -23,11 +23,15 @@ import io.github.hectorvent.floci.services.ce.CostExplorerJsonHandler;
 import io.github.hectorvent.floci.services.cloudtrail.CloudTrailJsonHandler;
 import io.github.hectorvent.floci.services.applicationautoscaling.ApplicationAutoScalingJsonHandler;
 import io.github.hectorvent.floci.services.cloudcontrol.CloudControlJsonHandler;
+import io.github.hectorvent.floci.services.ssoadmin.SsoAdminJsonHandler;
 import io.github.hectorvent.floci.services.configservice.ConfigServiceJsonHandler;
 import io.github.hectorvent.floci.services.cur.CurJsonHandler;
 import io.github.hectorvent.floci.services.pricing.PricingJsonHandler;
 import io.github.hectorvent.floci.services.textract.TextractJsonHandler;
+import io.github.hectorvent.floci.services.comprehend.ComprehendJsonHandler;
+import io.github.hectorvent.floci.services.rekognition.RekognitionJsonHandler;
 import io.github.hectorvent.floci.services.transcribe.TranscribeJsonHandler;
+import io.github.hectorvent.floci.services.translate.TranslateJsonHandler;
 import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2JsonHandler;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsHandler;
 import io.github.hectorvent.floci.services.cognito.CognitoJsonHandler;
@@ -40,6 +44,11 @@ import io.github.hectorvent.floci.services.kinesis.KinesisJsonHandler;
 import io.github.hectorvent.floci.services.kinesisanalytics.KinesisAnalyticsV2JsonHandler;
 import io.github.hectorvent.floci.services.kms.KmsJsonHandler;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerJsonHandler;
+import io.github.hectorvent.floci.services.organizations.OrganizationsJsonHandler;
+import io.github.hectorvent.floci.services.route53resolver.Route53ResolverJsonHandler;
+import io.github.hectorvent.floci.services.networkfirewall.NetworkFirewallJsonHandler;
+import io.github.hectorvent.floci.services.servicecatalog.ServiceCatalogJsonHandler;
+import io.github.hectorvent.floci.services.servicequotas.ServiceQuotasJsonHandler;
 import io.github.hectorvent.floci.services.ssm.Ec2MessagesJsonHandler;
 import io.github.hectorvent.floci.services.ssm.SsmJsonHandler;
 import jakarta.inject.Inject;
@@ -94,17 +103,26 @@ public class AwsJson11Controller {
     private final Ec2MessagesJsonHandler ec2MessagesJsonHandler;
     private final TransferHandler transferHandler;
     private final TextractJsonHandler textractJsonHandler;
+    private final ComprehendJsonHandler comprehendJsonHandler;
+    private final RekognitionJsonHandler rekognitionJsonHandler;
     private final PricingJsonHandler pricingJsonHandler;
     private final TranscribeJsonHandler transcribeJsonHandler;
+    private final TranslateJsonHandler translateJsonHandler;
     private final CostExplorerJsonHandler costExplorerJsonHandler;
     private final CurJsonHandler curJsonHandler;
     private final BcmDataExportsJsonHandler bcmDataExportsJsonHandler;
     private final ConfigServiceJsonHandler configServiceJsonHandler;
     private final CloudTrailJsonHandler cloudTrailJsonHandler;
     private final LightsailJsonHandler lightsailJsonHandler;
+    private final Route53ResolverJsonHandler route53ResolverJsonHandler;
+    private final NetworkFirewallJsonHandler networkFirewallJsonHandler;
+    private final ServiceCatalogJsonHandler serviceCatalogJsonHandler;
     private final CloudControlJsonHandler cloudControlJsonHandler;
     private final ApplicationAutoScalingJsonHandler applicationAutoScalingJsonHandler;
     private final CloudHsmV2JsonHandler cloudHsmV2JsonHandler;
+    private final OrganizationsJsonHandler organizationsJsonHandler;
+    private final SsoAdminJsonHandler ssoAdminJsonHandler;
+    private final ServiceQuotasJsonHandler serviceQuotasJsonHandler;
 
     @Inject
     public AwsJson11Controller(ObjectMapper objectMapper, ResolvedServiceCatalog catalog,
@@ -131,17 +149,26 @@ public class AwsJson11Controller {
                                Ec2MessagesJsonHandler ec2MessagesJsonHandler,
                                TransferHandler transferHandler,
                                TextractJsonHandler textractJsonHandler,
+                               ComprehendJsonHandler comprehendJsonHandler,
+                               RekognitionJsonHandler rekognitionJsonHandler,
                                PricingJsonHandler pricingJsonHandler,
                                TranscribeJsonHandler transcribeJsonHandler,
+                               TranslateJsonHandler translateJsonHandler,
                                CostExplorerJsonHandler costExplorerJsonHandler,
                                CurJsonHandler curJsonHandler,
                                BcmDataExportsJsonHandler bcmDataExportsJsonHandler,
                                ConfigServiceJsonHandler configServiceJsonHandler,
                                CloudTrailJsonHandler cloudTrailJsonHandler,
                                LightsailJsonHandler lightsailJsonHandler,
+                               Route53ResolverJsonHandler route53ResolverJsonHandler,
+                               NetworkFirewallJsonHandler networkFirewallJsonHandler,
+                               ServiceCatalogJsonHandler serviceCatalogJsonHandler,
                                CloudControlJsonHandler cloudControlJsonHandler,
                                ApplicationAutoScalingJsonHandler applicationAutoScalingJsonHandler,
-                               CloudHsmV2JsonHandler cloudHsmV2JsonHandler){
+                               CloudHsmV2JsonHandler cloudHsmV2JsonHandler,
+                               OrganizationsJsonHandler organizationsJsonHandler,
+                               SsoAdminJsonHandler ssoAdminJsonHandler,
+                               ServiceQuotasJsonHandler serviceQuotasJsonHandler) {
         this.objectMapper = objectMapper;
         this.strictBodyReader = objectMapper.reader().with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
         this.catalog = catalog;
@@ -172,17 +199,26 @@ public class AwsJson11Controller {
         this.ec2MessagesJsonHandler = ec2MessagesJsonHandler;
         this.transferHandler = transferHandler;
         this.textractJsonHandler = textractJsonHandler;
+        this.comprehendJsonHandler = comprehendJsonHandler;
+        this.rekognitionJsonHandler = rekognitionJsonHandler;
         this.pricingJsonHandler = pricingJsonHandler;
         this.transcribeJsonHandler = transcribeJsonHandler;
+        this.translateJsonHandler = translateJsonHandler;
         this.costExplorerJsonHandler = costExplorerJsonHandler;
         this.curJsonHandler = curJsonHandler;
         this.bcmDataExportsJsonHandler = bcmDataExportsJsonHandler;
         this.configServiceJsonHandler = configServiceJsonHandler;
         this.cloudTrailJsonHandler = cloudTrailJsonHandler;
         this.lightsailJsonHandler = lightsailJsonHandler;
+        this.route53ResolverJsonHandler = route53ResolverJsonHandler;
+        this.networkFirewallJsonHandler = networkFirewallJsonHandler;
+        this.serviceCatalogJsonHandler = serviceCatalogJsonHandler;
         this.cloudControlJsonHandler = cloudControlJsonHandler;
         this.applicationAutoScalingJsonHandler = applicationAutoScalingJsonHandler;
         this.cloudHsmV2JsonHandler = cloudHsmV2JsonHandler;
+        this.organizationsJsonHandler = organizationsJsonHandler;
+        this.ssoAdminJsonHandler = ssoAdminJsonHandler;
+        this.serviceQuotasJsonHandler = serviceQuotasJsonHandler;
     }
 
     @POST
@@ -244,8 +280,11 @@ public class AwsJson11Controller {
                 case "ec2messages" -> ec2MessagesJsonHandler.handle(action, request, region);
                 case "transfer" -> transferHandler.handle(action, request, region);
                 case "textract" -> textractJsonHandler.handle(action, request, region);
+                case "comprehend" -> comprehendJsonHandler.handle(action, request, region);
+                case "rekognition" -> rekognitionJsonHandler.handle(action, request, region);
                 case "pricing" -> pricingJsonHandler.handle(action, request, region);
                 case "transcribe" -> transcribeJsonHandler.handle(action, request, region);
+                case "translate" -> translateJsonHandler.handle(action, request, region);
                 case "ce" -> costExplorerJsonHandler.handle(action, request, region);
                 case "cur" -> curJsonHandler.handle(action, request, region);
                 case "bcm-data-exports" -> bcmDataExportsJsonHandler.handle(action, request, region);
@@ -253,8 +292,20 @@ public class AwsJson11Controller {
                 case "cloudtrail" -> cloudTrailJsonHandler.handle(action, request, region);
                 case "application-autoscaling" -> applicationAutoScalingJsonHandler.handle(action, request, region);
                 case "lightsail" -> lightsailJsonHandler.handle(action, request, region);
+                case "route53resolver" -> route53ResolverJsonHandler.handle(action, request, region, regionResolver.getAccountId());
+                case "network-firewall" -> networkFirewallJsonHandler.handle(
+                        action, request, region, regionResolver.getAccountId());
+                case "servicecatalog" -> serviceCatalogJsonHandler.handle(
+                        action, request, region, regionResolver.getAccountId());
                 case "cloudcontrol" -> cloudControlJsonHandler.handle(action, request, region);
                 case "cloudhsmv2" -> cloudHsmV2JsonHandler.handle(action, request, region);
+                // Organizations is global and account-scoped rather than region-scoped: every
+                // action is authorized against the calling account, so pass that instead of region.
+                case "organizations" ->
+                        organizationsJsonHandler.handle(action, request, regionResolver.getAccountId());
+                case "sso" -> ssoAdminJsonHandler.handle(action, request, regionResolver.getAccountId());
+                case "servicequotas" -> serviceQuotasJsonHandler.handle(
+                        action, request, region, regionResolver.getAccountId());
                 default -> null;
             };
             // catalog.matchTarget is protocol-agnostic: a JSON 1.0 target

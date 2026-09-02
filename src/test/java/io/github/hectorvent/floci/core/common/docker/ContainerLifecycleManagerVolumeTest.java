@@ -3,6 +3,8 @@ package io.github.hectorvent.floci.core.common.docker;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.CreateContainerCmd;
 import com.github.dockerjava.api.command.CreateContainerResponse;
+import com.github.dockerjava.api.command.CreateVolumeCmd;
+import com.github.dockerjava.api.command.CreateVolumeResponse;
 import com.github.dockerjava.api.command.InspectVolumeCmd;
 import com.github.dockerjava.api.command.InspectVolumeResponse;
 import com.github.dockerjava.api.command.ListVolumesCmd;
@@ -23,11 +25,15 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.IntConsumer;
+import java.util.function.IntFunction;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
@@ -387,5 +393,131 @@ class ContainerLifecycleManagerVolumeTest {
                 Optional.of("0777"), "busybox:stable");
 
         verify(dockerClient, times(2)).createContainerCmd("busybox:stable");
+    }
+
+    /** Stubs {@code inspectVolumeCmd("vol").exec()} to defer to {@code behaviour}, counting calls. */
+    private AtomicInteger inspectVolumeBehaving(IntFunction<InspectVolumeResponse> behaviour) {
+        AtomicInteger calls = new AtomicInteger();
+        InspectVolumeCmd cmd = mock(InspectVolumeCmd.class);
+        when(dockerClient.inspectVolumeCmd("vol")).thenReturn(cmd);
+        when(cmd.exec()).thenAnswer(inv -> behaviour.apply(calls.incrementAndGet()));
+        return calls;
+    }
+
+    /** Stubs {@code createVolumeCmd()...exec()} to defer to {@code behaviour}, counting calls. */
+    private AtomicInteger createVolumeBehaving(IntConsumer behaviour) {
+        AtomicInteger calls = new AtomicInteger();
+        CreateVolumeCmd cmd = mock(CreateVolumeCmd.class, RETURNS_SELF);
+        when(dockerClient.createVolumeCmd()).thenReturn(cmd);
+        when(cmd.exec()).thenAnswer(inv -> {
+            behaviour.accept(calls.incrementAndGet());
+            return mock(CreateVolumeResponse.class);
+        });
+        return calls;
+    }
+
+    @Test
+    void ensureVolume_createsMissingVolumeExactlyOnce() {
+        AtomicInteger inspects = inspectVolumeBehaving(attempt -> {
+            throw new NotFoundException("No such volume: vol");
+        });
+        AtomicInteger creates = createVolumeBehaving(attempt -> {
+        });
+
+        manager.ensureVolume("vol");
+
+        assertEquals(1, inspects.get());
+        assertEquals(1, creates.get(), "a missing volume must be created");
+    }
+
+    @Test
+    void ensureVolume_doesNotCreateWhenVolumeAlreadyExists() {
+        // This existence guard is what keeps ensureVolume idempotent now that transient-I/O
+        // retries live at the transport: when the daemon created the volume but the response was
+        // lost to a broken pipe, the transport's replayed create finds the volume already there —
+        // POST /volumes/create with the same name is itself idempotent — and later ensureVolume
+        // calls see it exists and do nothing.
+        AtomicInteger inspects = inspectVolumeBehaving(attempt ->
+                mock(InspectVolumeResponse.class));
+
+        manager.ensureVolume("vol");
+
+        assertEquals(1, inspects.get());
+        verify(dockerClient, never()).createVolumeCmd();
+    }
+
+    @Test
+    void ensureVolume_doesNotRetryOnTopOfTheTransport() {
+        inspectVolumeBehaving(attempt -> {
+            throw new NotFoundException("No such volume: vol");
+        });
+        RuntimeException transportGaveUp = new RuntimeException(new IOException("Broken pipe"));
+        AtomicInteger creates = createVolumeBehaving(attempt -> {
+            throw transportGaveUp;
+        });
+
+        RuntimeException thrown =
+                assertThrows(RuntimeException.class, () -> manager.ensureVolume("vol"));
+
+        assertSame(transportGaveUp, thrown,
+                "a transient error surfacing here means the transport already spent the retry"
+                        + " budget; it must surface unchanged");
+        assertEquals(1, creates.get(),
+                "no call-site loop: an outer retry would compound backoff on an exhausted"
+                        + " inner one");
+    }
+
+    @Test
+    void ensureVolume_doesNotSwallowDaemonRejection() {
+        inspectVolumeBehaving(attempt -> {
+            throw new NotFoundException("No such volume: vol");
+        });
+        DockerException rejected = new DockerException("volume name already in use", 409);
+        AtomicInteger creates = createVolumeBehaving(attempt -> {
+            throw rejected;
+        });
+
+        DockerException thrown =
+                assertThrows(DockerException.class, () -> manager.ensureVolume("vol"));
+
+        assertSame(rejected, thrown, "a genuine daemon rejection must surface unchanged");
+        assertEquals(1, creates.get(), "a name conflict never clears on a retry");
+    }
+
+    @Test
+    void ensureSharedVolume_startsHelperThroughTheTranslatingStartContainer() {
+        // github.com/floci-io/floci/issues/2243 (follow-up, PR #2797 review): the shared-volume
+        // init helper is a third container-start call site, distinct from createAndStart /
+        // startCreated and from adopt(). A failure here is caught as a plain RuntimeException by
+        // ensureSharedVolume's computeIfAbsent and only logged (never rethrown to the caller), so
+        // whether the logged message is the misleading raw "Disk quota exceeded" or the translated
+        // one depends entirely on whether this call site goes through startContainer(). Verifying
+        // startContainer("helper-id") is actually invoked (via a spy) is the only way to pin that
+        // routing, since the swallowed exception itself is not observable from ensureSharedVolume.
+        ContainerLifecycleManager spyManager = spy(manager);
+        doNothing().when(spyManager).startContainer("helper-id");
+
+        InspectVolumeCmd ivc = mock(InspectVolumeCmd.class);
+        when(dockerClient.inspectVolumeCmd("shared")).thenReturn(ivc);
+        when(ivc.exec()).thenReturn(mock(InspectVolumeResponse.class));
+
+        CreateContainerCmd ccc = mock(CreateContainerCmd.class, RETURNS_SELF);
+        when(dockerClient.createContainerCmd("busybox:stable")).thenReturn(ccc);
+        CreateContainerResponse resp = mock(CreateContainerResponse.class);
+        when(resp.getId()).thenReturn("helper-id");
+        when(ccc.exec()).thenReturn(resp);
+
+        WaitContainerCmd wcc = mock(WaitContainerCmd.class);
+        when(dockerClient.waitContainerCmd("helper-id")).thenReturn(wcc);
+        WaitContainerResultCallback wcb = mock(WaitContainerResultCallback.class);
+        when(wcc.exec(any(WaitContainerResultCallback.class))).thenReturn(wcb);
+        when(wcb.awaitStatusCode(anyLong(), any())).thenReturn(0);
+        when(dockerClient.removeContainerCmd("helper-id")).thenReturn(mock(RemoveContainerCmd.class, RETURNS_SELF));
+
+        spyManager.ensureSharedVolume("shared", OptionalInt.of(1001), OptionalInt.of(1001),
+                Optional.of("2775"), "busybox:stable");
+
+        verify(spyManager).startContainer("helper-id");
+        verify(dockerClient, never()).startContainerCmd("helper-id");
     }
 }

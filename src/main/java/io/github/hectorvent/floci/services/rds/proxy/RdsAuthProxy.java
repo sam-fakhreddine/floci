@@ -22,10 +22,11 @@ public class RdsAuthProxy {
     private final String instanceId;
     private final String backendHost;
     private final String masterUsername;
-    private final String masterPassword;
+    private volatile String masterPassword;
     private final String dbName;
     private final DatabaseEngine engine;
     private final RdsSigV4Validator sigV4;
+    private final RdsProxyTlsCertificates tlsCertificates;
     private final PasswordValidator passwordValidator;
 
     private volatile boolean running;
@@ -34,7 +35,8 @@ public class RdsAuthProxy {
     public RdsAuthProxy(String instanceId, String backendHost, int backendPort,
                         DatabaseEngine engine, boolean iamEnabled,
                         String masterUsername, String masterPassword, String dbName,
-                        RdsSigV4Validator sigV4, PasswordValidator passwordValidator) {
+                        RdsSigV4Validator sigV4, RdsProxyTlsCertificates tlsCertificates,
+                        PasswordValidator passwordValidator) {
         this.instanceId = instanceId;
         this.backendHost = backendHost;
         this.backendPort = backendPort;
@@ -44,6 +46,7 @@ public class RdsAuthProxy {
         this.masterPassword = masterPassword;
         this.dbName = dbName;
         this.sigV4 = sigV4;
+        this.tlsCertificates = tlsCertificates;
         this.passwordValidator = passwordValidator;
     }
 
@@ -55,6 +58,11 @@ public class RdsAuthProxy {
         Thread.ofVirtual().name("rds-proxy-accept-" + instanceId).start(this::acceptLoop);
         LOG.infov("RDS proxy started for instance {0} on port {1} → {2}:{3}",
                 instanceId, String.valueOf(proxyPort), backendHost, String.valueOf(backendPort));
+    }
+
+    /** Swap the master-password snapshot after a rotation; new connections authenticate against it. */
+    public void updateMasterPassword(String newPassword) {
+        this.masterPassword = newPassword;
     }
 
     public void stop() {
@@ -85,22 +93,35 @@ public class RdsAuthProxy {
     }
 
     private void handleConnection(Socket client) {
+        Socket backend = null;
         try {
             client.setTcpNoDelay(true);
-            Socket backend = new Socket(backendHost, backendPort);
+            backend = new Socket(backendHost, backendPort);
             backend.setTcpNoDelay(true);
 
             switch (engine) {
-                case POSTGRES -> PostgresProtocolHandler.handleAuth(
-                        client, backend, masterUsername, masterPassword, dbName,
-                        iamEnabled, sigV4, passwordValidator::validate);
+                case POSTGRES -> {
+                    Socket activeClient = PostgresProtocolHandler.authenticate(
+                            client, backend, masterUsername, masterPassword, dbName,
+                            iamEnabled, sigV4, tlsCertificates, passwordValidator::validate);
+                    if (activeClient != null) {
+                        PostgresProtocolHandler.bridge(activeClient, backend);
+                    }
+                }
                 case MYSQL, MARIADB -> MySqlProtocolHandler.handleAuth(
                         client, backend, masterUsername, masterPassword,
-                        iamEnabled, sigV4, passwordValidator::validate);
+                        iamEnabled, sigV4, tlsCertificates, passwordValidator::validate);
             }
         } catch (Exception e) {
             LOG.debugv("RDS connection error for instance {0}: {1}", instanceId, e.getMessage());
+        } finally {
+            // A handler's success path bridges then closes both sockets; every other path
+            // (early return on a bare probe, auth failure, thrown IOException) can leave the
+            // backend DB connection open. Closing here is idempotent.
             closeQuietly(client);
+            if (backend != null) {
+                closeQuietly(backend);
+            }
         }
     }
 

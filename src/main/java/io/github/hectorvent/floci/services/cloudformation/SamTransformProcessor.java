@@ -11,6 +11,8 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Expands {@code AWS::Serverless-2016-10-31} SAM resource types into standard CloudFormation
@@ -21,6 +23,16 @@ class SamTransformProcessor {
 
     private static final Logger LOG = Logger.getLogger(SamTransformProcessor.class);
     private static final String SAM_TRANSFORM = "AWS::Serverless-2016-10-31";
+
+    /**
+     * Matches a valid {@code s3://bucket/key} URI, optionally suffixed with a
+     * {@code ?versionId=<id>} query parameter, the way real SAM packages a {@code DefinitionUri}.
+     * The key is non-greedy so only a trailing {@code ?versionId=} is split off; S3 permits a
+     * literal {@code ?} in a key (for example {@code s3://bucket/key?foo=1}), and such a key must
+     * still match here rather than being rejected as an invalid URI.
+     */
+    private static final Pattern S3_DEFINITION_URI = Pattern.compile(
+            "^s3://(?<bucket>[^/?]+)/(?<key>.+?)(?:\\?versionId=(?<version>.+))?$");
 
     private final ObjectMapper objectMapper;
 
@@ -84,16 +96,37 @@ class SamTransformProcessor {
             String type = resDef.path("Type").asText();
             JsonNode properties = resDef.path("Properties");
 
+            // SAM CLI writes SamResourceId (in Metadata) for every AWS::Serverless::* resource it
+            // transforms, not only state machines, and CloudFormation carries a resource's
+            // Metadata/DependsOn/Condition/DeletionPolicy/UpdateReplacePolicy through a transform
+            // unchanged. Each arm's generated resource lands back at the same logicalId key, so
+            // copyResourceLevelAttributes runs once per arm, right after that arm builds its node.
             switch (type) {
-                case "AWS::Serverless::Function" ->
-                        expandServerlessFunction(logicalId, mergeGlobals(globals, "Function", properties), expandedResources);
-                case "AWS::Serverless::SimpleTable" ->
-                        expandServerlessSimpleTable(logicalId, mergeGlobals(globals, "SimpleTable", properties), expandedResources);
-                case "AWS::Serverless::Api" ->
-                        expandServerlessApi(logicalId, mergeGlobals(globals, "Api", properties), expandedResources);
-                case "AWS::Serverless::HttpApi" ->
-                        expandServerlessHttpApi(logicalId, mergeGlobals(globals, "HttpApi", properties),
-                                httpApiRoutes, expandedResources);
+                case "AWS::Serverless::Function" -> {
+                    expandServerlessFunction(logicalId, mergeGlobals(globals, "Function", properties), expandedResources);
+                    copyResourceLevelAttributes(resDef, (ObjectNode) expandedResources.path(logicalId));
+                }
+                case "AWS::Serverless::SimpleTable" -> {
+                    expandServerlessSimpleTable(logicalId, mergeGlobals(globals, "SimpleTable", properties), expandedResources);
+                    copyResourceLevelAttributes(resDef, (ObjectNode) expandedResources.path(logicalId));
+                }
+                case "AWS::Serverless::Api" -> {
+                    expandServerlessApi(logicalId, mergeGlobals(globals, "Api", properties), expandedResources);
+                    copyResourceLevelAttributes(resDef, (ObjectNode) expandedResources.path(logicalId));
+                }
+                case "AWS::Serverless::HttpApi" -> {
+                    expandServerlessHttpApi(logicalId, mergeGlobals(globals, "HttpApi", properties),
+                            httpApiRoutes, expandedResources);
+                    copyResourceLevelAttributes(resDef, (ObjectNode) expandedResources.path(logicalId));
+                }
+                case "AWS::Serverless::StateMachine" ->
+                        // Globals.StateMachine is intentionally not merged in: SAM's schema accepts
+                        // exactly one key there (PropagateTags), unimplemented here, and
+                        // mergeGlobals deep-merges any key it is given, which would make floci
+                        // honour a Globals.StateMachine.Role that AWS itself rejects.
+                        // copyResourceLevelAttributes runs inside expandServerlessStateMachine
+                        // itself (its one caller already owning the source resDef).
+                        expandServerlessStateMachine(logicalId, resDef, expandedResources);
                 default -> LOG.debugv("Unsupported SAM resource type: {0} ({1})", type, logicalId);
             }
         }
@@ -210,6 +243,13 @@ class SamTransformProcessor {
         apiProps.set("Name", !name.isMissingNode() ? name.deepCopy() : objectMapper.getNodeFactory().textNode(logicalId));
         apiProps.put("ProtocolType", "HTTP");
         copyIfPresent(properties, "Description", apiProps);
+
+        // Preserve inline OpenAPI route definitions so the ApiGatewayV2 provisioner can
+        // materialize the routes and integrations declared by SAM DefinitionBody. An HttpApi
+        // declaring neither DefinitionBody nor DefinitionUri is also accepted: measured against
+        // real AWS, us-east-1, create-change-set, it still expands to a bare
+        // AWS::ApiGatewayV2::Api and its default stage, carrying no Body and no BodyS3Location.
+        applyDefinitionSource(logicalId, properties, apiProps);
         apiDef.set("Properties", apiProps);
         resources.set(logicalId, apiDef);
 
@@ -247,8 +287,133 @@ class SamTransformProcessor {
             if (!logicalId.equals(route.apiLogicalId())) {
                 continue;
             }
+            JsonNode defaultAuthorizer = defaultAuthorizerName == null
+                    ? objectMapper.missingNode() : authorizers.path(defaultAuthorizerName);
+            if (mergeHttpApiRouteIntoDefinitionBody(apiProps.path("Body"), route,
+                    defaultAuthorizerName, defaultAuthorizer)) {
+                expandHttpApiPermission(logicalId, route, resources);
+                continue;
+            }
             expandHttpApiRoute(logicalId, route, defaultAuthorizerLogicalId, resources);
         }
+    }
+
+    /**
+     * SAM merges a Function HttpApi event into an existing OpenAPI operation instead of emitting a
+     * second route with the same key. Preserve the operation's documentation while adding the
+     * Lambda integration only when the body does not already provide one.
+     */
+    private boolean mergeHttpApiRouteIntoDefinitionBody(JsonNode definitionBody, HttpApiRoute route,
+                                                         String defaultAuthorizerName,
+                                                         JsonNode defaultAuthorizer) {
+        JsonNode pathItem = definitionBody.path("paths").path(route.path());
+        if (!pathItem.isObject()) {
+            return false;
+        }
+        String operationName = "ANY".equalsIgnoreCase(route.httpMethod())
+                ? "x-amazon-apigateway-any-method" : route.httpMethod();
+        JsonNode operation = fieldIgnoreCase(pathItem, operationName);
+        if (!operation.isObject()) {
+            return false;
+        }
+        ObjectNode operationObject = (ObjectNode) operation;
+        if (!operationObject.path("x-amazon-apigateway-integration").isObject()) {
+            ObjectNode integration = objectMapper.createObjectNode();
+            integration.put("type", "aws_proxy");
+            integration.put("httpMethod", "POST");
+            integration.put("payloadFormatVersion", "2.0");
+            integration.set("uri", lambdaInvokeUri(route.functionLogicalId()));
+            operationObject.set("x-amazon-apigateway-integration", integration);
+        }
+        applyMergedHttpApiRouteAuthorization(definitionBody, operationObject, route,
+                defaultAuthorizerName, defaultAuthorizer);
+        return true;
+    }
+
+    /**
+     * The SAM translator mutates matching DefinitionBody operations with both the Function event's
+     * integration and its effective authorization. Without the latter, merging an authenticated
+     * event would silently expose the route because the API Gateway V2 body importer defaults the
+     * operation to {@code NONE}.
+     */
+    private void applyMergedHttpApiRouteAuthorization(JsonNode definitionBody, ObjectNode operation,
+                                                       HttpApiRoute route, String defaultAuthorizerName,
+                                                       JsonNode defaultAuthorizer) {
+        if (route.noAuthorizer()) {
+            // SAM represents this opt-out with a synthetic NONE requirement. An empty operation-level
+            // OpenAPI security array is the standard equivalent and is understood by our body importer.
+            operation.set("security", objectMapper.createArrayNode());
+            return;
+        }
+        if (defaultAuthorizerName == null || !defaultAuthorizer.isObject()
+                || hasNonEmptySecurity(operation.get("security"))) {
+            return;
+        }
+
+        // AWS SAM deliberately treats an absent, null, or empty operation security value as unset
+        // when applying DefaultAuthorizer. A public per-event override is represented separately by
+        // Authorizer: NONE and is handled above. Keep this truthiness rule aligned with
+        // OpenApiEditor.set_path_default_authorizer:
+        // https://github.com/aws/serverless-application-model/blob/develop/samtranslator/open_api/open_api.py
+        addOpenApiJwtAuthorizer(definitionBody, defaultAuthorizerName, defaultAuthorizer);
+        ObjectNode requirement = objectMapper.createObjectNode();
+        JsonNode configuredScopes = defaultAuthorizer.path("AuthorizationScopes");
+        requirement.set(defaultAuthorizerName, configuredScopes.isArray()
+                ? configuredScopes.deepCopy() : objectMapper.createArrayNode());
+        ArrayNode security = objectMapper.createArrayNode();
+        security.add(requirement);
+        operation.set("security", security);
+    }
+
+    private static boolean hasNonEmptySecurity(JsonNode security) {
+        return security != null && !security.isNull()
+                && (!security.isContainerNode() || security.size() > 0);
+    }
+
+    /**
+     * Emits the same JWT security-scheme shape as
+     * {@code ApiGatewayV2Authorizer.generate_openapi} in AWS SAM. The ApiGatewayV2 body provisioner
+     * materializes this scheme first, then binds the operation's security requirement to it.
+     */
+    private void addOpenApiJwtAuthorizer(JsonNode definitionBody, String authorizerName,
+                                         JsonNode samAuthorizer) {
+        ObjectNode body = (ObjectNode) definitionBody;
+        ObjectNode components = objectChild(body, "components", "DefinitionBody.components");
+        ObjectNode schemes = objectChild(components, "securitySchemes",
+                "DefinitionBody.components.securitySchemes");
+
+        ObjectNode scheme = objectMapper.createObjectNode();
+        scheme.put("type", "oauth2");
+        ObjectNode extension = objectMapper.createObjectNode();
+        extension.set("identitySource", resolveIdentitySource(authorizerName, samAuthorizer));
+        extension.put("type", "jwt");
+
+        JsonNode samJwt = samAuthorizer.path("JwtConfiguration");
+        ObjectNode jwt = objectMapper.createObjectNode();
+        JsonNode issuer = fieldIgnoreCase(samJwt, "issuer");
+        if (!issuer.isMissingNode()) {
+            jwt.set("issuer", issuer.deepCopy());
+        }
+        JsonNode audience = fieldIgnoreCase(samJwt, "audience");
+        if (audience.isArray()) {
+            jwt.set("audience", audience.deepCopy());
+        }
+        extension.set("jwtConfiguration", jwt);
+        scheme.set("x-amazon-apigateway-authorizer", extension);
+        schemes.set(authorizerName, scheme);
+    }
+
+    private ObjectNode objectChild(ObjectNode parent, String fieldName, String fieldPath) {
+        JsonNode existing = parent.get(fieldName);
+        if (existing == null || existing.isNull()) {
+            ObjectNode created = objectMapper.createObjectNode();
+            parent.set(fieldName, created);
+            return created;
+        }
+        if (!existing.isObject()) {
+            throw new AwsException("ValidationError", fieldPath + " must be an object", 400);
+        }
+        return (ObjectNode) existing;
     }
 
     private ObjectNode buildHttpApiAuthorizer(String apiLogicalId, String authorizerName, JsonNode samAuthorizer) {
@@ -362,6 +527,10 @@ class SamTransformProcessor {
         routeDef.set("Properties", routeProps);
         resources.set(routeLogicalId, routeDef);
 
+        expandHttpApiPermission(apiLogicalId, route, resources);
+    }
+
+    private void expandHttpApiPermission(String apiLogicalId, HttpApiRoute route, ObjectNode resources) {
         String permissionLogicalId = uniqueId(
                 route.functionLogicalId() + "HttpApiPermission" + sanitize(apiLogicalId), resources);
         ObjectNode perm = objectMapper.createObjectNode();
@@ -910,6 +1079,15 @@ class SamTransformProcessor {
         }
         copyIfPresent(properties, "Description", apiProps);
 
+        // Preserve the inline OpenAPI document so the REST API provisioner can materialize the
+        // resources and methods declared by SAM DefinitionBody. An Api declaring neither
+        // DefinitionBody nor DefinitionUri is also accepted: measured against real AWS,
+        // us-east-1, create-change-set, it synthesizes a Body of {"swagger": "2.0", "info": {
+        // "version": "1.0", "title": {"Ref": "AWS::StackName"}}, "paths": {}}, while floci emits
+        // no Body and no BodyS3Location for that case. The paths are empty either way, so the
+        // runtime outcome (no method reachable) is the same, even though the stored Body differs.
+        applyDefinitionSource(logicalId, properties, apiProps);
+
         apiDef.set("Properties", apiProps);
         resources.set(logicalId, apiDef);
 
@@ -949,11 +1127,256 @@ class SamTransformProcessor {
         resources.set(stageLogicalId, stageDef);
     }
 
-    private void copyIfPresent(JsonNode source, String field, ObjectNode target) {
-        JsonNode value = source.path(field);
-        if (!value.isMissingNode() && !value.isNull()) {
-            target.set(field, value.deepCopy());
+    /**
+     * Expands {@code AWS::Serverless::StateMachine} into {@code AWS::StepFunctions::StateMachine}.
+     * Every mapped value is copied as a node, never read with {@code asText()}: {@code RoleArn}
+     * and {@code StateMachineName} are commonly intrinsics ({@code Fn::GetAtt}, {@code Fn::Sub})
+     * in the templates SAM itself produces, and {@code JsonNode.asText()} on an object node
+     * silently returns {@code ""}, dropping the intrinsic instead of failing loudly.
+     *
+     * <p>Every sibling key of {@code Type} and {@code Properties} on the SAM resource node (for
+     * example {@code Metadata}, {@code DependsOn}, {@code Condition}, {@code DeletionPolicy},
+     * {@code UpdateReplacePolicy}) is carried onto the emitted native resource, the way
+     * CloudFormation itself carries a transformed resource's own attributes through.
+     *
+     * <p>Does not handle {@code Events}, {@code Policies}, {@code PermissionsBoundary},
+     * {@code AutoPublishAlias} or {@code UseAliasAsEventTarget}: none appeared in the
+     * {@code AWS::Serverless::StateMachine} declarations measured against real AWS.
+     */
+    private void expandServerlessStateMachine(String logicalId, JsonNode samResource, ObjectNode resources) {
+        resources.remove(logicalId);
+        JsonNode properties = samResource.path("Properties");
+
+        JsonNode definition = properties.path("Definition");
+        JsonNode definitionUri = properties.path("DefinitionUri");
+        boolean hasDefinition = isPropertyPresent(definition);
+        boolean hasDefinitionUri = isPropertyPresent(definitionUri);
+        rejectBothDefinitionSources(logicalId, "Definition", "DefinitionUri", hasDefinition && hasDefinitionUri);
+        if (!hasDefinition && !hasDefinitionUri) {
+            throw new AwsException("ValidationError",
+                    "Resource with id [" + logicalId + "] is invalid. Either 'Definition' or "
+                            + "'DefinitionUri' property must be specified.", 400);
         }
+
+        ObjectNode stateMachineDef = objectMapper.createObjectNode();
+        stateMachineDef.put("Type", "AWS::StepFunctions::StateMachine");
+        copyResourceLevelAttributes(samResource, stateMachineDef);
+        ObjectNode smProps = objectMapper.createObjectNode();
+
+        copyRenamed(properties, "Name", smProps, "StateMachineName");
+        copyRenamed(properties, "Type", smProps, "StateMachineType");
+        copyRenamed(properties, "Role", smProps, "RoleArn");
+        copyRenamed(properties, "Logging", smProps, "LoggingConfiguration");
+        copyRenamed(properties, "Tracing", smProps, "TracingConfiguration");
+        copyIfPresent(properties, "DefinitionSubstitutions", smProps);
+        if (hasDefinition) {
+            smProps.set("Definition", definition.deepCopy());
+        } else {
+            resolveDefinitionUriOrThrow(definitionUri, "DefinitionS3Location", logicalId, smProps);
+        }
+
+        smProps.set("Tags", samTagsToCfnTags(properties.path("Tags")));
+
+        stateMachineDef.set("Properties", smProps);
+        resources.set(logicalId, stateMachineDef);
+    }
+
+    /**
+     * Copies every sibling key of {@code Type} and {@code Properties} from {@code source} onto
+     * {@code target}, the way CloudFormation carries a resource's {@code Metadata},
+     * {@code DependsOn}, {@code Condition}, {@code DeletionPolicy} and
+     * {@code UpdateReplacePolicy} through a transform unchanged.
+     */
+    private void copyResourceLevelAttributes(JsonNode source, ObjectNode target) {
+        Iterator<Map.Entry<String, JsonNode>> fields = source.fields();
+        while (fields.hasNext()) {
+            Map.Entry<String, JsonNode> field = fields.next();
+            String key = field.getKey();
+            if ("Type".equals(key) || "Properties".equals(key)) {
+                continue;
+            }
+            target.set(key, field.getValue().deepCopy());
+        }
+    }
+
+    /**
+     * Converts SAM's string-to-string {@code Tags} map into the {@code {Key, Value}} list
+     * {@code AWS::StepFunctions::StateMachine} reads (see {@code parseCfnTags} in
+     * {@code CloudFormationResourceProvisioner}, which returns an empty set for anything that is
+     * not an array; a verbatim map copy would silently tag nothing). Emitted unconditionally,
+     * even for an absent or empty {@code Tags} map: measured against real AWS, us-east-1, a
+     * change set's Processed template for a state machine with no source {@code Tags} declared
+     * still carried exactly {@code [{"Key": "stateMachine:createdBy", "Value": "SAM"}]}, so real
+     * SAM adds this tag regardless of what the template declares.
+     *
+     * <p>A tag value keeps its own JSON type (number, intrinsic) in this expanded template. The
+     * native provisioner's {@code parseCfnTags} still reads every value with {@code asText("")}
+     * once it applies the tags to the state machine, so the type is preserved only up to the
+     * expanded template, not into the deployed resource.
+     */
+    private ArrayNode samTagsToCfnTags(JsonNode tagsMap) {
+        ArrayNode tags = objectMapper.createArrayNode();
+        ObjectNode samTag = objectMapper.createObjectNode();
+        samTag.put("Key", "stateMachine:createdBy");
+        samTag.put("Value", "SAM");
+        tags.add(samTag);
+
+        if (tagsMap.isObject()) {
+            Iterator<Map.Entry<String, JsonNode>> fields = tagsMap.fields();
+            while (fields.hasNext()) {
+                Map.Entry<String, JsonNode> entry = fields.next();
+                ObjectNode tag = objectMapper.createObjectNode();
+                tag.put("Key", entry.getKey());
+                tag.set("Value", entry.getValue().deepCopy());
+                tags.add(tag);
+            }
+        }
+        return tags;
+    }
+
+    /** Copies {@code source.<field>} to {@code target.<targetField>} when present and non-null. */
+    private void copyRenamed(JsonNode source, String field, ObjectNode target, String targetField) {
+        JsonNode value = source.path(field);
+        if (isPropertyPresent(value)) {
+            target.set(targetField, value.deepCopy());
+        }
+    }
+
+    /** True when {@code value} is neither an absent property nor an explicit JSON null. */
+    private boolean isPropertyPresent(JsonNode value) {
+        return !value.isMissingNode() && !value.isNull();
+    }
+
+    /**
+     * Resolves a resource's {@code Body} or {@code BodyS3Location} from its {@code DefinitionBody}
+     * or {@code DefinitionUri} properties and sets it on {@code apiProps}, rejecting a resource
+     * that declares both. Shared by {@link #expandServerlessApi} ({@code AWS::ApiGateway::RestApi}'s
+     * {@code Body}/{@code BodyS3Location}) and {@link #expandServerlessHttpApi}
+     * ({@code AWS::ApiGatewayV2::Api}'s {@code Body}/{@code BodyS3Location}): both resource types
+     * accept the identical {@code DefinitionBody}/{@code DefinitionUri} shape and the identical
+     * mutual-exclusion rule.
+     */
+    private void applyDefinitionSource(String logicalId, JsonNode properties, ObjectNode apiProps) {
+        JsonNode definitionBody = properties.path("DefinitionBody");
+        JsonNode definitionUri = properties.path("DefinitionUri");
+        boolean hasDefinitionBody = isPropertyPresent(definitionBody);
+        boolean hasDefinitionUri = isPropertyPresent(definitionUri);
+        rejectBothDefinitionSources(logicalId, "DefinitionUri", "DefinitionBody", hasDefinitionUri && hasDefinitionBody);
+
+        if (hasDefinitionBody) {
+            apiProps.set("Body", definitionBody.deepCopy());
+        } else if (hasDefinitionUri) {
+            resolveDefinitionUriOrThrow(definitionUri, "BodyS3Location", logicalId, apiProps);
+        }
+    }
+
+    /**
+     * Rejects a resource that declares both of a pair of mutually exclusive definition-source
+     * properties, with AWS's own two-property wording. Shared by {@link #expandServerlessStateMachine}
+     * (for {@code Definition}/{@code DefinitionUri}) and {@link #applyDefinitionSource} (for
+     * {@code DefinitionUri}/{@code DefinitionBody}, itself shared by the
+     * {@code AWS::Serverless::Api} and {@code AWS::Serverless::HttpApi} arms): measured against
+     * real AWS, us-east-1, {@code create-change-set}, both resource types are rejected before a
+     * single resource is provisioned, and each names its two properties in its own order,
+     * {@code firstPropertyName} before {@code secondPropertyName}.
+     */
+    private void rejectBothDefinitionSources(String logicalId, String firstPropertyName,
+                                             String secondPropertyName, boolean bothDeclared) {
+        if (bothDeclared) {
+            throw new AwsException("ValidationError",
+                    "Resource with id [" + logicalId + "] is invalid. Specify either '" + firstPropertyName
+                            + "' or '" + secondPropertyName + "' property and not both.", 400);
+        }
+    }
+
+    /**
+     * Splits a SAM {@code *Uri} property into the literal {@code {Bucket, Key}} (or
+     * {@code {Bucket, Key, Version}}) shape the native ApiGatewayV2 {@code BodyS3Location} and
+     * Step Functions {@code DefinitionS3Location} properties both accept. Accepts a textual
+     * {@code s3://bucket/key} URI, optionally suffixed with {@code ?versionId=<id>}, or an object
+     * form carrying non-null {@code Bucket} and {@code Key} values. Shared by
+     * {@link #applyDefinitionSource} (for {@code DefinitionUri} to {@code BodyS3Location}, itself
+     * shared by the {@code AWS::Serverless::Api} and {@code AWS::Serverless::HttpApi} arms) and
+     * {@link #expandServerlessStateMachine} (for {@code DefinitionUri} to
+     * {@code DefinitionS3Location}); {@link #resolveDefinitionUriOrThrow} is every caller's single
+     * entry point, so this predicate for "an S3 location is a literal Bucket and a literal Key"
+     * lives here once.
+     *
+     * <p>Returns {@code null} whenever the value cannot be resolved to a literal Bucket and Key:
+     * an absent or null property; a textual value that is not a valid {@code s3://bucket/key}
+     * URI (a local path or an {@code s3://} value with no key); an object missing {@code Bucket}
+     * or {@code Key}, or carrying either as an explicit JSON null (YAML's {@code Key:} with no
+     * value parses this way); or a value of any other JSON type (array, number, boolean). An
+     * object whose {@code Bucket}/{@code Key} is itself an unresolved intrinsic (for example
+     * {@code Ref} or {@code Fn::Sub}) is not distinguished from one carrying a literal value
+     * here: {@link #resolveDefinitionUriOrThrow} only calls this method for the top-level
+     * {@code DefinitionUri} node, and an intrinsic at that level (rather than nested inside
+     * {@code Bucket}/{@code Key}) is the shape measured against real AWS and rejected.
+     */
+    private ObjectNode samUriToS3Location(JsonNode definitionUri) {
+        if (definitionUri.isTextual()) {
+            Matcher matcher = S3_DEFINITION_URI.matcher(definitionUri.asText());
+            if (!matcher.matches()) {
+                return null;
+            }
+            ObjectNode location = objectMapper.createObjectNode();
+            location.put("Bucket", matcher.group("bucket"));
+            location.put("Key", matcher.group("key"));
+            String version = matcher.group("version");
+            if (version != null) {
+                location.put("Version", version);
+            }
+            return location;
+        }
+        if (definitionUri.isObject()) {
+            ObjectNode location = objectMapper.createObjectNode();
+            copyIfPresent(definitionUri, "Bucket", location);
+            copyIfPresent(definitionUri, "Key", location);
+            copyIfPresent(definitionUri, "Version", location);
+            return location.has("Bucket") && location.has("Key") ? location : null;
+        }
+        return null;
+    }
+
+    /**
+     * Resolves {@code definitionUri} to a literal Bucket/Key location and sets it on
+     * {@code target.<propertyName>}, or throws when it cannot be resolved. Shared by
+     * {@code AWS::Serverless::StateMachine} and {@link #applyDefinitionSource} (itself shared by
+     * the {@code AWS::Serverless::Api} and {@code AWS::Serverless::HttpApi} arms): real AWS
+     * (measured against us-east-1 via {@code create-change-set}) rejects every unresolvable
+     * {@code DefinitionUri} shape with the same wording on both resource types, before
+     * CloudFormation ever sees the resource, so both fail the SAM transform itself rather than
+     * reaching provisioning with no usable definition.
+     *
+     * <p>Both callers check {@code definitionUri} for presence before calling this method:
+     * {@link #expandServerlessStateMachine} only reaches this call once it has rejected the
+     * "neither Definition nor DefinitionUri" and "both" shapes, and {@link #applyDefinitionSource}
+     * only reaches it once it knows {@code DefinitionBody} is absent and {@code DefinitionUri} is
+     * present. {@code definitionUri} here is therefore always present and non-null.
+     */
+    private void resolveDefinitionUriOrThrow(JsonNode definitionUri, String propertyName, String logicalId,
+                                             ObjectNode target) {
+        ObjectNode s3Location = samUriToS3Location(definitionUri);
+        if (s3Location != null) {
+            target.set(propertyName, s3Location);
+            return;
+        }
+        String reason;
+        if (definitionUri.isTextual()) {
+            reason = "'DefinitionUri' is not a valid S3 Uri of the form 's3://bucket/key' "
+                    + "with optional versionId query parameter.";
+        } else if (definitionUri.isObject()) {
+            reason = "'DefinitionUri' requires Bucket and Key properties to be specified.";
+        } else {
+            reason = "Type of property 'DefinitionUri' is invalid.";
+        }
+        throw new AwsException("ValidationError",
+                "Resource with id [" + logicalId + "] is invalid. " + reason, 400);
+    }
+
+    /** Copies {@code source.<field>} to {@code target.<field>} when present and non-null. */
+    private void copyIfPresent(JsonNode source, String field, ObjectNode target) {
+        copyRenamed(source, field, target, field);
     }
 
     private String mapSamAttributeType(String samType) {

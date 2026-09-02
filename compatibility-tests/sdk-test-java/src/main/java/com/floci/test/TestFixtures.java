@@ -26,9 +26,12 @@ import software.amazon.awssdk.services.lambda.LambdaClient;
 import software.amazon.awssdk.services.opensearch.OpenSearchClient;
 import software.amazon.awssdk.services.neptune.NeptuneClient;
 import software.amazon.awssdk.services.rds.RdsClient;
+import software.amazon.awssdk.services.redshift.RedshiftClient;
 import software.amazon.awssdk.services.guardduty.GuardDutyClient;
 import software.amazon.awssdk.services.fis.FisClient;
+import software.amazon.awssdk.services.organizations.OrganizationsClient;
 import software.amazon.awssdk.services.rum.RumClient;
+import software.amazon.awssdk.services.resourceexplorer2.ResourceExplorer2Client;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.endpoints.Endpoint;
 import software.amazon.awssdk.services.s3control.S3ControlClient;
@@ -37,6 +40,7 @@ import software.amazon.awssdk.services.secretsmanager.SecretsManagerClient;
 import software.amazon.awssdk.services.ses.SesClient;
 import software.amazon.awssdk.services.sesv2.SesV2Client;
 import software.amazon.awssdk.services.sfn.SfnClient;
+import software.amazon.awssdk.services.signin.SigninClient;
 import software.amazon.awssdk.services.swf.SwfClient;
 import software.amazon.awssdk.services.sns.SnsClient;
 import software.amazon.awssdk.services.sqs.SqsClient;
@@ -57,6 +61,8 @@ import software.amazon.awssdk.services.apigatewayv2.ApiGatewayV2Client;
 import software.amazon.awssdk.services.elasticache.ElastiCacheClient;
 import software.amazon.awssdk.services.elasticbeanstalk.ElasticBeanstalkClient;
 import software.amazon.awssdk.services.acm.AcmClient;
+import software.amazon.awssdk.services.amp.AmpClient;
+import software.amazon.awssdk.services.efs.EfsClient;
 import software.amazon.awssdk.services.ec2.Ec2Client;
 import software.amazon.awssdk.services.ecr.EcrClient;
 import software.amazon.awssdk.services.bedrockagentcore.BedrockAgentCoreClient;
@@ -259,6 +265,14 @@ public final class TestFixtures {
                 .build();
     }
 
+    public static OrganizationsClient organizationsClient() {
+        return OrganizationsClient.builder()
+                .endpointOverride(ENDPOINT)
+                .region(REGION)
+                .credentialsProvider(CREDENTIALS)
+                .build();
+    }
+
     public static SsmClient ssmClient() {
         return SsmClient.builder()
                 .endpointOverride(ENDPOINT)
@@ -277,6 +291,14 @@ public final class TestFixtures {
 
     public static SnsClient snsClient() {
         return SnsClient.builder()
+                .endpointOverride(ENDPOINT)
+                .region(REGION)
+                .credentialsProvider(CREDENTIALS)
+                .build();
+    }
+
+    public static SigninClient signinClient() {
+        return SigninClient.builder()
                 .endpointOverride(ENDPOINT)
                 .region(REGION)
                 .credentialsProvider(CREDENTIALS)
@@ -488,6 +510,14 @@ public final class TestFixtures {
 
     public static SecretsManagerClient secretsManagerClient() {
         return SecretsManagerClient.builder()
+                .endpointOverride(ENDPOINT)
+                .region(REGION)
+                .credentialsProvider(CREDENTIALS)
+                .build();
+    }
+
+    public static AmpClient ampClient() {
+        return AmpClient.builder()
                 .endpointOverride(ENDPOINT)
                 .region(REGION)
                 .credentialsProvider(CREDENTIALS)
@@ -945,6 +975,23 @@ public final class TestFixtures {
                 .build();
     }
 
+    public static ResourceExplorer2Client resourceExplorer2Client() {
+        return resourceExplorer2Client(REGION);
+    }
+
+    /**
+     * Resource Explorer 2 client bound to an explicit region. The emulator auto-provisions an
+     * index only in the default region, so CreateIndex/DeleteIndex tests use a different region
+     * to exercise a real create against a region that starts with no index.
+     */
+    public static ResourceExplorer2Client resourceExplorer2Client(Region region) {
+        var builder = ResourceExplorer2Client.builder().region(region);
+        if (!isRealAws()) {
+            builder.endpointOverride(ENDPOINT).credentialsProvider(CREDENTIALS);
+        }
+        return builder.build();
+    }
+
     public static AppSyncClient appSyncClient() {
         return AppSyncClient.builder()
                 .endpointOverride(ENDPOINT)
@@ -971,6 +1018,22 @@ public final class TestFixtures {
 
     public static S3TablesClient s3tablesClient() {
         return S3TablesClient.builder()
+                .endpointOverride(ENDPOINT)
+                .region(REGION)
+                .credentialsProvider(CREDENTIALS)
+                .build();
+    }
+
+    public static EfsClient efsClient() {
+        return EfsClient.builder()
+                .endpointOverride(ENDPOINT)
+                .region(REGION)
+                .credentialsProvider(CREDENTIALS)
+                .build();
+    }
+
+    public static RedshiftClient redshiftClient() {
+        return RedshiftClient.builder()
                 .endpointOverride(ENDPOINT)
                 .region(REGION)
                 .credentialsProvider(CREDENTIALS)

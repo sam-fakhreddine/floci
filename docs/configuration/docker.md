@@ -140,6 +140,20 @@ Extra labels are a list of key/value entries rather than a map so that label key
 !!! note
     Entries using one of the reserved keys (`floci`, `floci_emulator`, `floci_namespace`) are ignored with a warning — user configuration can never break Floci's own container discovery and volume pruning.
 
+### Resource Identity Labels
+
+A container backing an emulated AWS resource also carries labels tying it back to that resource, additive to the labels above:
+
+| Label | Value | Purpose |
+|---|---|---|
+| `io.floci` | `aws` | Cloud provider, for multi-cloud discovery when several Floci-like emulators share a host |
+| `io.floci.service` | e.g. `rds` | The AWS service the container backs |
+| `io.floci.resource-id` | e.g. `orders-db-primary` | The resource's identifier (DB instance identifier, cluster name, function name, ...) |
+| `io.floci.account` | the resolved account id | The AWS account the resource belongs to |
+| `io.floci.region` | the resolved region | The AWS region the resource belongs to |
+
+This makes `docker ps --filter label=io.floci.resource-id=orders-db-primary` resolve a specific emulated resource to its backing container directly, without inferring it from names or creation order. Applied to RDS, DocDB, ElastiCache (Redis/Valkey and Memcached), MemoryDB, Neptune, MSK, OpenSearch, ECS, EKS, AmazonMQ, MWAA, Kinesis Data Analytics (Flink), Batch, CodeBuild, Lambda, and EC2. ECR's backing registry container carries every label except `io.floci.resource-id`, since it is a shared singleton with no single resource identifier.
+
 ## Docker Network
 
 Containers spawned by Floci (Lambda, RDS, ElastiCache, OpenSearch, MSK, ECS) need to be on the same Docker network to communicate with each other and with Floci itself.
@@ -200,7 +214,7 @@ What each setting does and why it is needed:
 !!! tip "When the Runtime API address is still unreachable"
     On some Podman network topologies the auto-detected Runtime API address
     (the host/IP Lambda containers use to call back into Floci) is still wrong,
-    and invocations fail with `connect ECONNREFUSED <ip>:9200`. Set the address
+    and invocations fail with `connect ECONNREFUSED <ip>:12000`. Set the address
     explicitly to bypass auto-detection:
 
     ```bash
@@ -211,6 +225,12 @@ What each setting does and why it is needed:
     given host (here the `FLOCI_HOSTNAME` value), skipping Floci's
     auto-detection entirely. See the [Lambda docs](../services/lambda.md#configuration)
     for details.
+
+## Transient I/O retry
+
+All of Floci's short-lived docker calls (create/start/inspect/remove container, volume management, image operations) travel one shared daemon socket, and under fan-out load the daemon occasionally drops a connection mid-call with `java.io.IOException: Broken pipe`. Floci retries these transient failures centrally, at the docker transport layer — up to 6 attempts with a capped exponential backoff (500ms base, 8s cap) — so every call site is covered without per-call configuration, and a genuine daemon rejection (a 4xx, a name conflict) still surfaces immediately.
+
+A request is only replayed when doing so cannot change semantics: requests carrying a one-shot upload stream (e.g. copying an archive into a container), bidirectional attach streams, and `exec` requests (which would re-run the command) are never retried. Long-lived streaming connections (log follow, exec output) use a separate transport that does not retry at all.
 
 ## Full Reference
 

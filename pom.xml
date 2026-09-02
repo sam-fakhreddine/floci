@@ -6,7 +6,7 @@
 
     <groupId>io.github.hectorvent</groupId>
     <artifactId>floci</artifactId>
-    <version>1.7.0</version>
+    <version>2.0.1</version>
     <packaging>jar</packaging>
 
     <name>Floci</name>
@@ -18,6 +18,7 @@
         <quarkus.platform.version>3.37.4</quarkus.platform.version>
         <jackson.version>2.22.1</jackson.version>
         <apicurio.version>2.6.13.Final</apicurio.version>
+        <everit.json.schema.version>1.14.6</everit.json.schema.version>
         <wire.version>6.4.5</wire.version>
     </properties>
 
@@ -187,6 +188,25 @@
             <artifactId>dec</artifactId>
             <version>0.1.2</version>
         </dependency>
+        <!-- Archive handling that preserves unix file modes (CodeBuild/CodePipeline artifacts,
+             docker tar streams) -->
+        <dependency>
+            <groupId>org.apache.commons</groupId>
+            <artifactId>commons-compress</artifactId>
+        </dependency>
+        <!-- commons-compress 1.28.0 optionally depends on org.tukaani:xz (not pulled
+             transitively, since Maven never resolves an "optional=true" dependency of a
+             dependency); GraalVM native image's static analysis reaches XZ-support classes
+             via commons-compress's CompressorStreamFactory service registration regardless of
+             whether Floci ever reads/writes .xz archives, and needs to resolve the type at
+             bytecode-parse time, a link-time step that initialize-at-run-time cannot defer,
+             so the jar has to actually be on the classpath, same as the org.brotli:dec case
+             above. -->
+        <dependency>
+            <groupId>org.tukaani</groupId>
+            <artifactId>xz</artifactId>
+            <version>1.10</version>
+        </dependency>
 
         <!-- BouncyCastle for X.509 certificate generation and PEM handling (ACM service) -->
         <dependency>
@@ -257,7 +277,24 @@
                     <groupId>io.apicurio</groupId>
                     <artifactId>apicurio-common-app-components-logging</artifactId>
                 </exclusion>
+                <!-- Apicurio asks for the JSON schema library under its JitPack coordinate
+                     (com.github.everit-org.json-schema), which has never been published to Maven
+                     Central. Resolving it needs a JitPack repository, so a clone with a cold
+                     ~/.m2 fails to build. Replaced below with the same library under the
+                     coordinate its author publishes to Central. -->
+                <exclusion>
+                    <groupId>com.github.everit-org.json-schema</groupId>
+                    <artifactId>org.everit.json.schema</artifactId>
+                </exclusion>
             </exclusions>
+        </dependency>
+        <!-- The same project as com.github.everit-org.json-schema, rehomed by its author to a
+             Central-published coordinate: identical org.everit.json.schema packages, so apicurio's
+             JsonSchemaCompatibilityChecker and JsonSchemaContentValidator load unchanged. -->
+        <dependency>
+            <groupId>com.github.erosb</groupId>
+            <artifactId>everit-json-schema</artifactId>
+            <version>${everit.json.schema.version}</version>
         </dependency>
         <dependency>
             <groupId>io.apicurio</groupId>
