@@ -5,6 +5,9 @@ import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.Resettable;
+import io.github.hectorvent.floci.core.resource.ExplorerResource;
+import io.github.hectorvent.floci.core.resource.ResourceProvider;
+import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
@@ -51,12 +54,14 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 
 @ApplicationScoped
-public class SnsService implements Resettable {
+public class SnsService implements Resettable, ResourceProvider {
 
     private static final Logger LOG = Logger.getLogger(SnsService.class);
     private static final Duration FIFO_DEDUP_WINDOW = Duration.ofMinutes(5);
     private static final int MAX_PUBLISH_SIZE = 262_144;
     private static final int PUSH_CAPTURE_LIMIT = 1000;
+    private static final String CONTROL_TOWER_AGGREGATE_SECURITY_TOPIC =
+            "aws-controltower-AggregateSecurityNotifications";
     private static final List<String> PENDING_CONFIRMATION_PROTOCOLS =
             List.of("http", "https", "email", "email-json", "sms");
     /** Mobile-push platforms Floci mocks. iOS and Android only — anything else is rejected. */
@@ -218,6 +223,10 @@ public class SnsService implements Resettable {
         return topicStore.scan(k -> k.startsWith(prefix));
     }
 
+    public boolean topicExists(String topicArn, String region) {
+        return topicStore.get(topicKey(region, topicArn)).isPresent();
+    }
+
     public Map<String, String> getTopicAttributes(String topicArn, String region) {
         String key = topicKey(region, topicArn);
         Topic topic = topicStore.get(key)
@@ -255,7 +264,7 @@ public class SnsService implements Resettable {
 
     public Subscription subscribe(String topicArn, String protocol, String endpoint, String region, Map<String, String> attributes) {
         String topicKey = topicKey(region, topicArn);
-        if (topicStore.get(topicKey).isEmpty()) {
+        if (topicStore.get(topicKey).isEmpty() && !ensureControlTowerManagedTopic(topicArn, region)) {
             throw new AwsException("NotFound", "Topic does not exist.", 404);
         }
         if (protocol == null || protocol.isBlank()) {
@@ -301,6 +310,16 @@ public class SnsService implements Resettable {
         }
 
         return subscription;
+    }
+
+    private boolean ensureControlTowerManagedTopic(String topicArn, String region) {
+        String expectedArn = regionResolver.buildArn(
+                "sns", region, CONTROL_TOWER_AGGREGATE_SECURITY_TOPIC);
+        if (!expectedArn.equals(topicArn)) {
+            return false;
+        }
+        createTopic(CONTROL_TOWER_AGGREGATE_SECURITY_TOPIC, Map.of(), Map.of(), region);
+        return true;
     }
 
     public String confirmSubscription(String topicArn, String token, String region) {
@@ -416,7 +435,8 @@ public class SnsService implements Resettable {
             if (dedupId == null && "true".equals(topic.getAttributes().get("ContentBasedDeduplication"))) {
                 dedupId = sha256(message);
             }
-            if (dedupId != null && isDuplicate(effectiveArn, dedupId)) {
+            if (dedupId != null && isDuplicate(effectiveArn, messageGroupId, dedupId,
+                    isGroupScopedDeduplication(topic))) {
                 LOG.debugv("FIFO dedup: skipping duplicate for topic {0}, dedupId {1}", effectiveArn, dedupId);
                 return UUID.randomUUID().toString();
             }
@@ -822,6 +842,7 @@ public class SnsService implements Resettable {
         }
 
         boolean isFifo = "true".equals(topic.getAttributes().get("FifoTopic"));
+        boolean groupScopedDedup = isGroupScopedDeduplication(topic);
         List<String[]> successful = new ArrayList<>();
         List<String[]> failed = new ArrayList<>();
         for (Map<String, Object> entry : entries) {
@@ -852,7 +873,8 @@ public class SnsService implements Resettable {
             if (isFifo && messageDeduplicationId == null && "true".equals(topic.getAttributes().get("ContentBasedDeduplication"))) {
                 messageDeduplicationId = sha256(message);
             }
-            if (isFifo && messageDeduplicationId != null && isDuplicate(topicArn, messageDeduplicationId)) {
+            if (isFifo && messageDeduplicationId != null && isDuplicate(topicArn, messageGroupId,
+                    messageDeduplicationId, groupScopedDedup)) {
                 successful.add(new String[]{id, UUID.randomUUID().toString()});
                 continue;
             }
@@ -901,6 +923,29 @@ public class SnsService implements Resettable {
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException",
                         "Resource does not exist.", 404));
         return new java.util.LinkedHashMap<>(topic.getTags());
+    }
+
+    @Override
+    public List<ExplorerResource> getResources() {
+        List<ExplorerResource> resources = new ArrayList<>();
+        for (Topic topic : topicStore.scan(k -> true)) {
+            String arn = topic.getTopicArn();
+            if (arn == null) {
+                continue;
+            }
+            AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
+            resources.add(new ExplorerResource(
+                    arn, "sns:topic", "sns",
+                    parsed.region(), parsed.accountId(),
+                    topic.getCreatedAt() != null ? topic.getCreatedAt() : Instant.now(),
+                    topic.getTags() != null ? topic.getTags() : Map.of()));
+        }
+        return resources;
+    }
+
+    @Override
+    public Set<SupportedResourceType> getSupportedResourceTypes() {
+        return Set.of(new SupportedResourceType("sns:topic", "sns", true));
     }
 
     /**
@@ -1210,8 +1255,23 @@ public class SnsService implements Resettable {
         return true;
     }
 
-    private boolean isDuplicate(String topicArn, String deduplicationId) {
-        String cacheKey = topicArn + ":" + deduplicationId;
+    /**
+     * {@code MessageGroup} narrows deduplication to a single message group. {@code Topic}, the AWS
+     * default, keeps it topic-wide.
+     */
+    private static boolean isGroupScopedDeduplication(Topic topic) {
+        return "MessageGroup".equalsIgnoreCase(topic.getAttributes().get("FifoThroughputScope"));
+    }
+
+    private boolean isDuplicate(String topicArn, String messageGroupId, String deduplicationId,
+                                boolean groupScoped) {
+        // The scope is part of the key: the attribute can change inside the deduplication window,
+        // and a topic-scoped id must never land on a group-scoped entry. The group is
+        // length-prefixed because nothing validates the characters in either id.
+        String scopedId = groupScoped
+                ? "group:" + messageGroupId.length() + ":" + messageGroupId + deduplicationId
+                : "topic:" + deduplicationId;
+        String cacheKey = topicArn + ":" + scopedId;
         Instant now = Instant.now();
         Instant existing = fifoDeduplicationCache.get(cacheKey);
         if (existing != null && existing.plus(FIFO_DEDUP_WINDOW).isAfter(now)) {

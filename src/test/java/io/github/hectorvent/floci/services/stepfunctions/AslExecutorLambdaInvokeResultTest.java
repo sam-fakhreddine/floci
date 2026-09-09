@@ -86,9 +86,12 @@ class AslExecutorLambdaInvokeResultTest {
                 mock(S3Service.class),
                 mock(io.github.hectorvent.floci.services.ecs.EcsService.class),
                 mock(io.github.hectorvent.floci.services.ecs.EcsJsonHandler.class),
+                mock(io.github.hectorvent.floci.services.eventbridge.EventBridgeHandler.class),
+                mock(io.github.hectorvent.floci.services.scheduler.SchedulerService.class),
+                mock(io.github.hectorvent.floci.services.scheduler.SchedulerController.class),
                 objectMapper,
                 new JsonataEvaluator(objectMapper),
-                mock(Instance.class), mock(EmulatorConfig.class), vertx);
+                mock(Instance.class), mock(EmulatorConfig.class), vertx, null);
     }
 
     @Test
@@ -165,6 +168,33 @@ class AslExecutorLambdaInvokeResultTest {
         assertEquals("RET", output.path("lambda").path("marker").asText());
         assertEquals(200, output.path("lambda").path("status").asInt());
         assertEquals(1, output.path("in").asInt());
+    }
+
+    @Test
+    void resultSelectorUnwrapsPayloadWhenFunctionNameIsABareName() throws Exception {
+        // Scenario (c) of issue #2544: the function is referenced by its bare name and the
+        // documented "$.Payload" selector must reach the function output, not resolve to null.
+        Execution execution = run("""
+                {
+                  "StartAt": "T",
+                  "States": {
+                    "T": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {"FunctionName": "%s", "Payload.$": "$"},
+                      "ResultSelector": {"unwrapped.$": "$.Payload"},
+                      "End": true
+                    }
+                  }
+                }
+                """.formatted(FUNCTION_NAME));
+
+        assertEquals("SUCCEEDED", execution.getStatus());
+        JsonNode output = objectMapper.readTree(execution.getOutput());
+        assertTrue(output.path("unwrapped").isObject(), "$.Payload must resolve to the function output");
+        assertEquals("RET", output.path("unwrapped").path("marker").asText());
+        assertEquals(1, output.path("unwrapped").path("echo").path("in").asInt());
+        assertEquals(1, output.size());
     }
 
     @Test

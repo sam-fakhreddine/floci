@@ -35,7 +35,7 @@ class ApiGatewayExecuteControllerTest {
         return new ApiGatewayExecuteController(
                 null, null, null,
                 regionResolver, objectMapper, null,
-                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null);
+                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null);
     }
 
     @Test
@@ -58,6 +58,22 @@ class ApiGatewayExecuteControllerTest {
                 "GET /users/{user}/orders/{order}", "/users/u-1/orders/o-2");
         assertEquals("u-1", p.get("user"));
         assertEquals("o-2", p.get("order"));
+    }
+
+    @Test
+    void capturesNamedParamsContainingUnderscores() {
+        Map<String, String> p = ApiGatewayExecuteController.extractV2PathParams(
+                "GET /api/v1/key-ids/{key_id}/jobs/{job_id}",
+                "/api/v1/key-ids/key-123/jobs/job-456");
+        assertEquals("key-123", p.get("key_id"));
+        assertEquals("job-456", p.get("job_id"));
+    }
+
+    @Test
+    void capturesNamedParamsContainingDigits() {
+        Map<String, String> p = ApiGatewayExecuteController.extractV2PathParams(
+                "GET /items/{item1}", "/items/value-1");
+        assertEquals("value-1", p.get("item1"));
     }
 
     @Test
@@ -235,7 +251,7 @@ class ApiGatewayExecuteControllerTest {
         ApiGatewayExecuteController controller = new ApiGatewayExecuteController(
                 apiGatewayService, apiGatewayV2Service, null,
                 regionResolver, new ObjectMapper(), null,
-                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null);
+                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null);
 
         Response response = controller.dispatch("GET", "abc123", "prod", "hello", headers, null, null);
 
@@ -265,7 +281,7 @@ class ApiGatewayExecuteControllerTest {
         ApiGatewayExecuteController controller = new ApiGatewayExecuteController(
                 apiGatewayService, apiGatewayV2Service, null,
                 regionResolver, new ObjectMapper(), null,
-                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null);
+                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null);
 
         controller.dispatch("GET", "abc123", "prod", "hello", headers, null, null);
 
@@ -299,7 +315,7 @@ class ApiGatewayExecuteControllerTest {
         ApiGatewayExecuteController controller = new ApiGatewayExecuteController(
                 apiGatewayService, apiGatewayV2Service, null,
                 regionResolver, new ObjectMapper(), null,
-                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null);
+                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null);
 
         controller.dispatch("GET", "restapi1", "prod", "hello", headers, null, null);
 

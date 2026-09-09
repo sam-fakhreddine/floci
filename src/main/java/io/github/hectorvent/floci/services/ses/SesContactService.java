@@ -12,15 +12,19 @@ import io.github.hectorvent.floci.services.ses.model.TopicPreference;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
+import io.github.hectorvent.floci.services.ses.model.ListManagementOptions;
 
 import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.function.UnaryOperator;
 import java.util.Set;
 import java.util.regex.Pattern;
 
@@ -31,9 +35,9 @@ import java.util.regex.Pattern;
  * <p>New facet: a multi-store domain — one service owns both stores and the locks that serialize
  * them (contact create/update against contact-list deletion), collapsing two SesService constructor
  * arguments into one. It also owns the list-management contact behaviour used during a send
- * ({@link #getOrAutoCreateContact}, {@link #isListManagementOptedOut}, {@link #unsubscribeContact});
- * the facade's send orchestration ({@code collectListManagementOptOuts}) stays in {@link SesService}
- * and calls into this service, keeping the shared {@code extractEmailAddress} send helper there.
+ * ({@link #getOrAutoCreateContact}, {@link #isListManagementOptedOut}, {@link #unsubscribeContact}),
+ * including {@link #collectListManagementOptOuts}, which resolves a send's opted-out recipients
+ * with the facade's address extractor injected as a callback.
  */
 @ApplicationScoped
 public class SesContactService {
@@ -77,6 +81,7 @@ public class SesContactService {
     public ContactList createContactList(String name, String description, List<Topic> topics,
                                          List<Tag> tags, String region) {
         validateContactListInput(name, description, topics);
+        SesTags.validate(tags);
         ContactList list = new ContactList(name);
         list.setDescription(description);
         list.setTopics(topics);
@@ -102,6 +107,48 @@ public class SesContactService {
     public ContactList getContactList(String name, String region) {
         return contactListStore.get(contactListKey(region, name))
                 .orElseThrow(() -> contactListNotFound(name));
+    }
+
+    public List<Tag> listTags(String name, String region) {
+        ContactList list = contactListStore.get(contactListKey(region, name))
+                .orElseThrow(() -> tagTargetNotFound(name));
+        return new ArrayList<>(list.getTags());
+    }
+
+    /**
+     * Merges the incoming tags into the stored list. The lookup and write share the mutation lock
+     * used by deletion, so tagging can't resurrect a concurrently deleted list or overwrite a
+     * concurrent mutation with a stale object.
+     */
+    public void tag(String name, String region, List<Tag> newTags) {
+        String key = contactListKey(region, name);
+        synchronized (contactMutationLock) {
+            ContactList list = contactListStore.get(key).orElseThrow(() -> tagTargetNotFound(name));
+            list.setTags(SesTags.merge(list.getTags(), newTags));
+            contactListStore.put(key, list);
+        }
+        LOG.infov("Tagged SES contact list: {0} in region {1} (+{2} tags)", name, region, newTags.size());
+    }
+
+    public void untag(String name, String region, List<String> tagKeys) {
+        String key = contactListKey(region, name);
+        synchronized (contactMutationLock) {
+            ContactList list = contactListStore.get(key).orElseThrow(() -> tagTargetNotFound(name));
+            Set<String> toRemove = new HashSet<>(tagKeys);
+            // Copy-on-write: the stored list may be immutable, and unlocked readers iterate it.
+            List<Tag> remaining = new ArrayList<>(list.getTags());
+            remaining.removeIf(t -> toRemove.contains(t.key()));
+            list.setTags(remaining);
+            contactListStore.put(key, list);
+        }
+        LOG.infov("Untagged SES contact list: {0} in region {1} (-{2} keys)", name, region, tagKeys.size());
+    }
+
+    private static AwsException tagTargetNotFound(String name) {
+        // The tag endpoints use AWS's "No ContactList present with name" wording
+        // (probe-confirmed), unlike the CRUD "List with name: X doesn't exist."
+        return new AwsException("NotFoundException",
+                "No ContactList present with name: " + name, 404);
     }
 
     public List<ContactList> listContactLists(String region) {
@@ -579,5 +626,53 @@ public class SesContactService {
             prefs.add(new TopicPreference(topicName, status));
         }
         contact.setTopicPreferences(prefs);
+    }
+
+    /**
+     * Resolves the recipients suppressed by SES V2 {@code SendEmail} {@code ListManagementOptions}:
+     * for each envelope recipient that is opted out of the named contact list (or the given topic),
+     * returns a {@code BOUNCE} suppression reason so the shared send path drops the recipient from
+     * the relay and publishes a Bounce event, matching AWS ("SES will issue a bounce event for a
+     * message that is sent to an unsubscribed contact"). Returns an empty map when no
+     * {@code ListManagementOptions} was supplied. The display-name stripping is the facade's shared
+     * send helper, injected as {@code addressExtractor} so this service stays free of facade
+     * dependencies. Throws when the contact list does not exist, so a
+     * bad reference fails the whole send. A recipient that is not yet a contact is created
+     * automatically (matching AWS), then evaluated like any other contact.
+     */
+    public Map<String, String> collectListManagementOptOuts(Collection<String> addresses,
+                                                            ListManagementOptions listManagement, String region,
+                                                            UnaryOperator<String> addressExtractor) {
+        Objects.requireNonNull(addressExtractor, "addressExtractor is required");
+        if (listManagement == null || listManagement.contactListName() == null
+                || listManagement.contactListName().isBlank() || addresses == null || addresses.isEmpty()) {
+            return Map.of();
+        }
+        ContactList list = getContactList(listManagement.contactListName(), region);
+        String topicName = listManagement.topicName();
+        String effectiveTopic = (topicName == null || topicName.isBlank()) ? null : topicName;
+        // Fail fast on a topic that isn't defined on the list rather than silently skipping
+        // suppression (a typo would otherwise send to everyone). AWS does not document this, so the
+        // exact error is best-effort.
+        if (effectiveTopic != null && defaultTopicStatus(list, effectiveTopic) == null) {
+            throw new AwsException("BadRequestException",
+                    "Topic " + effectiveTopic + " does not exist in contact list "
+                            + list.getContactListName() + ".", 400);
+        }
+        Map<String, String> optOuts = new LinkedHashMap<>();
+        for (String address : addresses) {
+            if (address == null || address.isBlank() || optOuts.containsKey(address)) {
+                continue;
+            }
+            String email = addressExtractor.apply(address);
+            if (email == null || email.isBlank()) {
+                continue;
+            }
+            Contact contact = getOrAutoCreateContact(list, email, region);
+            if (isListManagementOptedOut(contact, list, effectiveTopic)) {
+                optOuts.put(address, "BOUNCE");
+            }
+        }
+        return optOuts;
     }
 }

@@ -25,6 +25,7 @@ public class Bucket {
     private String transitionDefaultMinimumObjectSize; // x-amz-transition-default-minimum-object-size header value
     private String acl; // XML representation or JSON stub
     private String encryptionConfiguration; // XML string
+    private String replicationConfiguration; // XML string
     private String publicAccessBlockConfiguration; // XML string
     private String ownershipControlsConfiguration; // XML string
     private String requestPaymentPayer; // "BucketOwner" (default) or "Requester"; null until first PUT
@@ -33,6 +34,12 @@ public class Bucket {
     private WebsiteConfiguration websiteConfiguration;
     /** CloudWatch request metrics configurations, keyed by the id they were stored under. */
     private Map<String, String> metricsConfigurations;
+    /** Intelligent-Tiering configurations, keyed by the id they were stored under. */
+    private Map<String, String> intelligentTieringConfigurations;
+    /** Storage class analysis configurations, keyed by the id they were stored under. */
+    private Map<String, String> analyticsConfigurations;
+    /** Inventory configurations, keyed by the id they were stored under. */
+    private Map<String, String> inventoryConfigurations;
 
     public Bucket() {
         this.tags = new HashMap<>();
@@ -98,6 +105,9 @@ public class Bucket {
     public String getEncryptionConfiguration() { return encryptionConfiguration; }
     public void setEncryptionConfiguration(String encryptionConfiguration) { this.encryptionConfiguration = encryptionConfiguration; }
 
+    public String getReplicationConfiguration() { return replicationConfiguration; }
+    public void setReplicationConfiguration(String replicationConfiguration) { this.replicationConfiguration = replicationConfiguration; }
+
     public String getPublicAccessBlockConfiguration() { return publicAccessBlockConfiguration; }
     public void setPublicAccessBlockConfiguration(String publicAccessBlockConfiguration) {
         this.publicAccessBlockConfiguration = publicAccessBlockConfiguration;
@@ -107,6 +117,7 @@ public class Bucket {
     public void setOwnershipControlsConfiguration(String ownershipControlsConfiguration) {
         this.ownershipControlsConfiguration = ownershipControlsConfiguration;
     }
+
 
     public String getRequestPaymentPayer() { return requestPaymentPayer; }
     public void setRequestPaymentPayer(String requestPaymentPayer) { this.requestPaymentPayer = requestPaymentPayer; }
@@ -122,4 +133,19 @@ public class Bucket {
 
     public Map<String, String> getMetricsConfigurations() { return metricsConfigurations; }
     public void setMetricsConfigurations(Map<String, String> metricsConfigurations) { this.metricsConfigurations = metricsConfigurations; }
+
+    public Map<String, String> getIntelligentTieringConfigurations() { return intelligentTieringConfigurations; }
+    public void setIntelligentTieringConfigurations(Map<String, String> intelligentTieringConfigurations) {
+        this.intelligentTieringConfigurations = intelligentTieringConfigurations;
+    }
+
+    public Map<String, String> getAnalyticsConfigurations() { return analyticsConfigurations; }
+    public void setAnalyticsConfigurations(Map<String, String> analyticsConfigurations) {
+        this.analyticsConfigurations = analyticsConfigurations;
+    }
+
+    public Map<String, String> getInventoryConfigurations() { return inventoryConfigurations; }
+    public void setInventoryConfigurations(Map<String, String> inventoryConfigurations) {
+        this.inventoryConfigurations = inventoryConfigurations;
+    }
 }

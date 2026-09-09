@@ -34,9 +34,14 @@ import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Predicate;
+import io.github.hectorvent.floci.core.resource.ExplorerResource;
+import io.github.hectorvent.floci.core.resource.ResourceProvider;
+import io.github.hectorvent.floci.core.resource.SupportedResourceType;
+import java.util.LinkedHashMap;
+import java.util.Set;
 
 @ApplicationScoped
-public class SecretsManagerService {
+public class SecretsManagerService implements ResourceProvider {
 
     private static final Logger LOG = Logger.getLogger(SecretsManagerService.class);
 
@@ -99,7 +104,13 @@ public class SecretsManagerService {
         String storageKey = regionKey(region, name);
         Secret existing = store.get(storageKey).orElse(null);
 
-        if (existing != null && existing.getDeletedDate() == null) {
+        if (existing != null) {
+            // A name inside its recovery window is still taken: the secret is recoverable via
+            // RestoreSecret, so reusing the name has to be refused rather than allowed to
+            // overwrite it. Without this the create would replace the stored secret at the same
+            // key AND clear its deletedDate, so the original value became unrecoverable and
+            // RestoreSecret then reported "was not deleted" - silent data loss.
+            throwIfPendingDeletion(existing);
             throw new AwsException("ResourceExistsException",
                     "A secret with the name " + name + " already exists.", 400);
         }
@@ -138,11 +149,7 @@ public class SecretsManagerService {
 
     public SecretVersion getSecretValue(String secretId, String versionId, String versionStage, String region) {
         Secret secret = resolveSecret(secretId, region);
-
-        if (secret.getDeletedDate() != null) {
-            throw new AwsException("ResourceNotFoundException",
-                    "Secrets Manager can't find the specified secret.", 400);
-        }
+        throwIfPendingDeletion(secret);
 
         SecretVersion version;
         if (versionId != null && !versionId.isEmpty()) {
@@ -178,118 +185,115 @@ public class SecretsManagerService {
                                         String secretBinary, String clientRequestToken, String region,
                                         List<String> versionStages) {
         Secret secret = resolveSecret(secretId, region);
-
-        if (secret.getDeletedDate() != null) {
-            throw new AwsException("ResourceNotFoundException",
-                    "Secrets Manager can't find the specified secret.", 400);
-        }
+        throwIfPendingDeletion(secret);
 
         if (clientRequestToken != null && (clientRequestToken.length() < 32 || clientRequestToken.length() > 64)) {
             throw new AwsException("InvalidParameterException", "ClientRequestToken must be between 32 and 64 characters long.", 400);
         }
 
-        if (clientRequestToken != null && secret.getVersions() != null && secret.getVersions().containsKey(clientRequestToken)) {
-            SecretVersion existingVersion = secret.getVersions().get(clientRequestToken);
-            boolean isPendingPlaceholder = existingVersion.getSecretString() == null
-                    && existingVersion.getSecretBinary() == null
-                    && existingVersion.getVersionStages() != null
-                    && existingVersion.getVersionStages().contains("AWSPENDING");
-            if (!isPendingPlaceholder) {
-                if (!Objects.equals(existingVersion.getSecretString(), secretString) ||
-                    !Objects.equals(existingVersion.getSecretBinary(), secretBinary)) {
-                    throw new AwsException("ResourceExistsException",
-                        "You can't use ClientRequestToken " + clientRequestToken
-                            + " because that value is already in use for a version of secret " + secret.getArn(), 400);
+        synchronized (lockFor(secret.getArn())) {
+            if (clientRequestToken != null && secret.getVersions() != null && secret.getVersions().containsKey(clientRequestToken)) {
+                SecretVersion existingVersion = secret.getVersions().get(clientRequestToken);
+                boolean isPendingPlaceholder = existingVersion.getSecretString() == null
+                        && existingVersion.getSecretBinary() == null
+                        && existingVersion.getVersionStages() != null
+                        && existingVersion.getVersionStages().contains("AWSPENDING");
+                if (!isPendingPlaceholder) {
+                    if (!Objects.equals(existingVersion.getSecretString(), secretString) ||
+                        !Objects.equals(existingVersion.getSecretBinary(), secretBinary)) {
+                        throw new AwsException("ResourceExistsException",
+                            "You can't use ClientRequestToken " + clientRequestToken
+                                + " because that value is already in use for a version of secret " + secret.getArn(), 400);
+                    }
+                    return existingVersion;
                 }
-                return existingVersion;
             }
-        }
 
-        Instant now = Instant.now();
-        String newVersionId = clientRequestToken != null ? clientRequestToken : UUID.randomUUID().toString();
+            Instant now = Instant.now();
+            String newVersionId = clientRequestToken != null ? clientRequestToken : UUID.randomUUID().toString();
 
-        List<String> stages;
-        if (versionStages != null) {
-            if (versionStages.isEmpty() || versionStages.size() > 20) {
-                throw new AwsException("ValidationException", "Invalid length for parameter VersionStages", 400);
-            }
-            if (versionStages.stream()
-                    .anyMatch(stage -> stage == null
-                            || stage.isEmpty()
-                            || stage.length() > 256)) {
-                throw new AwsException("ValidationException", "Member must have length less than or equal to 256, Member must have length greater than or equal to 1", 400);
-            }
-            stages = versionStages;
-        } else {
-            stages = List.of(AWSCURRENT);
-        }
-
-        SecretVersion previousCurrent = stages.contains(AWSCURRENT) ? findVersionByStage(secret, AWSCURRENT) : null;
-
-        for (String stage : stages) {
-            SecretVersion version = findVersionByStage(secret, stage);
-            if (version == null) {
-                continue;
-            }
-            List<String> newStages = new ArrayList<>(version.getVersionStages());
-            // if stage is AWSCURRENT, the previous AWSCURRENT will become
-            // AWSPREVIOUS, and the previous AWSPREVIOUS will drop that stage
-            // name
-            if (stage.equals(AWSCURRENT)) {
-                SecretVersion previous = findVersionByStage(secret, AWSPREVIOUS);
-                if (previous != null) {
-                    List<String> oldPrevious = new ArrayList<>(previous.getVersionStages());
-                    oldPrevious.remove(AWSPREVIOUS);
-                    previous.setVersionStages(oldPrevious);
+            List<String> stages;
+            if (versionStages != null) {
+                if (versionStages.isEmpty() || versionStages.size() > 20) {
+                    throw new AwsException("ValidationException", "Invalid length for parameter VersionStages", 400);
                 }
-                newStages.add(AWSPREVIOUS);
+                if (versionStages.stream()
+                        .anyMatch(stage -> stage == null
+                                || stage.isEmpty()
+                                || stage.length() > 256)) {
+                    throw new AwsException("ValidationException", "Member must have length less than or equal to 256, Member must have length greater than or equal to 1", 400);
+                }
+                stages = versionStages;
+            } else {
+                stages = List.of(AWSCURRENT);
             }
-            newStages.remove(stage);
 
-            version.setVersionStages(newStages);
-        }
+            SecretVersion previousCurrent = stages.contains(AWSCURRENT) ? findVersionByStage(secret, AWSCURRENT) : null;
 
-        if (previousCurrent != null) {
-            for (SecretVersion version : secret.getVersions().values()) {
-                List<String> assignedStages = version.getVersionStages();
-                if (assignedStages == null || !assignedStages.contains(AWSPREVIOUS)) {
+            for (String stage : stages) {
+                SecretVersion version = findVersionByStage(secret, stage);
+                // A version carrying the id being written is replaced wholesale below, so moving
+                // the stage off it first would only leave that stage briefly unassigned to a
+                // reader, which is how a rotation loses track of its own AWSPENDING version.
+                if (version == null || newVersionId.equals(version.getVersionId())) {
                     continue;
                 }
-                List<String> newStages = new ArrayList<>(assignedStages);
-                newStages.removeIf(AWSPREVIOUS::equals);
+                List<String> newStages = new ArrayList<>(version.getVersionStages());
+                // if stage is AWSCURRENT, the previous AWSCURRENT will become
+                // AWSPREVIOUS, and the previous AWSPREVIOUS will drop that stage
+                // name
+                if (stage.equals(AWSCURRENT)) {
+                    SecretVersion previous = findVersionByStage(secret, AWSPREVIOUS);
+                    if (previous != null) {
+                        List<String> oldPrevious = new ArrayList<>(previous.getVersionStages());
+                        oldPrevious.remove(AWSPREVIOUS);
+                        previous.setVersionStages(oldPrevious);
+                    }
+                    newStages.add(AWSPREVIOUS);
+                }
+                newStages.remove(stage);
+
                 version.setVersionStages(newStages);
             }
 
-            List<String> newStages = new ArrayList<>(previousCurrent.getVersionStages());
-            newStages.add(AWSPREVIOUS);
-            previousCurrent.setVersionStages(newStages);
+            if (previousCurrent != null) {
+                for (SecretVersion version : secret.getVersions().values()) {
+                    List<String> assignedStages = version.getVersionStages();
+                    if (assignedStages == null || !assignedStages.contains(AWSPREVIOUS)) {
+                        continue;
+                    }
+                    List<String> newStages = new ArrayList<>(assignedStages);
+                    newStages.removeIf(AWSPREVIOUS::equals);
+                    version.setVersionStages(newStages);
+                }
+
+                List<String> newStages = new ArrayList<>(previousCurrent.getVersionStages());
+                newStages.add(AWSPREVIOUS);
+                previousCurrent.setVersionStages(newStages);
+            }
+
+            SecretVersion newVersion = new SecretVersion();
+            newVersion.setVersionId(newVersionId);
+            newVersion.setSecretString(secretString);
+            newVersion.setSecretBinary(secretBinary);
+            newVersion.setVersionStages(stages);
+            newVersion.setCreatedDate(now);
+
+            secret.getVersions().put(newVersionId, newVersion);
+            if (stages.contains(AWSCURRENT)) {
+                secret.setCurrentVersionId(newVersionId);
+            }
+            secret.setLastChangedDate(now);
+
+            store.put(regionKey(region, secret.getName()), secret);
+            LOG.infov("Put secret value for: {0}", secret.getName());
+            return newVersion;
         }
-
-        SecretVersion newVersion = new SecretVersion();
-        newVersion.setVersionId(newVersionId);
-        newVersion.setSecretString(secretString);
-        newVersion.setSecretBinary(secretBinary);
-        newVersion.setVersionStages(stages);
-        newVersion.setCreatedDate(now);
-
-        secret.getVersions().put(newVersionId, newVersion);
-        if (stages.contains(AWSCURRENT)) {
-            secret.setCurrentVersionId(newVersionId);
-        }
-        secret.setLastChangedDate(now);
-
-        store.put(regionKey(region, secret.getName()), secret);
-        LOG.infov("Put secret value for: {0}", secret.getName());
-        return newVersion;
     }
 
     public Secret updateSecret(String secretId, String description, String kmsKeyId, String region) {
         Secret secret = resolveSecret(secretId, region);
-
-        if (secret.getDeletedDate() != null) {
-            throw new AwsException("ResourceNotFoundException",
-                    "Secrets Manager can't find the specified secret.", 400);
-        }
+        throwIfPendingDeletion(secret);
 
         if (description != null) {
             secret.setDescription(description);
@@ -370,10 +374,7 @@ public class SecretsManagerService {
         Secret resolved = resolveSecret(secretId, region);
         synchronized (lockFor(resolved.getArn())) {
             Secret secret = resolveSecret(resolved.getArn(), region);
-            if (secret.getDeletedDate() != null) {
-                throw new AwsException("ResourceNotFoundException",
-                        "Secrets Manager can't find the specified secret.", 400);
-            }
+            throwIfPendingDeletion(secret);
 
             String existingOwner = secret.getTargetAttachmentOwner();
             if (existingOwner != null && !existingOwner.equals(attachmentOwner)) {
@@ -559,6 +560,13 @@ public class SecretsManagerService {
             return secret;
         }
 
+        // Guard placed AFTER the force-delete branch on purpose: force-deleting a secret that is
+        // already inside its recovery window is a legitimate "skip the window, remove it now"
+        // escape hatch, so only the scheduling path is refused. Re-scheduling an already-scheduled
+        // secret silently moved its DeletionDate, which would quietly extend a window a caller
+        // believed was already counting down.
+        throwIfPendingDeletion(secret);
+
         int windowDays = (recoveryWindowInDays != null) ? recoveryWindowInDays : defaultRecoveryWindowDays;
         Instant deletedDate = Instant.now().plusSeconds((long) windowDays * 86400);
         secret.setDeletedDate(deletedDate);
@@ -585,11 +593,7 @@ public class SecretsManagerService {
     public Secret rotateSecret(String secretId, String clientRequestToken, String rotationLambdaArn, Secret.RotationRules rotationRules,
                                boolean rotateImmediately, String region) {
         Secret secret = resolveSecret(secretId, region);
-
-        if (secret.getDeletedDate() != null) {
-            throw new AwsException("ResourceNotFoundException",
-                    "Secrets Manager can't find the specified secret.", 400);
-        }
+        throwIfPendingDeletion(secret);
 
         if (clientRequestToken != null && (clientRequestToken.length() < 32 || clientRequestToken.length() > 64)) {
             throw new AwsException("InvalidParameterException", "ClientRequestToken must be between 32 and 64 characters long.", 400);
@@ -678,14 +682,16 @@ public class SecretsManagerService {
     private void executeRotationLifecycle(String secretArn, String clientRequestToken, String lambdaArn, boolean rotateImmediately, boolean isExistingVersion, String region) {
         if (!rotateImmediately) {
             invokeRotationLambda(secretArn, clientRequestToken, lambdaArn, "testSecret", region);
-            
-            Secret refreshed = resolveSecret(secretArn, region);
-            SecretVersion pending = findVersionByStage(refreshed, "AWSPENDING");
-            if (pending != null) {
-                List<String> stages = new ArrayList<>(pending.getVersionStages());
-                stages.remove("AWSPENDING");
-                pending.setVersionStages(stages);
-                store.put(regionKey(region, refreshed.getName()), refreshed);
+
+            synchronized (lockFor(secretArn)) {
+                Secret refreshed = resolveSecret(secretArn, region);
+                SecretVersion pending = findVersionByStage(refreshed, "AWSPENDING");
+                if (pending != null) {
+                    List<String> stages = new ArrayList<>(pending.getVersionStages());
+                    stages.remove("AWSPENDING");
+                    pending.setVersionStages(stages);
+                    store.put(regionKey(region, refreshed.getName()), refreshed);
+                }
             }
             return;
         }
@@ -753,6 +759,7 @@ public class SecretsManagerService {
 
     public void tagResource(String secretId, List<Secret.Tag> tags, String region) {
         Secret secret = resolveSecret(secretId, region);
+        throwIfPendingDeletion(secret);
 
         List<Secret.Tag> existing = secret.getTags() != null ? new ArrayList<>(secret.getTags()) : new ArrayList<>();
         for (Secret.Tag newTag : tags) {
@@ -765,11 +772,39 @@ public class SecretsManagerService {
 
     public void untagResource(String secretId, List<String> tagKeys, String region) {
         Secret secret = resolveSecret(secretId, region);
+        throwIfPendingDeletion(secret);
 
         List<Secret.Tag> existing = secret.getTags() != null ? new ArrayList<>(secret.getTags()) : new ArrayList<>();
         existing.removeIf(t -> tagKeys.contains(t.key()));
         secret.setTags(existing);
         store.put(regionKey(region, secret.getName()), secret);
+    }
+
+    public Secret putResourcePolicy(String secretId, String resourcePolicy, String region) {
+        Secret secret = resolveSecret(secretId, region);
+        throwIfPendingDeletion(secret);
+        secret.setResourcePolicy(resourcePolicy);
+        store.put(regionKey(region, secret.getName()), secret);
+        LOG.infov("Put resource policy on secret: {0}", secret.getName());
+        return secret;
+    }
+
+    // Real AWS rejects GetResourcePolicy on a secret in its recovery window the same way it
+    // rejects the mutating ops; the terraform provider matches that InvalidRequestException's
+    // "marked for deletion" message to treat the policy as gone, so the guard applies here too.
+    public Secret getResourcePolicy(String secretId, String region) {
+        Secret secret = resolveSecret(secretId, region);
+        throwIfPendingDeletion(secret);
+        return secret;
+    }
+
+    public Secret deleteResourcePolicy(String secretId, String region) {
+        Secret secret = resolveSecret(secretId, region);
+        throwIfPendingDeletion(secret);
+        secret.setResourcePolicy(null);
+        store.put(regionKey(region, secret.getName()), secret);
+        LOG.infov("Deleted resource policy on secret: {0}", secret.getName());
+        return secret;
     }
 
     public Map<String, List<String>> listSecretVersionIds(String secretId, String region) {
@@ -838,73 +873,73 @@ public class SecretsManagerService {
         }
 
         Secret secret = resolveSecret(secretId, region);
-        if (secret.getDeletedDate() != null) {
-            throw new AwsException("ResourceNotFoundException", "Secrets Manager can't find the specified secret.", 400);
-        }
+        throwIfPendingDeletion(secret);
 
-        SecretVersion versionByStage = findVersionByStage(secret, versionStage);
-        String currentVersionId = versionByStage != null
-                ? versionByStage.getVersionId() : null;
+        synchronized (lockFor(secret.getArn())) {
+            SecretVersion versionByStage = findVersionByStage(secret, versionStage);
+            String currentVersionId = versionByStage != null
+                    ? versionByStage.getVersionId() : null;
 
-        if (currentVersionId != null) {
+            if (currentVersionId != null) {
 
-            // If the label is attached and you either do not specify
-            // this parameter, or the version ID does not match, then the
-            // operation fails.
-            if (removeFromVersionId == null) {
-                throw new AwsException("InvalidParameterException",
-                        ("The parameter RemoveFromVersionId can't be empty. Staging label %s is currently attached to "
-                            + "version %s, so you must explicitly reference that version in RemoveFromVersionId.")
-                        .formatted(versionByStage, currentVersionId), 400);
-            } else if (!Objects.equals(currentVersionId, removeFromVersionId)) {
-                throw new AwsException("InvalidParameterException",
-                        ("When you move staging label %s, if you specify RemoveFromVersionId, it must be set to the "
-                            + "version that currently has the staging label %s.")
-                        .formatted(versionByStage, currentVersionId), 400);
-            }
-
-            List<String> mutableStages = new ArrayList<>(secret.getVersions()
-                    .get(removeFromVersionId).getVersionStages());
-            mutableStages.remove(versionStage);
-
-            if (AWSCURRENT.equals(versionStage)) {
-                mutableStages.add(AWSPREVIOUS);
-
-                // remove AWSPREVIOUS tag from the previous SecretVersion
-                SecretVersion previous = findVersionByStage(secret, AWSPREVIOUS);
-                if (previous != null) {
-                    List<String> mutablePrevStages =
-                            new ArrayList<>(previous.getVersionStages());
-                    mutablePrevStages.remove(AWSPREVIOUS);
-                    previous.setVersionStages(mutablePrevStages);
+                // If the label is attached and you either do not specify
+                // this parameter, or the version ID does not match, then the
+                // operation fails.
+                if (removeFromVersionId == null) {
+                    throw new AwsException("InvalidParameterException",
+                            ("The parameter RemoveFromVersionId can't be empty. Staging label %s is currently attached to "
+                                + "version %s, so you must explicitly reference that version in RemoveFromVersionId.")
+                            .formatted(versionStage, currentVersionId), 400);
+                } else if (!Objects.equals(currentVersionId, removeFromVersionId)) {
+                    throw new AwsException("InvalidParameterException",
+                            ("When you move staging label %s, if you specify RemoveFromVersionId, it must be set to the "
+                                + "version that currently has the staging label %s.")
+                            .formatted(versionStage, currentVersionId), 400);
                 }
 
-                // we will set currentVersionId further down
-            }
-            secret.getVersions().get(removeFromVersionId).setVersionStages(mutableStages);
-        }
+                List<String> mutableStages = new ArrayList<>(secret.getVersions()
+                        .get(removeFromVersionId).getVersionStages());
+                mutableStages.remove(versionStage);
 
-        if (moveToVersionId != null) {
-            // check whether it exists
-            if (!secret.getVersions().containsKey(moveToVersionId)) {
-                throw new AwsException("ResourceNotFoundException",
-                        "Secrets Manager can't find the specified secret value for VersionId: %s.".formatted(moveToVersionId),
-                        400);
+                if (AWSCURRENT.equals(versionStage)) {
+                    mutableStages.add(AWSPREVIOUS);
+
+                    // remove AWSPREVIOUS tag from the previous SecretVersion
+                    SecretVersion previous = findVersionByStage(secret, AWSPREVIOUS);
+                    if (previous != null) {
+                        List<String> mutablePrevStages =
+                                new ArrayList<>(previous.getVersionStages());
+                        mutablePrevStages.remove(AWSPREVIOUS);
+                        previous.setVersionStages(mutablePrevStages);
+                    }
+
+                    // we will set currentVersionId further down
+                }
+                secret.getVersions().get(removeFromVersionId).setVersionStages(mutableStages);
             }
 
-            // we are adding versionStage to this ID
-            List<String> mutableStages = new ArrayList<>(secret.getVersions().get(moveToVersionId).getVersionStages());
-            mutableStages.add(versionStage);
-            secret.getVersions().get(moveToVersionId).setVersionStages(mutableStages);
+            if (moveToVersionId != null) {
+                // check whether it exists
+                if (!secret.getVersions().containsKey(moveToVersionId)) {
+                    throw new AwsException("ResourceNotFoundException",
+                            "Secrets Manager can't find the specified secret value for VersionId: %s.".formatted(moveToVersionId),
+                            400);
+                }
+
+                // we are adding versionStage to this ID
+                List<String> mutableStages = new ArrayList<>(secret.getVersions().get(moveToVersionId).getVersionStages());
+                mutableStages.add(versionStage);
+                secret.getVersions().get(moveToVersionId).setVersionStages(mutableStages);
             
-            if (AWSCURRENT.equals(versionStage)) {
-                secret.setCurrentVersionId(moveToVersionId);
+                if (AWSCURRENT.equals(versionStage)) {
+                    secret.setCurrentVersionId(moveToVersionId);
+                }
             }
+
+            store.put(regionKey(region, secret.getName()), secret);
+
+            return secret;
         }
-
-        store.put(regionKey(region, secret.getName()), secret);
-
-        return secret;
     }
 
     public record BatchSecretValue(
@@ -931,6 +966,22 @@ public class SecretsManagerService {
     ) {
         public static BatchGetSecretValueResult empty() {
             return new BatchGetSecretValueResult(Collections.emptyList(), Collections.emptyList());
+        }
+    }
+
+    /**
+     * A secret found by {@link #resolveSecret} with {@code deletedDate} set is on the
+     * recovery-window path (still in {@code store}, still restorable) - {@link
+     * #deleteSecret} force-deletes by removing the entry from {@code store} outright, so a
+     * fully, permanently gone secret never reaches this check; {@code resolveSecret} throws
+     * ResourceNotFoundException for that case on its own. Real AWS's error for the
+     * recoverable case is InvalidRequestException, matching what {@code batchGetSecretValue}
+     * already does correctly - the other call sites threw ResourceNotFoundException instead.
+     */
+    private void throwIfPendingDeletion(Secret secret) {
+        if (secret.getDeletedDate() != null) {
+            throw new AwsException("InvalidRequestException",
+                    "You can't perform this operation on the secret because it was marked for deletion.", 400);
         }
     }
 
@@ -999,5 +1050,36 @@ public class SecretsManagerService {
             sb.append(ALPHABET.charAt(rng.nextInt(ALPHABET.length())));
         }
         return sb.toString();
+    }
+
+    // ─── Resource Explorer 2 ───────────────────────────────────────────────────
+
+    @Override
+    public List<ExplorerResource> getResources() {
+        List<ExplorerResource> resources = new ArrayList<>();
+        for (Secret secret : store.scan(k -> true)) {
+            String arn = secret.getArn();
+            if (arn == null) {
+                continue;
+            }
+            AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
+            Map<String, String> tags = new LinkedHashMap<>();
+            if (secret.getTags() != null) {
+                for (Secret.Tag tag : secret.getTags()) {
+                    tags.put(tag.key(), tag.value() != null ? tag.value() : "");
+                }
+            }
+            resources.add(new ExplorerResource(
+                    arn, "secretsmanager:secret", "secretsmanager",
+                    parsed.region(), parsed.accountId(),
+                    secret.getCreatedDate() != null ? secret.getCreatedDate() : Instant.now(),
+                    tags));
+        }
+        return resources;
+    }
+
+    @Override
+    public Set<SupportedResourceType> getSupportedResourceTypes() {
+        return Set.of(new SupportedResourceType("secretsmanager:secret", "secretsmanager", true));
     }
 }

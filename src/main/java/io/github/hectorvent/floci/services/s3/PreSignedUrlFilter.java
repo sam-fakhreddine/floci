@@ -13,12 +13,14 @@ import org.jboss.logging.Logger;
 
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
+import java.net.URI;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 @Provider
@@ -162,9 +164,10 @@ public class PreSignedUrlFilter implements ContainerRequestFilter {
             String credentialScope = date + "/" + region + "/" + service + "/aws4_request";
 
             // Build canonical headers from signed headers
-            String host = requestContext.getUriInfo().getRequestUri().getHost();
-            int port = requestContext.getUriInfo().getRequestUri().getPort();
-            String authority = (port > 0 && port != 80 && port != 443) ? host + ":" + port : host;
+            URI requestUri = requestContext.getProperty(S3VirtualHostFilter.ORIGINAL_REQUEST_URI_PROPERTY) instanceof URI uri
+                    ? uri
+                    : requestContext.getUriInfo().getRequestUri();
+            String authority = S3VirtualHostFilter.resolveHost(requestContext.getHeaderString("Host"), requestUri);
 
             StringBuilder canonicalHeaders = new StringBuilder();
             for (String header : signedHeaders.split(";")) {
@@ -177,7 +180,7 @@ public class PreSignedUrlFilter implements ContainerRequestFilter {
             }
 
             // Canonical request
-            String path = requestContext.getUriInfo().getRequestUri().getRawPath();
+            String path = requestUri.getRawPath();
             String canonicalQueryString = buildCanonicalQueryString(queryParams);
             String payloadHash = requestContext.getHeaderString("x-amz-content-sha256");
             if (payloadHash == null) {
@@ -218,7 +221,18 @@ public class PreSignedUrlFilter implements ContainerRequestFilter {
             return LEGACY_SECRET_KEY;
         }
         if (iamService != null) {
-            return iamService.findSecretKey(accessKeyId).orElse(null);
+            Optional<String> registered = iamService.findSecretKey(accessKeyId);
+            if (registered.isPresent()) {
+                return registered.get();
+            }
+            // Deliberately no fallback for a bare 12-digit account ID here: AccountResolver
+            // reads a 12-digit access key ID as the request's account directly, so trusting an
+            // unregistered numeric key paired with the well-known "test" secret would let any
+            // client forge a signed request for an arbitrary account under S3 auth enforcement.
+            // A launched container's owning-account placeholder credentials (see
+            // LaunchedContainerAwsEnv) are therefore not honored by this enforced path either;
+            // they only work where no signature is required (auth enforcement disabled).
+            return null;
         }
         return null;
     }

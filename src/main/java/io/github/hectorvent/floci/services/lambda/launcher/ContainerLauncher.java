@@ -41,8 +41,6 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.security.cert.CertificateFactory;
-import java.security.cert.X509Certificate;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -97,18 +95,6 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         return configured;
     }
 
-    /**
-     * In-container location of Floci's CA certificate, injected when TLS is enabled so the
-     * container trusts Floci's self-signed HTTPS endpoint. {@code /etc} exists in every Lambda
-     * base image, so no directory needs to be created.
-     */
-    private static final String FLOCI_CA_DIR = "/etc";
-    private static final String FLOCI_CA_FILE_NAME = "floci-ca.crt";
-    /** Shared with the kubernetes executor, which mounts the CA ConfigMap at the same path. */
-    public static final String FLOCI_CA_CONTAINER_PATH = FLOCI_CA_DIR + "/" + FLOCI_CA_FILE_NAME;
-    /** Self-signed cert filename produced by {@code TlsConfigSource} under {persistent-path}/tls/. */
-    private static final String SELF_SIGNED_CERT_NAME = "floci-selfsigned.crt";
-
     private static final DateTimeFormatter LOG_STREAM_DATE_FMT = DateTimeFormatter.ofPattern("yyyy/MM/dd");
 
     private final ContainerBuilder containerBuilder;
@@ -122,10 +108,6 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     private final LambdaLayerService layerService;
     private final LaunchedContainerAwsEnv awsEnv;
     private final LambdaExecutionRoleCredentials executionRoleCredentials;
-
-    /** Matches an AWS-shaped ECR image URI: {@code <account>.dkr.ecr.<region>.amazonaws.com/<repo>[:tag]}. */
-    private static final java.util.regex.Pattern AWS_ECR_URI =
-            java.util.regex.Pattern.compile("^([0-9]{12})\\.dkr\\.ecr\\.([a-z0-9-]+)\\.amazonaws\\.com/(.+)$");
 
     @Inject
     public ContainerLauncher(ContainerBuilder containerBuilder,
@@ -150,6 +132,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         this.layerService = layerService;
         this.awsEnv = awsEnv;
         this.executionRoleCredentials = executionRoleCredentials;
+        this.populateSemaphore = new java.util.concurrent.Semaphore(resolvePopulateConcurrency(config));
     }
 
     @PostConstruct
@@ -161,28 +144,6 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     @PreDestroy
     void shutdown() {
         volumeCleanupScheduler.shutdownNow();
-    }
-
-    /**
-     * Rewrites real-AWS-shaped ECR image URIs to point at Floci's loopback registry.
-     * Stored ImageUri is preserved (so describe-function returns the original);
-     * the rewrite is only applied immediately before the docker pull.
-     */
-    private String rewriteForEmulatedRegistry(String image) {
-        if (image == null) {
-            return null;
-        }
-        java.util.regex.Matcher m = AWS_ECR_URI.matcher(image);
-        if (!m.matches()) {
-            return image;
-        }
-        String account = m.group(1);
-        String region = m.group(2);
-        String repoAndTag = m.group(3);
-        ecrRegistryManager.ensureStarted();
-        String rewritten = ecrRegistryManager.getRepositoryUri(account, region, repoAndTag);
-        LOG.infov("Rewriting ECR image URI {0} -> {1}", image, rewritten);
-        return rewritten;
     }
 
     public ContainerHandle launch(LambdaFunction fn) {
@@ -236,7 +197,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 : imageResolver.resolve(fn.getRuntime());
 
         // If this is an AWS-shaped ECR URI, rewrite it to Floci's loopback registry
-        image = rewriteForEmulatedRegistry(image);
+        image = ecrRegistryManager.rewriteImageUri(image);
 
         // Determine host address reachable from container
         String hostAddress = dockerHostResolver.resolve();
@@ -251,13 +212,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         String cwLogGroup  = "/aws/lambda/" + fn.getFunctionName();
         String cwLogStream = LOG_STREAM_DATE_FMT.format(LocalDate.now()) + "/[$LATEST]" + shortId;
         String lambdaRegion = extractRegionFromArn(fn.getFunctionArn(), config.defaultRegion());
-
-        // When TLS is on, the container must trust Floci's self-signed cert so HTTPS callbacks
-        // to Floci succeed (e.g. a CDK custom resource's cfn-response, which hardcodes https://).
-        // Short-circuit when TLS is off so cert-path/storage config isn't read needlessly.
-        Optional<Path> flociCaCert = config.tls().enabled()
-                ? resolveFlociCaCertPath(true, config.tls().certPath(), config.storage().persistentPath())
-                : Optional.empty();
+        String lambdaAccountId = AwsArnUtils.accountOrDefault(fn.getFunctionArn(), config.defaultAccountId());
 
         // Build env vars
         List<String> env = new ArrayList<>();
@@ -281,12 +236,22 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         }
         env.addAll(awsEnv.sdkBaselineEnv(lambdaRegion,
                 awsConfigPath.isPresent() ? Optional.of("/opt/aws-config") : Optional.empty(),
-                roleCredentials));
-        env.addAll(flociCaEnv(flociCaCert));
+                roleCredentials, lambdaAccountId));
         if (fn.getEnvironment() != null) {
             boolean hasExecutionRoleCredentials = roleCredentials.isPresent();
+            boolean userDefinesFullCredentialTriad = definesFullCredentialTriad(fn.getEnvironment());
             fn.getEnvironment().forEach((k, v) -> {
-                if (!hasExecutionRoleCredentials || !isAwsCredentialVariable(k)) {
+                if (isAwsCredentialVariable(k)) {
+                    // Credential injection is all-or-nothing: a partial override (e.g. only
+                    // AWS_ACCESS_KEY_ID set) must never join the baseline's other two values —
+                    // that pairs a user-chosen key with the owner-account/execution-role secret
+                    // and session token, a tuple nothing can verify. Only let the user's triad
+                    // through when it is complete, and only when there is no execution role
+                    // (which is already the authoritative credential source).
+                    if (!hasExecutionRoleCredentials && userDefinesFullCredentialTriad) {
+                        env.add(k + "=" + v);
+                    }
+                } else {
                     env.add(k + "=" + v);
                 }
             });
@@ -298,7 +263,9 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 .withMemoryMb(fn.getMemorySize())
                 .withDockerNetwork(config.services().lambda().dockerNetwork())
                 .withHostDockerInternalOnLinux()
-                .withLogRotation();
+                .withLogRotation()
+                .withLabels(ContainerStorageHelper.resourceIdentityLabels(
+                        "lambda", fn.getFunctionName(), lambdaAccountId, lambdaRegion));
 
         specBuilder.withEmbeddedDns();
 
@@ -383,7 +350,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
 
         // Create container without starting — provided.* runtimes exec
         // /var/runtime/bootstrap on start, so code must be copied first.
-        containerId = lifecycleManager.create(spec);
+        containerId = createContainer(spec, fn);
         LOG.infov("Created container {0} for function {1}", containerId, fn.getFunctionName());
         // Docker now holds the real container-to-volume reference, which removeVolume's own in-use
         // check protects from here on - release the in-flight marker that stood in for it before
@@ -433,15 +400,6 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                     LOG.warnv("Could not resolve layer ARN: {0} for function {1}", layerArn, fn.getFunctionName());
                 }
             }
-        }
-
-        // 4. Copy Floci's CA cert so the container trusts Floci's HTTPS endpoint (TLS mode).
-        //    Placed before start so NODE_EXTRA_CA_CERTS et al. resolve at runtime init.
-        //    An if-block rather than ifPresent(...) because containerId is assigned along the
-        //    code-volume path and so is not effectively final for a lambda capture.
-        if (flociCaCert.isPresent()) {
-            copyFileToContainer(dockerClient, containerId, flociCaCert.get(),
-                    FLOCI_CA_DIR, FLOCI_CA_FILE_NAME, fn.getFunctionName());
         }
 
         // Now start the container with code in place
@@ -526,6 +484,33 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         }
     }
 
+    private static Optional<String> dockerPlatform(LambdaFunction fn) {
+        List<String> architectures = fn.getArchitectures();
+        if (architectures == null) {
+            return Optional.of("linux/amd64");
+        }
+        if (architectures.size() != 1) {
+            return Optional.empty();
+        }
+        return switch (architectures.getFirst()) {
+            case "arm64" -> Optional.of("linux/arm64");
+            case "x86_64" -> Optional.of("linux/amd64");
+            default -> Optional.empty();
+        };
+    }
+
+    private String createContainer(ContainerSpec spec, LambdaFunction fn) {
+        if (!config.services().lambda().honourArchitectures()) {
+            return lifecycleManager.create(spec);
+        }
+        Optional<String> platform = dockerPlatform(fn);
+        if (platform.isEmpty()) {
+            throw new IllegalStateException("Invalid persisted architectures "
+                    + fn.getArchitectures() + " for function '" + fn.getFunctionName() + "'");
+        }
+        return lifecycleManager.create(spec, platform.get());
+    }
+
     public void stop(ContainerHandle handle) {
         LOG.infov("Stopping container {0}", handle.getContainerId());
         handle.setState(ContainerState.STOPPED);
@@ -580,10 +565,23 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         }
     }
 
-    private static boolean isAwsCredentialVariable(String name) {
+    public static boolean isAwsCredentialVariable(String name) {
         return "AWS_ACCESS_KEY_ID".equals(name)
                 || "AWS_SECRET_ACCESS_KEY".equals(name)
                 || "AWS_SESSION_TOKEN".equals(name);
+    }
+
+    /**
+     * Whether a Lambda's own Environment config defines all three AWS credential variables,
+     * the only condition under which any of them may override the baseline env — a partial
+     * set must never leak through and split the baseline's credential tuple. Public: both the
+     * Docker and Kubernetes launchers append the function's Environment after the same baseline
+     * and must apply this rule identically.
+     */
+    public static boolean definesFullCredentialTriad(java.util.Map<String, String> environment) {
+        return environment.containsKey("AWS_ACCESS_KEY_ID")
+                && environment.containsKey("AWS_SECRET_ACCESS_KEY")
+                && environment.containsKey("AWS_SESSION_TOKEN");
     }
 
     /**
@@ -602,12 +600,40 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     // overwhelmed the Docker daemon, so copies hung/failed and left half-built "Created" containers.
     // This gates ONLY the heavy populate — not every launch — so ordinary cold starts (volume mounts
     // for already-populated large code, or the small-code direct copy) are never serialized.
-    private static final java.util.concurrent.Semaphore POPULATE_SEMAPHORE =
-            new java.util.concurrent.Semaphore(Math.max(2, Runtime.getRuntime().availableProcessors() / 2));
+    //
+    // Per-instance rather than static so the permit count can come from configuration; Floci runs a
+    // single @ApplicationScoped launcher, so this is still one gate for the whole emulator.
+    private final java.util.concurrent.Semaphore populateSemaphore;
 
-    private static void acquirePopulatePermit(String functionName) {
+    /**
+     * Permits for {@link #populateSemaphore}: the configured value when set and positive,
+     * otherwise {@code max(2, availableProcessors() / 2)}.
+     *
+     * <p>The derived default reads the JVM's view of the cgroup CPU quota, so a CPU-constrained
+     * Floci container collapses it to 2 and concurrent cold starts of distinct functions
+     * serialize into pairs. The populate itself is IO-bound (streaming a tar into a helper
+     * container), so CPU count is a weak proxy for how many the daemon can take — hence the
+     * override. The default is unchanged, since the daemon overload the cap exists to prevent is
+     * real and its safe ceiling is host-specific.
+     */
+    static int resolvePopulateConcurrency(EmulatorConfig config) {
+        int derived = Math.max(2, Runtime.getRuntime().availableProcessors() / 2);
+        Optional<Integer> configured = config.services().lambda().codeVolumePopulateConcurrency();
+        if (configured.isEmpty()) {
+            return derived;
+        }
+        int permits = configured.get();
+        if (permits < 1) {
+            LOG.warnv("Ignoring floci.services.lambda.code-volume-populate-concurrency {0}: must be "
+                    + "at least 1; using {1}", permits, derived);
+            return derived;
+        }
+        return permits;
+    }
+
+    private void acquirePopulatePermit(String functionName) {
         try {
-            POPULATE_SEMAPHORE.acquire();
+            populateSemaphore.acquire();
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             throw new RuntimeException("Interrupted while waiting to populate code volume for " + functionName, ie);
@@ -846,19 +872,19 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         String shortId = java.util.UUID.randomUUID().toString().replace("-", "").substring(0, 8);
         // A minimal helper container (sleep) with the volume mounted read-write at /var/task; we
         // tar-copy the code into it, then discard it — the data persists in the volume.
-        ContainerSpec helperSpec = containerBuilder.newContainer(image)
+        ContainerBuilder.Builder helperBuilder = containerBuilder.newContainer(image)
                 .withName(resolveContainerNamePrefix(config) + "-codevol-" + fn.getFunctionName() + "-" + shortId)
                 .withEnv(java.util.List.of())
                 .withEntrypoint(java.util.List.of("sleep"))
                 .withCmd(java.util.List.of("3600"))
-                .withNamedVolume(volName, TASK_DIR, false)
-                .build();
+                .withNamedVolume(volName, TASK_DIR, false);
+        ContainerSpec helperSpec = helperBuilder.build();
         // Gate the heavy work (helper create + ~90MB tar copy) so a burst of first-time populates
         // doesn't thrash the Docker daemon. Only populates are serialized — plain cold starts aren't.
         acquirePopulatePermit(fn.getFunctionName());
         String helperId = null;
         try {
-            helperId = lifecycleManager.create(helperSpec);
+            helperId = createContainer(helperSpec, fn);
             lifecycleManager.startCreated(helperId, helperSpec);
             copyDirToContainerStrict(lifecycleManager.getDockerClient(), helperId,
                     Path.of(fn.getCodeLocalPath()), TASK_DIR, fn.getFunctionName());
@@ -870,7 +896,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                     LOG.warnv("Could not remove code-volume helper {0}: {1}", helperId, e.getMessage());
                 }
             }
-            POPULATE_SEMAPHORE.release();
+            populateSemaphore.release();
         }
     }
 
@@ -1096,7 +1122,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                                            Path sourceDir, String remotePath, String functionName,
                                            DirectoryTarWriter tarWriter, boolean failOnTarFailure) {
         // No per-copy gating here: the heavy /var/task populate for large code already holds a
-        // POPULATE_SEMAPHORE permit; small-code direct copies and layer copies are light enough
+        // populateSemaphore permit; small-code direct copies and layer copies are light enough
         // to run unthrottled.
         try (java.io.PipedOutputStream pos = new java.io.PipedOutputStream();
              java.io.PipedInputStream pis = new java.io.PipedInputStream(pos, TAR_PIPE_BUFFER_BYTES)) {
@@ -1310,83 +1336,6 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                     EXTENSIONS_DIR, functionName, e.getMessage());
             return List.of();
         }
-    }
-
-    /**
-     * Resolves the host path of Floci's CA certificate to inject into Lambda containers, or
-     * empty when TLS is disabled or no readable certificate exists. Mirrors {@code TlsConfigSource}:
-     * a user-provided {@code floci.tls.cert-path} wins; otherwise the self-signed cert under
-     * {@code {persistent-path}/tls/}.
-     *
-     * <p>The resolved certificate is injected into containers as a <em>trust anchor</em> (CA), so it
-     * should be a self-signed CA certificate. The auto-generated Floci cert is one; a user-supplied
-     * {@code floci.tls.cert-path} that points at a leaf/server certificate is accepted but only pins
-     * that exact certificate (it cannot validate a chain it signs), so a warning is logged.
-     */
-    public static Optional<Path> resolveFlociCaCertPath(boolean tlsEnabled, Optional<String> userCertPath,
-                                                        String persistentPath) {
-        if (!tlsEnabled) {
-            return Optional.empty();
-        }
-        Optional<String> trimmedUserPath = userCertPath.filter(s -> !s.isBlank());
-        Path certPath = trimmedUserPath
-                .map(Path::of)
-                .orElseGet(() -> Path.of(persistentPath, "tls", SELF_SIGNED_CERT_NAME));
-        if (!Files.isReadable(certPath)) {
-            LOG.warnv("TLS enabled but Floci CA certificate not readable at {0}; "
-                    + "Lambda containers will not trust Floci HTTPS callbacks", certPath);
-            return Optional.empty();
-        }
-        if (trimmedUserPath.isPresent() && !isSelfSignedCaCertificate(certPath)) {
-            LOG.warnv("Configured floci.tls.cert-path {0} is not a self-signed CA certificate; it is "
-                    + "injected into Lambda containers as a trust anchor (CA), which only validates "
-                    + "this exact certificate and not a chain it signs. Provide a self-signed CA "
-                    + "certificate for reliable HTTPS callbacks.", certPath);
-        }
-        return Optional.of(certPath);
-    }
-
-    /**
-     * Returns {@code true} only if {@code certPath} holds a genuinely self-signed CA certificate
-     * (issuer == subject and BasicConstraints {@code CA:true}) — the form usable as a trust anchor.
-     * A leaf/server certificate, or one that cannot be read/parsed as X.509, returns {@code false}.
-     */
-    static boolean isSelfSignedCaCertificate(Path certPath) {
-        try (InputStream in = Files.newInputStream(certPath)) {
-            X509Certificate cert = (X509Certificate) CertificateFactory.getInstance("X.509")
-                    .generateCertificate(in);
-            boolean selfSigned = cert.getSubjectX500Principal().equals(cert.getIssuerX500Principal());
-            boolean isCa = cert.getBasicConstraints() >= 0; // -1 == not a CA
-            return selfSigned && isCa;
-        } catch (Exception e) {
-            LOG.debugv("Could not inspect TLS certificate {0} for CA suitability: {1}",
-                    certPath, e.getMessage());
-            return false;
-        }
-    }
-
-    /**
-     * Environment entries that make the container <em>add</em> Floci's CA to its trust, without
-     * replacing the system trust store (which would break the Lambda's external HTTPS calls):
-     * <ul>
-     *   <li>{@code NODE_EXTRA_CA_CERTS} appends Floci's cert to Node's built-in CAs, so public TLS
-     *       from the Lambda still works; and</li>
-     *   <li>{@code AWS_CA_BUNDLE} is scoped to AWS SDK/CLI traffic, which Floci redirects to its own
-     *       endpoint via {@code AWS_ENDPOINT_URL} — so pointing it at Floci's cert only affects
-     *       calls that already target Floci.</li>
-     * </ul>
-     * {@code SSL_CERT_FILE} and {@code REQUESTS_CA_BUNDLE} are deliberately <em>not</em> set: each
-     * <em>replaces</em> the entire OpenSSL / Python-requests trust store with only Floci's cert,
-     * which breaks every external HTTPS call (curl, openssl, requests/botocore) the Lambda makes.
-     * Returns an empty list when no CA cert is available (TLS off).
-     */
-    public static List<String> flociCaEnv(Optional<Path> caCert) {
-        if (caCert.isEmpty()) {
-            return List.of();
-        }
-        return List.of(
-                "NODE_EXTRA_CA_CERTS=" + FLOCI_CA_CONTAINER_PATH,
-                "AWS_CA_BUNDLE=" + FLOCI_CA_CONTAINER_PATH);
     }
 
     private static String extractRegionFromArn(String arn, String defaultRegion) {

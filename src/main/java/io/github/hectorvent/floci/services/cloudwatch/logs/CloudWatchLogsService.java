@@ -4,11 +4,13 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
+import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.cloudwatch.logs.model.LogEvent;
 import io.github.hectorvent.floci.services.cloudwatch.logs.model.LogGroup;
 import io.github.hectorvent.floci.services.cloudwatch.logs.model.LogStream;
+import io.github.hectorvent.floci.services.cloudwatch.logs.model.ResourcePolicy;
 import io.github.hectorvent.floci.services.cloudwatch.logs.model.SubscriptionFilter;
 import com.fasterxml.jackson.core.type.TypeReference;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -29,9 +31,14 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
+import io.github.hectorvent.floci.core.resource.ExplorerResource;
+import io.github.hectorvent.floci.core.resource.ResourceProvider;
+import io.github.hectorvent.floci.core.resource.SupportedResourceType;
+import java.time.Instant;
+import java.util.Set;
 
 @ApplicationScoped
-public class CloudWatchLogsService {
+public class CloudWatchLogsService implements ResourceProvider {
 
     private static final Logger LOG = Logger.getLogger(CloudWatchLogsService.class);
 
@@ -50,6 +57,7 @@ public class CloudWatchLogsService {
     private final StorageBackend<String, LogStream> streamStore;
     private final StorageBackend<String, LogEvent> eventStore;
     private final StorageBackend<String, SubscriptionFilter> subscriptionFilterStore;
+    private final StorageBackend<String, ResourcePolicy> resourcePolicyStore;
     private final RegionResolver regionResolver;
     private final int maxEventsPerQuery;
     /**
@@ -94,6 +102,8 @@ public class CloudWatchLogsService {
                         new TypeReference<>() {}),
                 storageFactory.create("cloudwatchlogs", "cwlogs-subscription-filters.json",
                         new TypeReference<>() {}),
+                storageFactory.create("cloudwatchlogs", "cwlogs-resource-policies.json",
+                        new TypeReference<>() {}),
                 config.services().cloudwatchlogs().maxEventsPerQuery(),
                 regionResolver,
                 config.services().cloudwatchlogs().queryCompletionDelayMs(),
@@ -107,7 +117,7 @@ public class CloudWatchLogsService {
                            StorageBackend<String, SubscriptionFilter> subscriptionFilterStore,
                            int maxEventsPerQuery,
                            RegionResolver regionResolver) {
-        this(groupStore, streamStore, eventStore, subscriptionFilterStore,
+        this(groupStore, streamStore, eventStore, subscriptionFilterStore, new InMemoryStorage<>(),
                 maxEventsPerQuery, regionResolver, 0L, System::currentTimeMillis);
     }
 
@@ -119,10 +129,24 @@ public class CloudWatchLogsService {
                            RegionResolver regionResolver,
                            long queryCompletionDelayMs,
                            LongSupplier clock) {
+        this(groupStore, streamStore, eventStore, subscriptionFilterStore, new InMemoryStorage<>(),
+                maxEventsPerQuery, regionResolver, queryCompletionDelayMs, clock);
+    }
+
+    CloudWatchLogsService(StorageBackend<String, LogGroup> groupStore,
+                           StorageBackend<String, LogStream> streamStore,
+                           StorageBackend<String, LogEvent> eventStore,
+                           StorageBackend<String, SubscriptionFilter> subscriptionFilterStore,
+                           StorageBackend<String, ResourcePolicy> resourcePolicyStore,
+                           int maxEventsPerQuery,
+                           RegionResolver regionResolver,
+                           long queryCompletionDelayMs,
+                           LongSupplier clock) {
         this.groupStore = groupStore;
         this.streamStore = streamStore;
         this.eventStore = eventStore;
         this.subscriptionFilterStore = subscriptionFilterStore;
+        this.resourcePolicyStore = resourcePolicyStore;
         this.maxEventsPerQuery = maxEventsPerQuery;
         this.regionResolver = regionResolver;
         long maxSequence = eventStore.scan(k -> true).stream()
@@ -143,7 +167,12 @@ public class CloudWatchLogsService {
 
     public void createLogGroup(String name, Integer retentionInDays, Map<String, String> tags,
                                boolean deletionProtectionEnabled, String region) {
-        createLogGroupForAccount(null, name, retentionInDays, tags, deletionProtectionEnabled, region);
+        createLogGroup(name, retentionInDays, tags, deletionProtectionEnabled, null, region);
+    }
+
+    public void createLogGroup(String name, Integer retentionInDays, Map<String, String> tags,
+                               boolean deletionProtectionEnabled, String kmsKeyId, String region) {
+        createLogGroupForAccount(null, name, retentionInDays, tags, deletionProtectionEnabled, kmsKeyId, region);
     }
 
     public void createLogGroupForAccount(
@@ -155,6 +184,12 @@ public class CloudWatchLogsService {
     public void createLogGroupForAccount(
             String accountId, String name, Integer retentionInDays,
             Map<String, String> tags, boolean deletionProtectionEnabled, String region) {
+        createLogGroupForAccount(accountId, name, retentionInDays, tags, deletionProtectionEnabled, null, region);
+    }
+
+    public void createLogGroupForAccount(
+            String accountId, String name, Integer retentionInDays,
+            Map<String, String> tags, boolean deletionProtectionEnabled, String kmsKeyId, String region) {
         if (name == null || name.isBlank()) {
             throw new AwsException("InvalidParameterException", "logGroupName is required.", 400);
         }
@@ -168,6 +203,9 @@ public class CloudWatchLogsService {
         group.setCreatedTime(System.currentTimeMillis());
         group.setRetentionInDays(retentionInDays);
         group.setDeletionProtectionEnabled(deletionProtectionEnabled);
+        if (kmsKeyId != null && !kmsKeyId.isBlank()) {
+            group.setKmsKeyId(kmsKeyId);
+        }
         if (tags != null) {
             group.setTags(new HashMap<>(tags));
         }
@@ -266,6 +304,36 @@ public class CloudWatchLogsService {
                         "The specified log group does not exist: " + groupName, 400));
         tagKeys.forEach(group.getTags()::remove);
         groupStore.put(key, group);
+    }
+
+    /**
+     * Associates a KMS CMK with a log group so its stored events are encrypted with it.
+     *
+     * <p>The association is a property of the group, not of each event, and it is surfaced by
+     * {@code DescribeLogGroups}: callers converge by reading {@code kmsKeyId} back and only
+     * re-associating when it differs from the key they want.
+     */
+    public void associateKmsKey(String groupName, String kmsKeyId, String region) {
+        if (kmsKeyId == null || kmsKeyId.isBlank()) {
+            throw new AwsException("InvalidParameterException", "kmsKeyId required.", 400);
+        }
+        String key = groupKey(region, groupName);
+        LogGroup group = groupStore.get(key)
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                        "The specified log group does not exist: " + groupName, 400));
+        group.setKmsKeyId(kmsKeyId);
+        groupStore.put(key, group);
+        LOG.infov("Associated KMS key {0} with log group {1}", kmsKeyId, groupName);
+    }
+
+    public void disassociateKmsKey(String groupName, String region) {
+        String key = groupKey(region, groupName);
+        LogGroup group = groupStore.get(key)
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                        "The specified log group does not exist: " + groupName, 400));
+        group.setKmsKeyId(null);
+        groupStore.put(key, group);
+        LOG.infov("Disassociated KMS key from log group {0}", groupName);
     }
 
     public Map<String, String> listTagsLogGroup(String groupName, String region) {
@@ -663,15 +731,21 @@ public class CloudWatchLogsService {
 
     // ──────────────────────────── Logs Insights Queries ────────────────────────────
 
-    /** A query's status and (once Complete) its projected rows — the AWS GetQueryResults shape. */
+    /**
+     * A query's status and (once Complete) its projected rows: the AWS GetQueryResults shape.
+     * {@code failureReason} is {@code null} unless {@code status} is {@code Failed}; it is not
+     * part of the AWS wire response (GetQueryResults carries no such field) but is exposed here
+     * for callers and tests that want to know why an unsupported query failed.
+     */
     public record QueryState(String status, List<LinkedHashMap<String, String>> rows,
-                             long recordsScanned, long recordsMatched) {}
+                             long recordsScanned, long recordsMatched, String failureReason) {}
 
     /** Lifecycle state of a stored Insights query; {@link #label()} is the AWS wire form. */
     private enum InsightsQueryStatus {
         RUNNING("Running"),
         COMPLETE("Complete"),
-        CANCELLED("Cancelled");
+        CANCELLED("Cancelled"),
+        FAILED("Failed");
 
         private final String label;
 
@@ -687,42 +761,61 @@ public class CloudWatchLogsService {
     /**
      * A stored Insights query. Results are computed eagerly at StartQuery, but the query reports
      * {@code Running} until {@code completeAtMs} (an artificial delay emulating AWS's asynchronous
-     * execution), then {@code Complete} — unless cancelled by StopQuery, after which it is
-     * {@code Cancelled}. State transitions are time-driven and computed on read. {@code recordsMatched}
-     * is captured at construction so it survives the Running/Cancelled row masking and the row-drop on cancel.
+     * execution), then either {@code Complete} or, if the query string contained syntax this engine
+     * cannot evaluate, {@code Failed}, unless cancelled by StopQuery first, after which it is
+     * {@code Cancelled}. State transitions are time-driven and computed on read. For a Complete or
+     * Cancelled query, {@code recordsMatched} is captured at construction so it survives the
+     * Running/Cancelled row masking and the row-drop on cancel; a Failed query never evaluated any
+     * matches, so its {@code recordsMatched} is always zero.
      */
     private static final class QueryRecord {
         private List<LinkedHashMap<String, String>> rows;
         private final long recordsScanned;
         private final long recordsMatched;
         private final long completeAtMs;
+        private final String failureReason;
         private boolean cancelled;
 
         QueryRecord(List<LinkedHashMap<String, String>> rows, long recordsScanned, long completeAtMs) {
+            this(rows, recordsScanned, completeAtMs, null);
+        }
+
+        private QueryRecord(List<LinkedHashMap<String, String>> rows, long recordsScanned, long completeAtMs,
+                             String failureReason) {
             this.rows = rows;
             this.recordsScanned = recordsScanned;
             this.recordsMatched = rows.size();
             this.completeAtMs = completeAtMs;
+            this.failureReason = failureReason;
+        }
+
+        /** A query whose string could not be fully evaluated: it never produces rows and ends up {@code Failed}. */
+        static QueryRecord failed(long recordsScanned, long completeAtMs, String failureReason) {
+            return new QueryRecord(List.of(), recordsScanned, completeAtMs, failureReason);
         }
 
         private InsightsQueryStatus status(long nowMs) {
             if (cancelled) {
                 return InsightsQueryStatus.CANCELLED;
             }
-            return nowMs >= completeAtMs ? InsightsQueryStatus.COMPLETE : InsightsQueryStatus.RUNNING;
+            if (nowMs < completeAtMs) {
+                return InsightsQueryStatus.RUNNING;
+            }
+            return failureReason != null ? InsightsQueryStatus.FAILED : InsightsQueryStatus.COMPLETE;
         }
 
         /**
          * Snapshot this query in the AWS GetQueryResults shape. Rows are exposed only once
          * {@code Complete}, and always as a defensive copy (the cached list is never handed out); while
          * Running or Cancelled the rows are masked empty, but {@code recordsMatched} still reports the
-         * full match count.
+         * full match count. A Failed query exposes neither: it has no rows and no matches to report,
+         * so both fields are empty and zero respectively.
          */
         synchronized QueryState snapshot(long nowMs) {
             InsightsQueryStatus status = status(nowMs);
             List<LinkedHashMap<String, String>> visible =
                     status == InsightsQueryStatus.COMPLETE ? List.copyOf(rows) : List.of();
-            return new QueryState(status.label(), visible, recordsScanned, recordsMatched);
+            return new QueryState(status.label(), visible, recordsScanned, recordsMatched, failureReason);
         }
 
         /** Cancels the query iff still running, dropping its now-unreachable rows. Returns true if this call stopped it. */
@@ -739,7 +832,8 @@ public class CloudWatchLogsService {
     /**
      * Start a CloudWatch Logs Insights query and cache it under a new queryId. Results are computed
      * eagerly (the scan is in-memory); the query then reports {@code Running} until the configured
-     * completion delay elapses (default 0 = immediate), emulating AWS's async execution.
+     * completion delay elapses (default 0 = immediate), emulating AWS's async execution, then either
+     * {@code Complete} or, if the query string could not be fully evaluated, {@code Failed}.
      * {@code startTimeSeconds}/{@code endTimeSeconds} are epoch <em>seconds</em> (the StartQuery
      * contract); {@link LogEvent} timestamps are epoch millis, so they are scaled for comparison.
      */
@@ -776,12 +870,22 @@ public class CloudWatchLogsService {
             }
         }
 
-        int effectiveLimit = (limit != null && limit > 0) ? Math.min(limit, maxEventsPerQuery) : maxEventsPerQuery;
-        List<LinkedHashMap<String, String>> rows =
-                LogsInsightsQuery.parse(queryString).evaluate(gathered, effectiveLimit);
-
+        LogsInsightsQuery parsedQuery = LogsInsightsQuery.parse(queryString);
         String queryId = UUID.randomUUID().toString();
         long completeAtMs = clock.getAsLong() + queryCompletionDelayMs;
+
+        if (parsedQuery.isUnsupported()) {
+            // A query containing syntax this engine cannot evaluate must not come back as a
+            // "successful" empty or partial result set: fail it, so the caller can tell the
+            // difference between "the filter matched nothing" and "the filter was never applied".
+            insightsQueries.put(queryId, QueryRecord.failed(gathered.size(), completeAtMs, parsedQuery.getUnsupportedReason()));
+            LOG.warnv("Logs Insights query {0} will fail: {1}", queryId, parsedQuery.getUnsupportedReason());
+            return queryId;
+        }
+
+        int effectiveLimit = (limit != null && limit > 0) ? Math.min(limit, maxEventsPerQuery) : maxEventsPerQuery;
+        List<LinkedHashMap<String, String>> rows = parsedQuery.evaluate(gathered, effectiveLimit);
+
         insightsQueries.put(queryId, new QueryRecord(rows, gathered.size(), completeAtMs));
         LOG.infov("Logs Insights query {0}: scanned {1} event(s) across {2} group(s) -> {3} row(s)",
                 queryId, gathered.size(), distinctGroups.size(), rows.size());
@@ -790,9 +894,11 @@ public class CloudWatchLogsService {
 
     /**
      * Return a query's status and, once {@code Complete}, its rows. Mirrors AWS: while {@code Running}
-     * or after a StopQuery ({@code Cancelled}) the result set is empty (though {@code recordsMatched}
-     * still reports the full match count); only a Complete query exposes rows. An unknown queryId is an
-     * error on real AWS — and a query that has fallen out of the bounded LRU cache 404s the same way.
+     * or after a StopQuery ({@code Cancelled}) the result set is empty, though {@code recordsMatched}
+     * still reports the full match count; once the query string is found to contain unsupported syntax
+     * ({@code Failed}) both the rows and {@code recordsMatched} are empty, since such a query is never
+     * evaluated. Only a Complete query exposes rows. An unknown queryId is an error on real AWS, and a
+     * query that has fallen out of the bounded LRU cache 404s the same way.
      */
     public QueryState getQueryResults(String queryId) {
         QueryRecord rec = insightsQueries.get(queryId);
@@ -891,6 +997,24 @@ public class CloudWatchLogsService {
         LOG.infov("Deleted subscription filter: {0} on log group: {1}", filterName, logGroupName);
     }
 
+    // ──────────────────────────── Resource Policies ────────────────────────────
+
+    public ResourcePolicy putResourcePolicy(String policyName, String policyDocument, String region) {
+        ResourcePolicy policy = new ResourcePolicy();
+        policy.setPolicyName(policyName);
+        policy.setPolicyDocument(policyDocument);
+        policy.setLastUpdatedTime(System.currentTimeMillis());
+        resourcePolicyStore.put(resourcePolicyKey(region, policyName), policy);
+        return policy;
+    }
+
+    public List<ResourcePolicy> describeResourcePolicies(String region) {
+        List<ResourcePolicy> policies = resourcePolicyStore.scan(
+                key -> key.startsWith(resourcePolicyKeyPrefix(region)));
+        policies.sort(Comparator.comparing(ResourcePolicy::getPolicyName));
+        return policies;
+    }
+
     // ──────────────────────────── Helpers ────────────────────────────
 
     private void deleteEventsForStream(String region, String groupName, String streamName) {
@@ -954,6 +1078,14 @@ public class CloudWatchLogsService {
         return region + "::" + logGroupName + "::filter::" + filterName;
     }
 
+    private static String resourcePolicyKeyPrefix(String region) {
+        return region + "::policy::";
+    }
+
+    private static String resourcePolicyKey(String region, String policyName) {
+        return resourcePolicyKeyPrefix(region) + policyName;
+    }
+
     private static long toLong(Object value, long defaultValue) {
         if (value == null) {
             return defaultValue;
@@ -966,5 +1098,40 @@ public class CloudWatchLogsService {
         } catch (NumberFormatException e) {
             return defaultValue;
         }
+    }
+
+    // ─── Resource Explorer 2 ───────────────────────────────────────────────────
+
+    /**
+     * Log groups carry no Region of their own — the store keys them {@code region::name} — so the
+     * key is the only place the Region can come from.
+     */
+    @Override
+    public List<ExplorerResource> getResources() {
+        List<ExplorerResource> resources = new ArrayList<>();
+        for (String key : groupStore.keys()) {
+            int separator = key.indexOf("::");
+            if (separator < 0) {
+                continue;
+            }
+            LogGroup group = groupStore.get(key).orElse(null);
+            if (group == null || group.getLogGroupName() == null) {
+                continue;
+            }
+            String region = key.substring(0, separator);
+            resources.add(new ExplorerResource(
+                    "arn:aws:logs:" + region + ":" + regionResolver.getAccountId()
+                            + ":log-group:" + group.getLogGroupName() + ":*",
+                    "logs:log-group", "logs",
+                    region, regionResolver.getAccountId(),
+                    group.getCreatedTime() > 0 ? Instant.ofEpochMilli(group.getCreatedTime()) : Instant.now(),
+                    group.getTags() != null ? group.getTags() : Map.of()));
+        }
+        return resources;
+    }
+
+    @Override
+    public Set<SupportedResourceType> getSupportedResourceTypes() {
+        return Set.of(new SupportedResourceType("logs:log-group", "logs", true));
     }
 }

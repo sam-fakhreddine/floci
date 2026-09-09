@@ -66,13 +66,23 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
         if (result.isPresent()) {
             return result;
         }
-        // Backward-compat: try un-prefixed key (pre-multi-account data) and migrate on read.
-        result = delegate.get(key);
-        if (result.isPresent()) {
-            delegate.put(prefixedKey, result.get());
-            delegate.delete(key);
+        // Backward-compat: try un-prefixed key (pre-multi-account data) and migrate on read. The
+        // migration is a write (put then delete), so it runs under the same monitor the explicit-account
+        // migrators hold, or two readers resolving the same legacy key from different account contexts
+        // would each copy it into their own partition and the two copies would then diverge. The hit
+        // path above stays outside the monitor, so only a miss pays for it.
+        synchronized (this) {
+            Optional<V> migratedByAnotherReader = delegate.get(prefixedKey);
+            if (migratedByAnotherReader.isPresent()) {
+                return migratedByAnotherReader;
+            }
+            result = delegate.get(key);
+            if (result.isPresent()) {
+                delegate.put(prefixedKey, result.get());
+                delegate.delete(key);
+            }
+            return result;
         }
-        return result;
     }
 
     @Override
@@ -330,7 +340,60 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
                 .collect(Collectors.toUnmodifiableSet());
     }
 
+    /** A value together with the account partition that owns it, as recovered by {@link #findAnyAccountEntry}. */
+    public record OwnedEntry<V>(String account, V value) {}
+
+    /**
+     * Resolves a logical key across every account's partition, modelling a globally-unique
+     * namespace — as S3 bucket names are in AWS, where a bucket lives in one account but is
+     * legitimately reachable cross-account. Tries the current caller's partition first (via
+     * {@link #get}, which also covers pre-multi-account un-prefixed data), then falls back to any
+     * other account that owns the key. Returns the first match, or empty if no account has it.
+     *
+     * <p>Unlike {@link #get}, a cross-account hit is <em>not</em> migrated into the caller's
+     * partition: the entry legitimately belongs to its owning account and must stay there.
+     */
+    public Optional<V> findAnyAccount(String key) {
+        return findAnyAccountEntry(key).map(OwnedEntry::value);
+    }
+
+    /**
+     * Like {@link #findAnyAccount}, but also reports the owning account so a cross-account
+     * <em>mutation</em> can write the value back to its owner's partition (via
+     * {@link #putForAccount}) instead of forking a phantom copy into the caller's partition.
+     * The caller's own hit is owned by the current account context; a scanned hit's owner is
+     * the account segment of its raw key (or {@code defaultAccountId} for pre-multi-account,
+     * un-prefixed data).
+     */
+    public Optional<OwnedEntry<V>> findAnyAccountEntry(String key) {
+        Optional<V> own = get(key);
+        if (own.isPresent()) {
+            return Optional.of(new OwnedEntry<>(prefix(), own.get()));
+        }
+        String suffix = "/" + key;
+        for (String rawKey : delegate.keys()) {
+            if (rawKey.equals(key)) {
+                Optional<V> value = delegate.get(rawKey);
+                if (value.isPresent()) {
+                    return Optional.of(new OwnedEntry<>(defaultAccountId, value.get()));
+                }
+            } else if (rawKey.endsWith(suffix)) {
+                Optional<V> value = delegate.get(rawKey);
+                if (value.isPresent()) {
+                    String account = rawKey.substring(0, rawKey.length() - suffix.length());
+                    return Optional.of(new OwnedEntry<>(account, value.get()));
+                }
+            }
+        }
+        return Optional.empty();
+    }
+
     // ---
+
+    /** Returns the account ID that keys are currently being prefixed with. */
+    public String accountId() {
+        return prefix();
+    }
 
     private String prefix() {
         if (requestContextInstance != null) {

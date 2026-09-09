@@ -10,14 +10,18 @@ import io.github.hectorvent.floci.services.stepfunctions.model.Activity;
 import io.github.hectorvent.floci.services.stepfunctions.model.ActivityTask;
 import io.github.hectorvent.floci.services.stepfunctions.model.Execution;
 import io.github.hectorvent.floci.services.stepfunctions.model.HistoryEvent;
+import io.github.hectorvent.floci.services.stepfunctions.model.MapRun;
 import io.github.hectorvent.floci.services.stepfunctions.model.StateMachine;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 @ApplicationScoped
 public class StepFunctionsJsonHandler {
@@ -48,6 +52,7 @@ public class StepFunctionsJsonHandler {
             case "ListExecutions" -> handleListExecutions(request);
             case "StopExecution" -> handleStopExecution(request);
             case "GetExecutionHistory" -> handleGetExecutionHistory(request);
+            case "DescribeMapRun" -> handleDescribeMapRun(request);
             case "SendTaskSuccess" -> handleSendTaskSuccess(request);
             case "SendTaskFailure" -> handleSendTaskFailure(request);
             case "SendTaskHeartbeat" -> handleSendTaskHeartbeat(request);
@@ -287,6 +292,52 @@ public class StepFunctionsJsonHandler {
         return Response.ok(response).build();
     }
 
+    private Response handleDescribeMapRun(JsonNode request) {
+        MapRun mapRun = service.describeMapRun(requiredText(request, "mapRunArn"));
+        return Response.ok(describeMapRunResponse(objectMapper, mapRun)).build();
+    }
+
+    /**
+     * The wire response of {@code DescribeMapRun}, measured against us-east-1. The
+     * {@code arn:aws:states:::aws-sdk:sfn:describeMapRun} Task integration renders the same node in
+     * PascalCase, so this is the one place the response is described.
+     *
+     * <p>Both tolerances and {@code redriveCount} are zero because Floci implements neither, and
+     * {@code redriveDate} is absent until a run is redriven, which no run here ever is.
+     */
+    static ObjectNode describeMapRunResponse(ObjectMapper objectMapper, MapRun mapRun) {
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("mapRunArn", mapRun.getMapRunArn());
+        response.put("executionArn", mapRun.getExecutionArn());
+        response.put("status", mapRun.getStatus());
+        response.put("startDate", mapRun.getStartDate());
+        response.put("stopDate", mapRun.getStopDate());
+        response.put("maxConcurrency", mapRun.getMaxConcurrency());
+        response.put("toleratedFailurePercentage", 0.0);
+        response.put("toleratedFailureCount", 0);
+        putMapRunCounts(response.putObject("itemCounts"), mapRun);
+        // One child execution per item: ItemBatcher is not applied, so no execution covers a batch.
+        putMapRunCounts(response.putObject("executionCounts"), mapRun);
+        response.put("redriveCount", 0);
+        return response;
+    }
+
+    /** A failed item's result counts as written, as on AWS. */
+    private static void putMapRunCounts(ObjectNode counts, MapRun mapRun) {
+        var succeeded = mapRun.getSucceededCount();
+        var failed = mapRun.getFailedCount();
+        counts.put("pending", 0);
+        counts.put("running", 0);
+        counts.put("succeeded", succeeded);
+        counts.put("failed", failed);
+        counts.put("timedOut", 0);
+        counts.put("aborted", mapRun.getItemCount() - succeeded - failed);
+        counts.put("total", mapRun.getItemCount());
+        counts.put("resultsWritten", succeeded + failed);
+        counts.put("failuresNotRedrivable", 0);
+        counts.put("pendingRedrive", 0);
+    }
+
     private Response handleListExecutions(JsonNode request) {
         List<Execution> list = service.listExecutions(request.path("stateMachineArn").asText());
         ObjectNode response = objectMapper.createObjectNode();
@@ -318,7 +369,12 @@ public class StepFunctionsJsonHandler {
         var arn = request.path("executionArn").asText();
         var includeExecutionData = request.path("includeExecutionData").asBoolean(true);
 
-        List<HistoryEvent> events = service.getExecutionHistory(arn);
+        var live = service.getExecutionHistory(arn);
+        List<HistoryEvent> events;
+        // Branch and iteration threads append under the history's own monitor while a client reads.
+        synchronized (live) {
+            events = new ArrayList<>(live);
+        }
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode array = response.putArray("events");
         for (HistoryEvent e : events) {
@@ -327,12 +383,21 @@ public class StepFunctionsJsonHandler {
             item.put("timestamp", e.getTimestamp());
             item.put("type", e.getType());
             if (e.getPreviousEventId() != null) item.put("previousEventId", e.getPreviousEventId());
-            if (includeExecutionData && e.getDetails() != null) {
-                item.set(historyEventDetailsField(e.getType()), objectMapper.valueToTree(e.getDetails()));
+            if (e.getDetails() != null) {
+                var details = e.getDetails();
+                if (!includeExecutionData) {
+                    var filtered = new LinkedHashMap<>(details);
+                    filtered.keySet().removeAll(EXECUTION_DATA_FIELDS);
+                    details = filtered;
+                }
+                item.set(historyEventDetailsField(e.getType()), objectMapper.valueToTree(details));
             }
         }
         return Response.ok(response).build();
     }
+
+    private static final Set<String> EXECUTION_DATA_FIELDS =
+            Set.of("input", "inputDetails", "output", "outputDetails");
 
     static String historyEventDetailsField(String type) {
         if (type.endsWith("StateEntered")) {
@@ -352,7 +417,9 @@ public class StepFunctionsJsonHandler {
     private Response handleSendTaskFailure(JsonNode request) {
         service.sendTaskFailure(
                 request.path("taskToken").asText(),
-                request.path("cause").asText(null),
+                // A SendTaskFailure that names no cause fails the task with an empty one, not with
+                // a missing key.
+                request.path("cause").asText(""),
                 request.path("error").asText(null)
         );
         return Response.ok(objectMapper.createObjectNode()).build();

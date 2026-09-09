@@ -346,6 +346,50 @@ class CloudFormationStackSetsIntegrationTest {
     }
 
     @Test
+    void updateStackSetWithUsePreviousValuePreservesTheDeployedParameter() {
+        // UpdateStackSet, unlike UpdateStack, resolves its Parameters through the single-arg
+        // extractParameters() overload that has no previous-value map to consult. A member
+        // with UsePreviousValue=true and no ParameterValue must still resolve to the StackSet's
+        // currently deployed value, not an empty string that clobbers it.
+        String setName = "upv-" + UUID.randomUUID().toString().substring(0, 8);
+        String q1 = "upv-q1-" + UUID.randomUUID().toString().substring(0, 8);
+        String original = "orig-" + UUID.randomUUID().toString().substring(0, 8);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStackSet")
+            .formParam("StackSetName", setName)
+            .formParam("TemplateBody", queueTemplate(q1))
+            .formParam("Parameters.member.1.ParameterKey", "Suffix")
+            .formParam("Parameters.member.1.ParameterValue", original)
+            .header("Authorization", auth(ADMIN, "cloudformation"))
+        .when().post("/")
+        .then().statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "UpdateStackSet")
+            .formParam("StackSetName", setName)
+            .formParam("TemplateBody", queueTemplate(q1))
+            .formParam("Parameters.member.1.ParameterKey", "Suffix")
+            .formParam("Parameters.member.1.UsePreviousValue", "true")
+            .header("Authorization", auth(ADMIN, "cloudformation"))
+        .when().post("/")
+        .then().statusCode(200)
+            .body(containsString("<OperationId>"));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStackSet")
+            .formParam("StackSetName", setName)
+            .header("Authorization", auth(ADMIN, "cloudformation"))
+        .when().post("/")
+        .then().statusCode(200)
+            .body(containsString("<ParameterValue>" + original + "</ParameterValue>"))
+            .body(not(containsString("<ParameterValue></ParameterValue>")));
+    }
+
+    @Test
     void stackSetErrorPaths() {
         String setName = "errset-" + UUID.randomUUID().toString().substring(0, 8);
         String queue = "errq-" + UUID.randomUUID().toString().substring(0, 8);
@@ -502,6 +546,73 @@ class CloudFormationStackSetsIntegrationTest {
         .when().post("/")
         .then().statusCode(200)
             .body(containsString("<Status>FAILED</Status>"));
+    }
+
+    /**
+     * An instance whose stack rolled back is terminal, and the single-stack engine refuses to
+     * update it. That is one instance failing, not a malformed request: UpdateStackSet still
+     * answers, leaves the instance INOPERABLE, and reports the operation FAILED. Letting the
+     * refusal out would fail the whole call with a 400 and update no instance at all.
+     */
+    @Test
+    void updateStackSetReportsFailedRatherThanRefusingOverARolledBackInstance() {
+        String setName = "failset-update-" + UUID.randomUUID().toString().substring(0, 8);
+        String queueName = "failset-update-q-" + UUID.randomUUID().toString().substring(0, 8);
+        String badTemplate =
+            "{\"Resources\":{\"Nested\":{\"Type\":\"AWS::CloudFormation::Stack\",\"Properties\":{}}}}";
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStackSet")
+            .formParam("StackSetName", setName)
+            .formParam("TemplateBody", badTemplate)
+            .header("Authorization", auth(ADMIN, "cloudformation"))
+        .when().post("/")
+        .then().statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStackInstances")
+            .formParam("StackSetName", setName)
+            .formParam("Accounts.member.1", ACCOUNT_B)
+            .formParam("Regions.member.1", REGION)
+            .header("Authorization", auth(ADMIN, "cloudformation"))
+        .when().post("/")
+        .then().statusCode(200);
+
+        String operationId = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "UpdateStackSet")
+            .formParam("StackSetName", setName)
+            .formParam("TemplateBody", queueTemplate(queueName))
+            .header("Authorization", auth(ADMIN, "cloudformation"))
+        .when().post("/")
+        .then().statusCode(200)
+            .extract().path("UpdateStackSetResponse.UpdateStackSetResult.OperationId");
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStackSetOperation")
+            .formParam("StackSetName", setName)
+            .formParam("OperationId", operationId)
+            .header("Authorization", auth(ADMIN, "cloudformation"))
+        .when().post("/")
+        .then().statusCode(200)
+            .body(containsString("<Status>FAILED</Status>"));
+
+        // The instance is kept and still INOPERABLE, carrying the refusal as its reason.
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStackInstance")
+            .formParam("StackSetName", setName)
+            .formParam("StackInstanceAccount", ACCOUNT_B)
+            .formParam("StackInstanceRegion", REGION)
+            .header("Authorization", auth(ADMIN, "cloudformation"))
+        .when().post("/")
+        .then().statusCode(200)
+            .body(containsString("<DetailedStatus>FAILED</DetailedStatus>"))
+            .body(containsString(
+                    "Stack instance is in ROLLBACK_COMPLETE state and can not be updated"));
     }
 
     @Test
