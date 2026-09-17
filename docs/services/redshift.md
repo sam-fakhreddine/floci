@@ -33,12 +33,46 @@ For running SQL without a PostgreSQL wire connection (the way Lambda and Step Fu
 | `DeleteTags` | Remove tags by key from a resource |
 | `DescribeTags` | List tagged resources and their tags |
 | `CreateClusterSubnetGroup` | Register a cluster subnet group (metadata only) |
+| `CreateIntegration` | Register a zero-ETL integration (metadata only; no data is replicated). Accepts `Description`, `KMSKeyId`, `AdditionalEncryptionContext` and `TagList` |
+| `DescribeIntegrations` | List integrations with `Filters`, `MaxRecords` and `Marker` pagination, or the one an `IntegrationArn` names |
+| `DeleteIntegration` | Remove a zero-ETL integration |
 | `DescribeClusterSubnetGroups` | List subnet groups, optionally filtered by name |
 | `ModifyClusterSubnetGroup` | Update a subnet group's description or subnet list |
 | `DeleteClusterSubnetGroup` | Remove a subnet group |
 | `ModifyCluster` | Update node type, parameter group, security groups, or the master password |
 | `RebootCluster` | Restart a cluster's container |
+| `GetClusterCredentials` | Issue a short-lived DbUser / DbPassword pair the auth proxy and Data API accept for a non-master user |
+| `GetClusterCredentialsWithIAM` | Issue short-lived credentials with the DbUser derived from the caller's IAM identity |
 <!-- floci:actions:end -->
+
+## CloudFormation
+
+Floci provisions these resource types:
+
+- `AWS::Redshift::Cluster`
+- `AWS::Redshift::ClusterParameterGroup`
+- `AWS::Redshift::ClusterSubnetGroup`
+- `AWS::Redshift::ClusterSecurityGroup`
+
+### Cluster Provisioning and References
+
+For `AWS::Redshift::Cluster`:
+
+- `Ref` returns the cluster identifier.
+- `Fn::GetAtt` exposes `Endpoint.Address`, `Endpoint.Port`, and `ClusterNamespaceArn` (synthesised, stable).
+
+Replacement occurs if `ClusterIdentifier`, `DBName`, `MasterUsername`, or `ClusterSubnetGroupName` changes. Other properties (such as `NodeType`, `MasterUserPassword`, `ClusterParameterGroupName`, and `VpcSecurityGroupIds`) update in place.
+
+For `AWS::Redshift::ClusterParameterGroup`, `Parameters` is applied via `ModifyClusterParameterGroup` on both create and update. `Description` and `ParameterGroupFamily` are replacement properties, matching AWS: changing either creates a new parameter group instead of reusing the prior one.
+
+### Gaps and Limitations
+
+- `Port` is ignored: Floci assigns the dynamic host proxy port returned in `Endpoint.Port`.
+- `DBName` other than `dev` is ignored: the emulated PostgreSQL container database is always `dev`.
+- `NumberOfNodes` is not stored on cluster create: every emulated cluster is backed by a single PostgreSQL container.
+- `ManageMasterPassword` is rejected: set `MasterUserPassword` instead.
+- `SnapshotIdentifier` is ignored: a fresh cluster is created instead of restoring from a snapshot.
+- `AWS::Redshift::ClusterSecurityGroup` is accepted as metadata: Floci does not emulate the legacy EC2-Classic security group model.
 
 ## Configuration
 
@@ -50,6 +84,9 @@ For running SQL without a PostgreSQL wire connection (the way Lambda and Step Fu
 | `FLOCI_SERVICES_REDSHIFT_PROXY_BASE_PORT` | `7100` | Lowest host port the per-cluster auth proxies bind |
 | `FLOCI_SERVICES_REDSHIFT_PROXY_MAX_PORT` | `7199` | Highest host port the per-cluster auth proxies bind |
 | `FLOCI_SERVICES_REDSHIFT_ENDPOINT_HOST` | _(unset)_ | Hostname advertised in `DescribeClusters`; unset resolves from the Docker host |
+| `FLOCI_SERVICES_REDSHIFT_PROXY_HANDSHAKE_TIMEOUT_MILLIS` | `10000` | Max time a client has to complete the startup/auth handshake before the proxy drops it |
+| `FLOCI_SERVICES_REDSHIFT_PROXY_BACKEND_CONNECT_TIMEOUT_MILLIS` | `5000` | Max time the proxy waits for the backend TCP connect |
+| `FLOCI_SERVICES_REDSHIFT_PROXY_MAX_CONNECTIONS` | `100` | Max concurrent connections per proxy before new ones are refused |
 
 Redshift needs the Docker socket so it can launch PostgreSQL containers. Each cluster's container is published on a dynamically assigned host port, returned by `DescribeClusters`.
 
@@ -139,7 +176,7 @@ print(cluster["Cluster"]["Endpoint"])
 
 ## SQL Interceptor
 
-Floci's Redshift auth proxy inspects frontend queries on the PostgreSQL wire protocol (Simple Query `'Q'` protocol) and rewrites common Redshift-specific table DDL so it runs on the plain PostgreSQL backend.
+Floci's Redshift auth proxy inspects frontend queries on the PostgreSQL wire protocol and rewrites common Redshift-specific table DDL so it runs on the plain PostgreSQL backend.
 
 ### DDL compatibility
 
@@ -168,20 +205,24 @@ order) through its own S3 service and streams the rows into the backing PostgreS
   recognized: the statement is forwarded unchanged and PostgreSQL returns its own error.
 - A multi-statement query whose COPY is followed by another statement is not intercepted; send the
   COPY on its own.
-- Extended Query protocol COPY (a JDBC `PreparedStatement`, or pgjdbc's default
-  `preferQueryMode=extended`) is not intercepted. Use `preferQueryMode=simple`.
+- Extended Query COPY is supported when the complete statement is present in `Parse` and has no
+  bind parameters. Zero-parameter JDBC `PreparedStatement` calls therefore work with pgjdbc's
+  default extended mode. Statements containing bind parameters are forwarded unchanged.
 
 ### Limitations
 
-- Emulation runs on the **Simple Query protocol** (`'Q'`) only. Extended Query protocol statements (`Parse`/`Bind`/`Execute`) pass through untouched, including anything a JDBC `PreparedStatement` sends, and, with the pgjdbc default `preferQueryMode=extended`, plain `Statement` calls too. Connect with `preferQueryMode=simple` to exercise the interceptor from JDBC.
+- DDL rewriting works in both Simple Query (`'Q'`) and Extended Query (`Parse`) flows. COPY and
+  UNLOAD interception in Extended Query is limited to zero-parameter statements fully present in
+  `Parse`; parameterized statements fail open to PostgreSQL.
 - The rewrite is textual (regex-based). It masks single-quoted string literals first, so `DEFAULT` / `CHECK` string values are safe, but it is **not** comment-aware and does not recognize escape strings (`E'...'`): an apostrophe inside a `--` or `/* */` comment can make the rewrite skip a Redshift clause. That fails safe: the statement then reaches PostgreSQL, which returns its own syntax error, but avoid apostrophes-in-comments in `CREATE TABLE` / `ALTER TABLE`.
 - A `rewrite` failure or any statement the interceptor does not recognize is forwarded unmodified (fail-open); PostgreSQL then rejects the Redshift-only syntax itself.
 - Simple Query ('Q') messages larger than 16 MiB bypass the interceptor and stream through verbatim without heap buffering; non-query traffic also streams through with no size limit.
+- `GetClusterCredentials` / `GetClusterCredentialsWithIAM` mint a short-lived password held in memory (lost on restart). As in AWS, `GetClusterCredentials` prefixes the returned `DbUser` with `IAM:` when `AutoCreate` is false and `IAMA:` when it is true; that prefixed name is what the auth proxy and Data API accept. The returned `DbUser` is nominal: the session runs as the cluster master, not a distinct PostgreSQL role, so `current_user`, `GRANT`, and object ownership are the master's.
 
 ### UNLOAD to S3
 
-`UNLOAD ('<select-statement>') TO 's3://<bucket>/<prefix>' [options]` sent over the
-Simple Query protocol runs the select on the backing PostgreSQL container and writes
+`UNLOAD ('<select-statement>') TO 's3://<bucket>/<prefix>' [options]` runs the select on the
+backing PostgreSQL container and writes
 the result to S3 as one or more objects under `<prefix>`.
 
 - Framing defaults to pipe-delimited text; `FORMAT CSV` (or `CSV`) switches to CSV
@@ -211,7 +252,33 @@ the result to S3 as one or more objects under `<prefix>`.
 - Any other option (`PARQUET`, `ENCRYPTED`, `REGION`, `IAM_ROLE` / `CREDENTIALS`,
   `ZSTD`, `EXTENSION`, `CLEANPATH`, `PARTITION`, and so on) is not intercepted; the
   statement is forwarded and PostgreSQL reports its own error.
-- Extended Query protocol UNLOAD (a JDBC `PreparedStatement`) is not intercepted.
+- Extended Query UNLOAD is supported when the complete statement is present in `Parse` and has no
+  bind parameters. Parameterized statements are forwarded unchanged.
+
+## Catalog Views
+
+When a Redshift cluster container starts, Floci bootstraps common Redshift system and catalog views into both `template1` (ensuring any future `CREATE DATABASE` inherits them automatically) and the active cluster database (`dev`). This ensures BI tools (Tableau, Looker, DBeaver), ORMs, and migration tools (Flyway, Liquibase, dbt) can introspect database schema metadata without missing-relation errors:
+
+- `pg_table_def`: Table and column metadata (`schemaname`, `tablename`, `column`, `type`, `encoding`, `distkey`, `sortkey`, `notnull`).
+- `svv_table_info`: Table-level summary metadata (`database`, `schema`, `table_id`, `table`, `encoded`, `diststyle`, `sortkey1`, `max_varchar`, `tbl_rows`, `size`).
+- `svv_all_columns`: All columns across database schemas (`database_name`, `schema_name`, `table_name`, `column_name`, `data_type`, `is_nullable`).
+- `svv_columns`: Column catalog list (`table_catalog`, `table_schema`, `table_name`, `column_name`, `ordinal_position`, `column_default`, `is_nullable`, `data_type`).
+- `svv_tables`: Table catalog list (`table_catalog`, `table_schema`, `table_name`, `table_type`).
+- `stv_tbl_perm`: Table persistence metadata (`id`, `name`, `db_id`, `temp`, `backup`).
+- `stl_load_errors`: Table exposing the documented Redshift load-error schema for catalog and tooling compatibility.
+- `svl_qlog`: Query execution log view (`userid`, `query`, `xid`, `pid`, `starttime`, `endtime`, `elapsed`, `aborted`, `label`).
+- `pg_user_info`: User catalog information (`usesysid`, `usename`, `usecreatedb`, `usesuper`, `useconnlimit`, `syslogaccess`).
+- `svl_user_info`: Standard Redshift user information view matching AWS documented columns.
+- `pg_database_info`: Database catalog information (`datid`, `datname`, `datdba`, `encoding`, `datconnlimit`).
+- `stv_sessions`: Active database sessions (`process`, `user_name`, `db_name`, `starttime`, `timeout_sec`).
+- `stv_recents`: Recently executed queries (`userid`, `pid`, `process`, `query`, `starttime`, `duration`, `status`).
+- `svv_transactions`: Current transaction status (`txn_owner`, `txn_db`, `xid`, `pid`, `txn_start`, `lock_mode`, `relation`, `granted`).
+- `stv_slices`: Cluster slice metadata (`node`, `slice`, `localslice`, `type`).
+- `stl_query`: Dynamic query execution log view mapped from `pg_stat_activity` (`query`, `xid`, `pid`, `userid`, `starttime`, `endtime`, `elapsed`, `querytxt`, `database`, `aborted`, `insert_pristine`, `concurrency_scaling_status`).
+- `stv_wlm_query_state`: Dynamic WLM query state view (`xid`, `task`, `query`, `service_class`, `slot_count`, `wlm_start_time`, `queue_time`, `exec_time`, `state`, `query_priority`).
+- `svv_diskusage`: Disk space usage summary per relation exposing full documented Redshift block layout columns (`db_id`, `name`, `slice`, `col`, `tbl`, `blocknum`, `num_values`, `minvalue`, `maxvalue`, `sb_pos`, `pinned`, `on_disk`, `modified`, `hdr_modified`, `unsorted`, `tombstone`, `preferred_diskno`, `temporary`, `newblock`) as well as compatibility aliases (`database`, `schema`, `table_id`, `size`, `used`).
+
+These views expose the documented Redshift column names, types, and ordering mapped from PostgreSQL internal catalogs (`pg_catalog`, `information_schema`, `pg_stat_activity`), with deterministic placeholders where PostgreSQL cannot provide multi-node metrics.
 
 ## Out of Scope
 
@@ -220,5 +287,5 @@ the result to S3 as one or more objects under `<prefix>`.
 - Parameter groups apply no real engine settings; values are stored and echoed back only.
 - Subnet groups, VPC routing, and security groups are metadata only.
 - Resize, pause/resume, IAM authentication, snapshot schedules, and cross-region snapshot copy.
-- The auth proxy validates only the master user's password. Non-master users pass straight through to PostgreSQL, which remains the authority for their credentials.
-- IAM database authentication (`GetClusterCredentials`), and `sslmode=verify-full` against the self-signed proxy certificate.
+- The auth proxy validates the master user's password and any live `GetClusterCredentials` credential. Other non-master users pass straight through to PostgreSQL, which remains the authority for their credentials.
+- IAM database authentication over the wire, and `sslmode=verify-full` against the self-signed proxy certificate.

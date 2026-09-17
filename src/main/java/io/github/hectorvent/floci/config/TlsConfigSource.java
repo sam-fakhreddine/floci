@@ -45,6 +45,16 @@ public class TlsConfigSource implements ConfigSource {
 
     private static final Logger LOG = Logger.getLogger(TlsConfigSource.class);
 
+    static final String NAME = "FlociTlsConfigSource";
+
+    /**
+     * Internal ports Quarkus binds when TLS is enabled. {@link TlsProxyServer} listens on the
+     * public Floci port and routes to these by protocol, so the two classes must agree; they are
+     * declared here, next to the properties that set them, and referenced from the proxy.
+     */
+    static final int HTTP_INTERNAL_PORT = 4510;
+    static final int HTTPS_INTERNAL_PORT = 4511;
+
     private static final String SERVER_CERT_NAME = "floci-server.crt";
     private static final String SERVER_KEY_NAME = "floci-server.key";
     private static final String SERVER_METADATA_NAME = "floci-server.metadata.json";
@@ -101,8 +111,7 @@ public class TlsConfigSource implements ConfigSource {
             trustAnchor = ca.certificatePath();
 
             if (Files.exists(certFile) && Files.exists(keyFile)) {
-                List<String> currentHostnames = new ArrayList<>(DEFAULT_SAN_HOSTNAMES);
-                currentHostnames.addAll(extractCustomHostnames());
+                List<String> currentHostnames = configuredSanHostnames();
 
                 // Regenerate when the hostname config changed, when the existing leaf was not
                 // issued by the current CA (a pre-CA self-signed cert, or the CA was regenerated),
@@ -136,8 +145,8 @@ public class TlsConfigSource implements ConfigSource {
         // and does protocol detection to route HTTP and HTTPS to the correct backend.
         properties.put("quarkus.http.insecure-requests", "enabled");
         properties.put("quarkus.http.host", "127.0.0.1");
-        properties.put("quarkus.http.port", "4510");
-        properties.put("quarkus.http.ssl-port", "4511");
+        properties.put("quarkus.http.port", String.valueOf(HTTP_INTERNAL_PORT));
+        properties.put("quarkus.http.ssl-port", String.valueOf(HTTPS_INTERNAL_PORT));
 
         LOG.infov("TLS: HTTPS enabled, proxy will listen on port {0} (HTTP+HTTPS), cert={1}",
                 resolveProperty("floci.port", "4566"), certPath);
@@ -161,7 +170,7 @@ public class TlsConfigSource implements ConfigSource {
 
     @Override
     public String getName() {
-        return "FlociTlsConfigSource";
+        return NAME;
     }
 
     /**
@@ -184,11 +193,45 @@ public class TlsConfigSource implements ConfigSource {
         return defaultValue;
     }
 
+    /**
+     * The full SAN list the server certificate must cover for the current configuration:
+     * defaults, custom hostnames, and the AWS endpoint wildcards when
+     * {@code floci.dns.spoof-aws-endpoints} is enabled. Used both for generation and for the
+     * change detection that triggers regeneration, so flipping the spoof flag regenerates the
+     * certificate.
+     */
+    private List<String> configuredSanHostnames() {
+        List<String> sans = new ArrayList<>(DEFAULT_SAN_HOSTNAMES);
+        sans.addAll(extractCustomHostnames());
+        sans.addAll(awsSpoofSans());
+        return sans;
+    }
+
+    /**
+     * SANs covering AWS endpoint hostnames spoofed by the embedded DNS server.
+     * Wildcards match a single label, so {@code *.amazonaws.com} covers global
+     * endpoints ({@code sts.amazonaws.com}) and {@code *.<region>.amazonaws.com}
+     * covers regional ones ({@code sts.us-east-1.amazonaws.com}) for the default
+     * region, the only region resolvable this early (pre-CDI, property-based).
+     */
+    private List<String> awsSpoofSans() {
+        if (!"true".equalsIgnoreCase(resolveProperty("floci.dns.spoof-aws-endpoints", "false"))) {
+            return List.of();
+        }
+        String region = resolveProperty("floci.default-region", "us-east-1");
+        // A wildcard matches exactly one label (RFC 6125 6.4.3), so the two broad
+        // wildcards miss virtual-hosted addressing, where the bucket adds a label:
+        // my-bucket.s3.amazonaws.com and my-bucket.s3.<region>.amazonaws.com. The DNS
+        // spoof does route those, so without these the handshake fails on a hostname
+        // mismatch rather than the request reaching Floci.
+        return List.of("*.amazonaws.com", "*." + region + ".amazonaws.com",
+                "*.s3.amazonaws.com", "*.s3." + region + ".amazonaws.com");
+    }
+
     private void generateServerCert(Path tlsDir, Path certFile, Path keyFile, FlociCertificateAuthority ca) {
         try {
             Files.createDirectories(tlsDir);
-            List<String> configured = new ArrayList<>(DEFAULT_SAN_HOSTNAMES);
-            configured.addAll(extractCustomHostnames());
+            List<String> configured = configuredSanHostnames();
             List<String> learned = readLearnedHostnames(tlsDir, certFile);
             List<String> allSans = new ArrayList<>(configured);
             for (String name : learned) {

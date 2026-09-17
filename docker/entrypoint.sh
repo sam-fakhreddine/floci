@@ -36,7 +36,9 @@ if [ "$(id -u)" = '0' ]; then
     # group. Supplementary groups are set by number, so the group needs no /etc/group entry.
     # --skip-chdir keeps the working directory (/app, where relative data paths resolve); GNU
     # chroot would otherwise chdir to the new root.
-    exec chroot --userspec=1001:0 --groups="$groups" --skip-chdir / "$0" "$@"
+    if [ "${FLOCI_RUN_AS_ROOT:-false}" != 'true' ]; then
+        exec chroot --userspec=1001:0 --groups="$groups" --skip-chdir / "$0" "$@"
+    fi
 fi
 
 if [ "${LOCALSTACK_PARITY:-true}" != "false" ]; then
@@ -71,11 +73,13 @@ fi
 # ignores its argv entirely, so this keeps drop-in parity.
 # The default matches the CMD of the image variant: native images ship
 # /app/application, JVM images ship /app/quarkus-app/quarkus-run.jar.
+# Both listen on 0.0.0.0 so a published port reaches Floci, which it only
+# accepts with explicit consent. The JVM reads -D options only before -jar.
 if [ $# -eq 0 ]; then
     if [ -x /app/application ]; then
-        set -- /app/application -Dquarkus.http.host=0.0.0.0
+        set -- /app/application -Dquarkus.http.host=0.0.0.0 -Dfloci.security.allow-unsafe-network-exposure=true
     else
-        set -- java -jar /app/quarkus-app/quarkus-run.jar -Dquarkus.http.host=0.0.0.0
+        set -- java -Dquarkus.http.host=0.0.0.0 -Dfloci.security.allow-unsafe-network-exposure=true -jar /app/quarkus-app/quarkus-run.jar
     fi
 fi
 

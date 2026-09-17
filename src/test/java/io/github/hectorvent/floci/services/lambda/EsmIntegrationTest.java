@@ -223,6 +223,8 @@ class EsmIntegrationTest {
                 .body("""
                         {
                           "BisectBatchOnFunctionError": true,
+                          "MaximumRetryAttempts": 3,
+                          "MaximumRecordAgeInSeconds": 120,
                           "DestinationConfig": {
                             "OnFailure": {
                               "Destination": "%s"
@@ -235,6 +237,8 @@ class EsmIntegrationTest {
                 .then()
                 .statusCode(202)
                 .body("BisectBatchOnFunctionError", equalTo(true))
+                .body("MaximumRetryAttempts", equalTo(3))
+                .body("MaximumRecordAgeInSeconds", equalTo(120))
                 .body("DestinationConfig.OnFailure.Destination", equalTo(destinationArn));
 
         given()
@@ -243,12 +247,31 @@ class EsmIntegrationTest {
                 .then()
                 .statusCode(200)
                 .body("BisectBatchOnFunctionError", equalTo(true))
+                .body("MaximumRetryAttempts", equalTo(3))
+                .body("MaximumRecordAgeInSeconds", equalTo(120))
                 .body("DestinationConfig.OnFailure.Destination", equalTo(destinationArn));
 
         given()
                 .delete(LAMBDA_BASE + "/event-source-mappings/" + uuid)
                 .then()
                 .statusCode(202);
+    }
+
+    @Test
+    void createEventSourceMappingRejectsMaximumRecordAgeBelowMinimum() {
+        given()
+                .contentType("application/json")
+                .body("""
+                        {
+                          "FunctionName": "%s",
+                          "EventSourceArn": "%s",
+                          "MaximumRecordAgeInSeconds": 59
+                        }
+                        """.formatted(FUNCTION_NAME, QUEUE_ARN))
+                .when()
+                .post(LAMBDA_BASE + "/event-source-mappings")
+                .then()
+                .statusCode(400);
     }
 
     @Test
@@ -266,6 +289,8 @@ class EsmIntegrationTest {
                 .then()
                 .statusCode(202)
                 .body("$", not(hasKey("BisectBatchOnFunctionError")))
+                .body("$", not(hasKey("MaximumRetryAttempts")))
+                .body("$", not(hasKey("MaximumRecordAgeInSeconds")))
                 .body("$", not(hasKey("DestinationConfig")))
                 .extract()
                 .path("UUID");
@@ -1369,5 +1394,113 @@ class EsmIntegrationTest {
 
         given().delete(LAMBDA_BASE + "/event-source-mappings/" + uuidWith).then().statusCode(202);
         given().delete(LAMBDA_BASE + "/event-source-mappings/" + uuidWithout).then().statusCode(202);
+    }
+
+    // ── Request-shape validation ────────────────────────────────────────────────
+
+    @Test
+    @Order(90)
+    void createEventSourceMapping_rejectsUnknownFunctionResponseType() {
+        given()
+            .contentType("application/json")
+            .body("""
+                {
+                    "FunctionName": "%s",
+                    "EventSourceArn": "%s",
+                    "FunctionResponseTypes": ["Bogus"]
+                }
+                """.formatted(FUNCTION_NAME, QUEUE_ARN))
+        .when()
+            .post(LAMBDA_BASE + "/event-source-mappings")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("ValidationException"));
+    }
+
+    @Test
+    @Order(91)
+    void updateEventSourceMapping_appliesAndRejectsFunctionResponseTypes() {
+        String uuid = given()
+            .contentType("application/json")
+            .body("""
+                {
+                    "FunctionName": "%s",
+                    "EventSourceArn": "%s"
+                }
+                """.formatted(FUNCTION_NAME, QUEUE_ARN))
+        .when()
+            .post(LAMBDA_BASE + "/event-source-mappings")
+        .then()
+            .statusCode(202)
+            .extract().path("UUID");
+
+        try {
+            given()
+                .contentType("application/json")
+                .body("{ \"FunctionResponseTypes\": [\"Bogus\"] }")
+            .when()
+                .put(LAMBDA_BASE + "/event-source-mappings/" + uuid)
+            .then()
+                .statusCode(400)
+                .body("__type", equalTo("ValidationException"));
+
+            given()
+                .contentType("application/json")
+                .body("{ \"FunctionResponseTypes\": [\"ReportBatchItemFailures\"] }")
+            .when()
+                .put(LAMBDA_BASE + "/event-source-mappings/" + uuid)
+            .then()
+                .statusCode(202)
+                .body("FunctionResponseTypes", hasItem("ReportBatchItemFailures"));
+        } finally {
+            given().delete(LAMBDA_BASE + "/event-source-mappings/" + uuid);
+        }
+    }
+
+    @Test
+    @Order(92)
+    void listEventSourceMappings_rejectsMalformedEventSourceArn() {
+        given()
+        .when()
+            .get(LAMBDA_BASE + "/event-source-mappings?EventSourceArn=not-an-arn")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("ValidationException"));
+    }
+
+    @Test
+    @Order(93)
+    void listEventSourceMappings_filtersByEventSourceArn() {
+        String uuid = given()
+            .contentType("application/json")
+            .body("""
+                {
+                    "FunctionName": "%s",
+                    "EventSourceArn": "%s"
+                }
+                """.formatted(FUNCTION_NAME, QUEUE_ARN))
+        .when()
+            .post(LAMBDA_BASE + "/event-source-mappings")
+        .then()
+            .statusCode(202)
+            .extract().path("UUID");
+
+        try {
+            given()
+            .when()
+                .get(LAMBDA_BASE + "/event-source-mappings?EventSourceArn=" + QUEUE_ARN)
+            .then()
+                .statusCode(200)
+                .body("EventSourceMappings.UUID", hasItem(uuid));
+
+            given()
+            .when()
+                .get(LAMBDA_BASE + "/event-source-mappings?EventSourceArn=" + STREAM_ARN)
+            .then()
+                .statusCode(200)
+                .body("EventSourceMappings.UUID", not(hasItem(uuid)));
+        } finally {
+            given().delete(LAMBDA_BASE + "/event-source-mappings/" + uuid);
+        }
     }
 }

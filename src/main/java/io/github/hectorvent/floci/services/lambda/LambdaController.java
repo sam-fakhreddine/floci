@@ -308,8 +308,9 @@ public class LambdaController {
 
     @GET
     @Path("/event-source-mappings")
-    public Response listEventSourceMappings(@QueryParam("FunctionName") String functionArn) {
-        List<EventSourceMapping> esms = lambdaService.listEventSourceMappings(functionArn);
+    public Response listEventSourceMappings(@QueryParam("FunctionName") String functionArn,
+                                            @QueryParam("EventSourceArn") String eventSourceArn) {
+        List<EventSourceMapping> esms = lambdaService.listEventSourceMappings(functionArn, eventSourceArn);
         ObjectNode root = objectMapper.createObjectNode();
         ArrayNode items = root.putArray("EventSourceMappings");
         for (EventSourceMapping esm : esms) {
@@ -367,6 +368,13 @@ public class LambdaController {
 
         if (esm.getBisectBatchOnFunctionError() != null) {
             node.put("BisectBatchOnFunctionError", esm.getBisectBatchOnFunctionError());
+        }
+
+        if (esm.getMaximumRetryAttempts() != null) {
+            node.put("MaximumRetryAttempts", esm.getMaximumRetryAttempts());
+        }
+        if (esm.getMaximumRecordAgeInSeconds() != null) {
+            node.put("MaximumRecordAgeInSeconds", esm.getMaximumRecordAgeInSeconds());
         }
 
         if (esm.getDestinationConfig() != null && esm.getDestinationConfig().getOnFailure() != null) {

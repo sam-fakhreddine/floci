@@ -192,6 +192,56 @@ class RdsSigV4ValidatorTest {
     }
 
     @Test
+    void validateBindsTokenToPublishedMysqlEndpointAndRegion() throws Exception {
+        IamService iamService = IamServiceTestHelper.iamServiceWithAccessKey("AKIDRDS", "secret-rds");
+        RdsSigV4Validator validator = new RdsSigV4Validator(iamService);
+        String token = SigV4TokenTestHelper.createRdsToken(
+                "db.example.local", 3307, "admin", "AKIDRDS", "secret-rds",
+                Instant.now().minusSeconds(60), 900);
+
+        assertTrue(validator.validate(token, "admin",
+                new RdsMysqlBinding("db.example.local", 3307, "us-east-1")));
+        assertFalse(validator.validate(token, "admin",
+                new RdsMysqlBinding("db.example.local", 3306, "us-east-1")));
+    }
+
+    @Test
+    void validateRejectsTokenSignedForAnotherHost() throws Exception {
+        IamService iamService = IamServiceTestHelper.iamServiceWithAccessKey("AKIDRDS", "secret-rds");
+        RdsSigV4Validator validator = new RdsSigV4Validator(iamService);
+        String token = SigV4TokenTestHelper.createRdsToken(
+                "db.example.local", 3307, "admin", "AKIDRDS", "secret-rds",
+                Instant.now().minusSeconds(60), 900);
+
+        assertFalse(validator.validate(token, "admin",
+                new RdsMysqlBinding("other.example.local", 3307, "us-east-1")));
+    }
+
+    @Test
+    void validateRejectsTokenSignedForAnotherRegion() throws Exception {
+        IamService iamService = IamServiceTestHelper.iamServiceWithAccessKey("AKIDRDS", "secret-rds");
+        RdsSigV4Validator validator = new RdsSigV4Validator(iamService);
+        String token = SigV4TokenTestHelper.createRdsToken(
+                "db.example.local", 3307, "admin", "AKIDRDS", "secret-rds",
+                Instant.now().minusSeconds(60), 900);
+
+        assertFalse(validator.validate(token, "admin",
+                new RdsMysqlBinding("db.example.local", 3307, "eu-west-1")));
+    }
+
+    @Test
+    void validateRejectsTokenSignedForAnotherService() throws Exception {
+        IamService iamService = IamServiceTestHelper.iamServiceWithAccessKey("AKIDRDS", "secret-rds");
+        RdsSigV4Validator validator = new RdsSigV4Validator(iamService);
+        String token = SigV4TokenTestHelper.createRdsTokenWithScope(
+                "db.example.local", 3307, "admin", "AKIDRDS", "secret-rds",
+                "us-east-1", "s3", Instant.now().minusSeconds(60), 900);
+
+        assertFalse(validator.validate(token, "admin",
+                new RdsMysqlBinding("db.example.local", 3307, "us-east-1")));
+    }
+
+    @Test
     void validateAcceptsTokenWhenClientUsernameIsNull() throws Exception {
         IamService iamService = IamServiceTestHelper.iamServiceWithAccessKey("AKIDRDS", "secret-rds");
 
@@ -283,11 +333,55 @@ class RdsSigV4ValidatorTest {
                 accessKeyId,
                 secretAccessKey,
                 Instant.now().minusSeconds(60),
-                900
+                900,
+                "session-token"
         );
 
         assertTrue(validator.validate(token, "admin"),
                 "Validator must accept RDS IAM tokens signed with STS session credentials (ASIA… keys)");
+    }
+
+    @Test
+    void validateRejectsStsCredentialWithoutIssuedSessionToken() throws Exception {
+        String accessKeyId = "ASIAIOSFODNN7EXAMPLE";
+        String secretAccessKey = "sts-generated-secret-key";
+        IamService iamService = IamServiceTestHelper.iamServiceWithSessionCredential(accessKeyId, secretAccessKey);
+        RdsSigV4Validator validator = new RdsSigV4Validator(iamService);
+
+        String token = SigV4TokenTestHelper.createRdsToken(
+                "db.example.local", 5432, "admin", accessKeyId, secretAccessKey,
+                Instant.now().minusSeconds(60), 900);
+
+        assertFalse(validator.validate(token, "admin"));
+    }
+
+    @Test
+    void validateRejectsStsCredentialWithMismatchedSessionToken() throws Exception {
+        String accessKeyId = "ASIAIOSFODNN7EXAMPLE";
+        String secretAccessKey = "sts-generated-secret-key";
+        IamService iamService = IamServiceTestHelper.iamServiceWithSessionCredential(accessKeyId, secretAccessKey);
+        RdsSigV4Validator validator = new RdsSigV4Validator(iamService);
+
+        String token = SigV4TokenTestHelper.createRdsToken(
+                "db.example.local", 5432, "admin", accessKeyId, secretAccessKey,
+                Instant.now().minusSeconds(60), 900, "wrong-session-token");
+
+        assertFalse(validator.validate(token, "admin"));
+    }
+
+    @Test
+    void validateRejectsExpiredStsCredentialEvenWithMatchingSessionToken() throws Exception {
+        String accessKeyId = "ASIAIOSFODNN7EXAMPLE";
+        String secretAccessKey = "sts-generated-secret-key";
+        IamService iamService = IamServiceTestHelper.iamServiceWithSessionCredential(
+                accessKeyId, secretAccessKey, "session-token", Instant.now().minusSeconds(1));
+        RdsSigV4Validator validator = new RdsSigV4Validator(iamService);
+
+        String token = SigV4TokenTestHelper.createRdsToken(
+                "db.example.local", 5432, "admin", accessKeyId, secretAccessKey,
+                Instant.now().minusSeconds(60), 900, "session-token");
+
+        assertFalse(validator.validate(token, "admin"));
     }
 
     @Test

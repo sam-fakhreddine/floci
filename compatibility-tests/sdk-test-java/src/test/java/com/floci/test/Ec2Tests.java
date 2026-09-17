@@ -278,6 +278,22 @@ class Ec2Tests {
                 .containsExactly("arm64");
     }
 
+    /** Regression coverage for the Karpenter instance-type compatibility contract. */
+    @Test
+    @Order(7)
+    @DisplayName("DescribeInstanceTypes - supported usage classes")
+    void describeInstanceTypeSupportedUsageClasses() {
+        DescribeInstanceTypesResponse resp = ec2.describeInstanceTypes(DescribeInstanceTypesRequest.builder()
+                .instanceTypes(InstanceType.M5_LARGE, InstanceType.fromValue("t4g.medium"),
+                        InstanceType.fromValue("m6gd.large"))
+                .build());
+
+        assertThat(resp.instanceTypes()).hasSize(3);
+        assertThat(resp.instanceTypes()).allSatisfy(instanceType ->
+                assertThat(instanceType.supportedUsageClassesAsStrings())
+                        .containsExactlyInAnyOrder("on-demand", "spot"));
+    }
+
     @Test
     @Order(7)
     @DisplayName("CreateFleet - dry-run and instant on-demand launch")
@@ -469,6 +485,19 @@ class Ec2Tests {
                 .satisfies(e -> {
                     Ec2Exception ec2Ex = (Ec2Exception) e;
                     assertThat(ec2Ex.awsErrorDetails().errorCode()).isEqualTo("InvalidKeyPair.Duplicate");
+                });
+    }
+
+    @Test
+    @Order(18)
+    @DisplayName("CreateKeyPair - missing KeyName returns MissingParameter")
+    void createKeyPairWithoutNameIsRejected() {
+        assertThatThrownBy(() -> ec2.createKeyPair(CreateKeyPairRequest.builder().build()))
+                .isInstanceOf(Ec2Exception.class)
+                .satisfies(e -> {
+                    Ec2Exception ec2Ex = (Ec2Exception) e;
+                    assertThat(ec2Ex.awsErrorDetails().errorCode()).isEqualTo("MissingParameter");
+                    assertThat(ec2Ex.statusCode()).isEqualTo(400);
                 });
     }
 
@@ -796,7 +825,9 @@ class Ec2Tests {
     @Order(46)
     @DisplayName("DeleteKeyPair - delete key pair")
     void deleteKeyPair() {
-        ec2.deleteKeyPair(DeleteKeyPairRequest.builder().keyName(keyName).build());
+        DeleteKeyPairResponse resp = ec2.deleteKeyPair(DeleteKeyPairRequest.builder().keyName(keyName).build());
+        assertThat(resp.returnValue()).isTrue();
+        assertThat(resp.keyPairId()).isNotNull().startsWith("key-");
     }
 
     @Test

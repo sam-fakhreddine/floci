@@ -25,6 +25,29 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
 ```
 
+The container normally switches to the unprivileged `floci` user (UID 1001), including when started with `--user root`. If the mounted socket is accessible only to root, set the entrypoint option `FLOCI_RUN_AS_ROOT=true` to keep Floci running as root:
+
+```bash
+docker run --rm -p 4566:4566 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e FLOCI_RUN_AS_ROOT=true \
+  floci/floci:latest
+```
+
+In Docker Compose, use the same environment variable:
+
+```yaml
+services:
+  floci:
+    image: floci/floci:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      FLOCI_RUN_AS_ROOT: "true"
+```
+
+Use this only when the socket's permissions require root. Without the option, Floci retains its unprivileged default. The setting applies to the container entrypoint, not to `floci.docker` configuration.
+
 ## Private Registry Authentication
 
 Any service that pulls a container image from a private registry (Lambda image functions, custom OpenSearch images, private Postgres images, etc.) needs Docker credentials. Two approaches are supported and can be combined.
@@ -225,6 +248,12 @@ What each setting does and why it is needed:
     given host (here the `FLOCI_HOSTNAME` value), skipping Floci's
     auto-detection entirely. See the [Lambda docs](../services/lambda.md#configuration)
     for details.
+
+## Transient I/O retry
+
+All of Floci's short-lived docker calls (create/start/inspect/remove container, volume management, image operations) travel one shared daemon socket, and under fan-out load the daemon occasionally drops a connection mid-call with `java.io.IOException: Broken pipe`. Floci retries these transient failures centrally, at the docker transport layer — up to 6 attempts with a capped exponential backoff (500ms base, 8s cap) — so every call site is covered without per-call configuration, and a genuine daemon rejection (a 4xx, a name conflict) still surfaces immediately.
+
+A request is only replayed when doing so cannot change semantics: requests carrying a one-shot upload stream (e.g. copying an archive into a container), bidirectional attach streams, and `exec` requests (which would re-run the command) are never retried. Long-lived streaming connections (log follow, exec output) use a separate transport that does not retry at all.
 
 ## Full Reference
 

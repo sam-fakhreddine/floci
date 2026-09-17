@@ -87,7 +87,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     private static final String SERVICE_LINKED_ROLE_NAME_PREFIX = "AWSServiceRoleFor";
     private static final Map<String, String> SERVICE_LINKED_ROLE_NAMES = Map.of(
             "autoscaling.amazonaws.com", "AutoScaling",
-            "cloud9.amazonaws.com", "AWSCloud9"
+            "cloud9.amazonaws.com", "AWSCloud9",
+            "ram.amazonaws.com", "ResourceAccessManager"
     );
     private static final String AMAZONAWS_DOMAIN = ".amazonaws.com";
     /** AWSServiceName as AWS constrains it: 1-128 characters of {@code [\w+=,.@-]}. */
@@ -275,8 +276,17 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         Map<String, IamPolicy> catalog = new LinkedHashMap<>();
         for (AwsManagedPolicies.ManagedPolicyDef def : AwsManagedPolicies.POLICIES) {
             String arn = def.arn();
+            // The bundled document is the policy's current default version, served under the
+            // version id AWS actually reports for it (v3 for AmazonS3ReadOnlyAccess, v1 for
+            // AdministratorAccess) so GetPolicy/ListPolicyVersions match a real account.
+            // Superseded versions are not bundled, so they resolve to NoSuchEntity.
+            Instant now = Instant.now();
+            Instant updateDate = def.updateDate() != null ? def.updateDate() : now;
+            Instant createDate = def.createDate() != null ? def.createDate() : updateDate;
+            PolicyVersion defaultVersion = new PolicyVersion(
+                    def.defaultVersionId(), def.document(), true, updateDate);
             catalog.put(arn, new IamPolicy("ANPA" + randomId(16), def.name(), def.path(), arn,
-                    def.description(), def.document()));
+                    def.description(), defaultVersion, createDate, updateDate));
         }
         return catalog;
     }
@@ -1414,6 +1424,13 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         return profile;
     }
 
+    public Optional<InstanceProfile> findInstanceProfile(String accountId, String profileName) {
+        if (instanceProfiles instanceof AccountAwareStorageBackend<InstanceProfile> aware) {
+            return aware.getForAccount(accountId, profileName);
+        }
+        return instanceProfiles.get(profileName);
+    }
+
     public InstanceProfile getInstanceProfile(String instanceProfileName) {
         return instanceProfiles.get(instanceProfileName)
                 .orElseThrow(() -> new AwsException("NoSuchEntity",
@@ -1921,8 +1938,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     /**
-     * Stores an assumed-role session including the temporary secret access key so that
-     * {@link #findSecretKey(String)} can resolve it for RDS/ElastiCache IAM token validation.
+     * Stores an assumed-role session including the temporary secret access key. Token-aware
+     * authentication paths use the overload that also records the session token.
      */
     public void registerSession(String sessionAccessKeyId, String secretAccessKey, String roleArn,
                                 java.time.Instant expiration, String sessionPolicyDocument) {
@@ -2008,6 +2025,33 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         }
         LOG.debugv("Registered Lambda execution-role session {0} under account {1} for {2}",
                 sessionAccessKeyId, accountId, roleArn);
+    }
+
+    /** Registers an IMDS session in the profile's account, outside request scope. */
+    public void registerEc2InstanceSession(SessionCredential session) {
+        if (session.getOriginAccountId() == null || session.getOriginAccountId().isBlank()
+                || session.getEc2InstanceId() == null || session.getEc2InstanceId().isBlank()) {
+            throw new IllegalArgumentException("EC2 session account and instance ID must not be blank");
+        }
+        if (sessions instanceof AccountAwareStorageBackend<SessionCredential> aware) {
+            aware.putForAccount(session.getOriginAccountId(), session.getAccessKeyId(), session);
+        } else {
+            sessions.put(session.getAccessKeyId(), session);
+        }
+    }
+
+    /** IMDS registrations are rebuilt on startup; discard credentials from the previous server. */
+    public int sweepOrphanedEc2InstanceSessions() {
+        List<SessionCredential> stored = sessions instanceof AccountAwareStorageBackend<SessionCredential> aware
+                ? aware.scanAllAccounts() : sessions.scan(key -> true);
+        int removed = 0;
+        for (SessionCredential session : stored) {
+            if (session.getEc2InstanceId() != null) {
+                deleteSession(session.getAccessKeyId(), session);
+                removed++;
+            }
+        }
+        return removed;
     }
 
     /** Removes a session from an explicit account namespace. */
@@ -2175,9 +2219,13 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 return Optional.empty();
             }
             String roleArn = session.getRoleArn();
+            if (roleArn == null) {
+                return Optional.empty();
+            }
             String roleName = roleArn.contains("/") ? roleArn.substring(roleArn.lastIndexOf('/') + 1) : "UnknownRole";
             String accountId = AwsArnUtils.accountOrDefault(roleArn, regionResolver.getAccountId());
-            return Optional.of(AwsArnUtils.Arn.of("sts", "", accountId, "assumed-role/" + roleName + "/floci-session").toString());
+            return Optional.of(AwsArnUtils.Arn.of("sts", "", accountId, "assumed-role/" + roleName + "/"
+                    + (session.getEc2InstanceId() != null ? session.getEc2InstanceId() : "floci-session")).toString());
         }
 
         return Optional.empty();
