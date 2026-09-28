@@ -61,6 +61,7 @@ Per-module requirements:
 | `sdk-test-awscli` | AWS CLI v2, bash, jq                |
 | `sdk-test-java`   | Java 17+, Maven                     |
 | `sdk-test-go`     | Go 1.24+                            |
+| `compat-cdk`      | Node.js 20+, npm, Python 3, bats-core |
 
 ## Setup
 
@@ -114,8 +115,17 @@ Bats-based suites keep their normal console output and also write JUnit XML repo
 
 - `sdk-test-awscli/test-results/junit.xml`
 - `compat-cdk/test-results/junit.xml`
-- `compat-terraform/test-results/junit.xml`
-- `compat-opentofu/test-results/junit.xml`
+- `compat-terraform/test-results/junit-<bats file>.xml`
+- `compat-opentofu/test-results/junit-<bats file>.xml`
+
+The Terraform and OpenTofu suites run each `test/*.bats` file in its own process
+concurrently, so they write one report per file rather than a single `junit.xml`.
+Every consumer globs the directory, so nothing downstream changes. Set
+`BATS_PARALLEL_FILES=0` to run the files one at a time when isolating a failure.
+Each file also runs under a `BATS_FILE_TIMEOUT` (default `12m`): a fixture that hangs
+fails under its own name with its TAP output ending at the stuck test, and the reports of
+the files that finished are still published, instead of the whole job dying at the
+workflow's 20 minute limit with nothing reported.
 
 ## Configuration
 

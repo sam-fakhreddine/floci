@@ -2,14 +2,15 @@ package io.github.hectorvent.floci.services.stepfunctions;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationQueryHandler;
+import io.github.hectorvent.floci.services.dynamodb.DynamoDbFacade;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbJsonHandler;
-import io.github.hectorvent.floci.services.dynamodb.DynamoDbService;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ecs.EcsJsonHandler;
 import io.github.hectorvent.floci.services.ecs.EcsService;
 import io.github.hectorvent.floci.services.lambda.LambdaExecutorService;
 import io.github.hectorvent.floci.services.lambda.LambdaFunctionStore;
 import io.github.hectorvent.floci.services.s3.S3Service;
+import io.github.hectorvent.floci.services.sns.SnsJsonHandler;
 import io.github.hectorvent.floci.services.sqs.SqsJsonHandler;
 import io.github.hectorvent.floci.services.stepfunctions.model.Execution;
 import io.github.hectorvent.floci.services.stepfunctions.model.HistoryEvent;
@@ -27,7 +28,9 @@ import static org.mockito.Mockito.mock;
 /**
  * End-to-end coverage for the ResultPath fix: a non-applicable ResultPath fails the execution with
  * {@code States.ResultPathMatchFailure} (was a silent input discard), the error is catchable via a
- * Parallel state's {@code Catch}, and object inputs merge unchanged.
+ * Parallel state's {@code Catch}, object inputs merge unchanged, and a bracket-index ResultPath
+ * (e.g. {@code $[1].payload}) merges into the addressed array element instead of discarding the
+ * array input.
  *
  * <p>CI-only: constructing {@link AslExecutor} pulls in Vert.x (absent in the offline sandbox). The merge
  * logic is covered locally by {@link ResultPathMergeTest}.
@@ -42,7 +45,7 @@ class AslExecutorResultPathTest {
     void setUp() {
         executor = new AslExecutor(
                 mock(LambdaExecutorService.class), mock(LambdaFunctionStore.class),
-                mock(DynamoDbService.class), mock(DynamoDbJsonHandler.class), mock(SqsJsonHandler.class),
+                mock(DynamoDbFacade.class), mock(DynamoDbJsonHandler.class), mock(SqsJsonHandler.class), mock(SnsJsonHandler.class),
                 mock(CloudFormationQueryHandler.class), mock(Ec2Service.class), mock(S3Service.class),
                 mock(EcsService.class), mock(EcsJsonHandler.class),
                 mock(io.github.hectorvent.floci.services.eventbridge.EventBridgeHandler.class),
@@ -108,6 +111,27 @@ class AslExecutorResultPathTest {
                         + "\"Recover\":{\"Type\":\"Pass\",\"End\":true}}}",
                 "\"just-a-string\"");
         assertEquals("SUCCEEDED", exec.getStatus());
+    }
+
+    @Test
+    void arrayIndexResultPathMergesIntoIndexedElementAndKeepsArrayInput() throws Exception {
+        Execution exec = run(
+                "{\"StartAt\":\"P\",\"States\":{\"P\":{\"Type\":\"Pass\",\"Result\":{\"subject_status\":1},"
+                        + "\"ResultPath\":\"$[1].payload\",\"End\":true}}}",
+                "[{\"a\":1},{\"id\":7},{\"c\":3},4]");
+        assertEquals("SUCCEEDED", exec.getStatus());
+        assertEquals(mapper.readTree("[{\"a\":1},{\"id\":7,\"payload\":{\"subject_status\":1}},{\"c\":3},4]"),
+                mapper.readTree(exec.getOutput()));
+    }
+
+    @Test
+    void arrayIndexOutOfBoundsResultPathFailsExecution() {
+        Execution exec = run(
+                "{\"StartAt\":\"P\",\"States\":{\"P\":{\"Type\":\"Pass\",\"Result\":{\"x\":1},"
+                        + "\"ResultPath\":\"$[10].payload\",\"End\":true}}}",
+                "[{\"a\":1},{\"id\":7},{\"c\":3},4]");
+        assertEquals("FAILED", exec.getStatus());
+        assertEquals("States.ResultPathMatchFailure", exec.getError());
     }
 
     @Test

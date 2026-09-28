@@ -102,10 +102,17 @@ public class AwsQueryController {
             "TagUser", "UntagUser", "ListUserTags",
             "TagRole", "UntagRole", "ListRoleTags",
             "TagPolicy", "UntagPolicy", "ListPolicyTags",
+            "TagInstanceProfile", "UntagInstanceProfile", "ListInstanceProfileTags",
             "CreateLoginProfile", "GetLoginProfile", "DeleteLoginProfile", "UpdateLoginProfile",
             "GenerateCredentialReport", "GetCredentialReport",
             "GetAccountSummary", "GetAccountAuthorizationDetails",
-            "SimulatePrincipalPolicy"
+            "SimulatePrincipalPolicy", "SimulateCustomPolicy",
+            "GetContextKeysForCustomPolicy", "GetContextKeysForPrincipalPolicy",
+            "ListSAMLProviders", "CreateSAMLProvider", "GetSAMLProvider",
+            "UpdateSAMLProvider", "DeleteSAMLProvider",
+            "TagSAMLProvider", "UntagSAMLProvider", "ListSAMLProviderTags",
+            "GenerateServiceLastAccessedDetails", "GetServiceLastAccessedDetails",
+            "GetServiceLastAccessedDetailsWithEntities", "ListPoliciesGrantingServiceAccess"
     );
 
     private static final Set<String> AUTOSCALING_ACTIONS = Set.of(
@@ -155,7 +162,10 @@ public class AwsQueryController {
             "DescribeSecurityGroupRules", "ModifySecurityGroupRules",
             "UpdateSecurityGroupRuleDescriptionsIngress", "UpdateSecurityGroupRuleDescriptionsEgress",
             "CreateKeyPair", "DescribeKeyPairs", "DeleteKeyPair", "ImportKeyPair",
-            "DescribeImages", "RegisterImage", "DescribeSnapshots",
+            "DescribeImages", "RegisterImage", "DeregisterImage", "CreateImage", "CopyImage",
+            "DescribeSnapshots",
+            "EnableSnapshotBlockPublicAccess", "DisableSnapshotBlockPublicAccess",
+            "GetSnapshotBlockPublicAccessState",
             "CreateTags", "DeleteTags", "DescribeTags",
             "CreateInternetGateway", "DescribeInternetGateways", "DeleteInternetGateway",
             "AttachInternetGateway", "DetachInternetGateway",
@@ -171,7 +181,7 @@ public class AwsQueryController {
             "DescribeAddressesAttribute",
             "DescribeIamInstanceProfileAssociations",
             "DescribeAvailabilityZones", "DescribeRegions", "DescribeAccountAttributes",
-            "DescribeInstanceTypes", "DescribeInstanceTypeOfferings",
+            "DescribeInstanceTypes", "DescribeInstanceTypeOfferings", "DescribeSpotPriceHistory",
             "CreateLaunchTemplate", "CreateLaunchTemplateVersion", "DescribeLaunchTemplates", "DescribeLaunchTemplateVersions",
             "ModifyLaunchTemplate", "DeleteLaunchTemplate",
             "DescribeNetworkInterfaces",
@@ -202,7 +212,7 @@ public class AwsQueryController {
     private final AutoScalingQueryHandler autoScalingQueryHandler;
     private final ElasticBeanstalkQueryHandler elasticBeanstalkQueryHandler;
     private final RedshiftQueryHandler redshiftQueryHandler;
-    private final ResolvedServiceCatalog catalog;
+    private final AwsQueryServiceResolver serviceResolver;
     private final RegionResolver regionResolver;
 
     @Inject
@@ -225,7 +235,7 @@ public class AwsQueryController {
                               AutoScalingQueryHandler autoScalingQueryHandler,
                               ElasticBeanstalkQueryHandler elasticBeanstalkQueryHandler,
                               RedshiftQueryHandler redshiftQueryHandler,
-                              ResolvedServiceCatalog catalog,
+                              AwsQueryServiceResolver serviceResolver,
                               RegionResolver regionResolver) {
         this.cloudFormationQueryHandler = cloudFormationQueryHandler;
         this.elastiCacheQueryHandler = elastiCacheQueryHandler;
@@ -248,7 +258,7 @@ public class AwsQueryController {
         this.autoScalingQueryHandler = autoScalingQueryHandler;
         this.elasticBeanstalkQueryHandler = elasticBeanstalkQueryHandler;
         this.redshiftQueryHandler = redshiftQueryHandler;
-        this.catalog = catalog;
+        this.serviceResolver = serviceResolver;
         this.regionResolver = regionResolver;
     }
 
@@ -260,16 +270,13 @@ public class AwsQueryController {
             @Context HttpHeaders httpHeaders,
             MultivaluedMap<String, String> formParams) {
 
-        String action = formParams.getFirst("Action");
-        if (action == null) {
-            action = formParams.getFirst("Operation");
-        }
+        String action = AwsQueryServiceResolver.action(formParams);
         if (action == null) {
             return xmlErrorResponse("MissingAction",
                     "The request must contain the parameter Action", 400);
         }
 
-        String service = resolveService(authorization, action);
+        String service = serviceResolver.resolve(authorization, action);
         LOG.debugv("Query protocol service={0} action={1}", service, action);
 
         String region = regionResolver.resolveRegion(httpHeaders);
@@ -287,7 +294,7 @@ public class AwsQueryController {
             // the Query/XML wire — SDK parsers fail before they can surface anything useful.
             LOG.errorv(e, "Unhandled error dispatching Query action {0} for service {1}", action, service);
             return xmlErrorResponse("InternalFailure",
-                    "Unexpected error: " + e.getMessage(), 500, "Receiver");
+                    "Unexpected error: " + AwsErrorMessages.describe(e), 500, "Receiver");
         }
     }
 
@@ -356,7 +363,7 @@ public class AwsQueryController {
                     : elbV2QueryHandler.handle(action, formParams, region);
             case "autoscaling" -> autoScalingQueryHandler.handle(action, formParams, region);
             case "elasticbeanstalk" -> elasticBeanstalkQueryHandler.handle(action, formParams, region);
-            case "redshift" -> redshiftQueryHandler.handle(action, formParams);
+            case "redshift" -> redshiftQueryHandler.handle(action, formParams, authorization);
             default -> xmlErrorResponse("UnknownService",
                     "Unknown or unsupported service: " + service, 400);
         };
@@ -503,7 +510,9 @@ public class AwsQueryController {
             "PutMetricData", "ListMetrics", "GetMetricStatistics", "GetMetricData",
             "PutMetricAlarm", "DescribeAlarms", "DeleteAlarms", "SetAlarmState",
             "ListTagsForResource", "TagResource", "UntagResource",
-            "PutDashboard", "GetDashboard", "ListDashboards", "DeleteDashboards"
+            "PutDashboard", "GetDashboard", "ListDashboards", "DeleteDashboards",
+            "PutMetricStream", "GetMetricStream", "ListMetricStreams", "DeleteMetricStream",
+            "StartMetricStreams", "StopMetricStreams"
     );
 
     private static final Set<String> ELASTIC_BEANSTALK_ACTIONS = Set.of(
@@ -603,20 +612,12 @@ public class AwsQueryController {
             "CreateClusterParameterGroup", "DescribeClusterParameterGroups", "DescribeClusterParameters", "DeleteClusterParameterGroup",
             "ModifyClusterParameterGroup",
             "CreateClusterSubnetGroup", "DescribeClusterSubnetGroups", "ModifyClusterSubnetGroup", "DeleteClusterSubnetGroup",
-            "CreateTags", "DeleteTags", "DescribeTags"
+            "CreateSnapshotCopyGrant", "DescribeSnapshotCopyGrants", "DeleteSnapshotCopyGrant",
+            "CreateTags", "DeleteTags", "DescribeTags",
+            "GetClusterCredentials", "GetClusterCredentialsWithIAM"
     );
 
-    private String resolveService(String authorization, String action) {
-        ServiceDescriptor descriptor = SigV4CredentialScope.serviceName(authorization)
-                .flatMap(catalog::byCredentialScope)
-                .orElse(null);
-        if (descriptor != null && descriptor.supportsProtocol(ServiceProtocol.QUERY)) {
-            return descriptor.externalKey();
-        }
-        return inferServiceFromAction(action);
-    }
-
-    private String inferServiceFromAction(String action) {
+    static String inferServiceFromAction(String action) {
         if (STS_ACTIONS.contains(action)) {
             return "sts";
         }

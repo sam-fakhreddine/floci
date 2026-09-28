@@ -83,6 +83,13 @@ class AppSyncVtlEngineTest {
         }
 
         @Test
+        void b2b_ctxArgsAlias() {
+            AppSyncVtlContext ctx = ctxWith(builder -> builder.arguments(Map.of("id", "123")));
+            AppSyncVtlResult result = engine.evaluate("$ctx.args.id", ctx);
+            assertEquals("123", result.output());
+        }
+
+        @Test
         void b3_argsShortcut() {
             var ctx = ctxWith(b -> b.arguments(Map.of("id", "123")));
             var result = engine.evaluate("$args.id", ctx);
@@ -104,10 +111,10 @@ class AppSyncVtlEngineTest {
         }
 
         @Test
-        void b6_contextSourceEmptyForTopLevel() {
-            var ctx = ctxWith(b -> b.source(Map.of()));
+        void b6_contextSourceNullForTopLevel() {
+            var ctx = ctxWith(b -> b.source(null));
             var result = engine.evaluate("$util.toJson($context.source)", ctx);
-            assertEquals("{}", result.output());
+            assertEquals("null", result.output());
         }
 
         @Test
@@ -763,6 +770,84 @@ class AppSyncVtlEngineTest {
         void j6_vtlSyntaxErrorPropagated() {
             assertThrows(Exception.class, () ->
                     engine.evaluate("#if(true)", defaultCtx()));
+        }
+    }
+
+    // ────────── Sandbox: reflection escapes, and runaway loop/output limits ──────────
+
+    @Nested
+    class CategoryK_Sandbox {
+
+        @Test
+        void k1_getClassLoaderIsNotReachable() {
+            // When SecureUberspector blocks a method call, Velocity (non-strict mode, the default
+            // here) renders the literal, unresolved reference text instead of throwing or
+            // evaluating it. Getting the raw template text back verbatim (rather than an actual
+            // ClassLoader instance's toString) proves the call was blocked.
+            String template = "$util.getClass().getClassLoader()";
+            var result = engine.evaluate(template, defaultCtx());
+            assertEquals(template, result.output(),
+                    "expected getClassLoader() to be blocked by SecureUberspector and rendered as "
+                            + "an unresolved literal reference, but got: " + result.output());
+        }
+
+        @Test
+        void k2_classForNameIsNotReachable() {
+            var result = engine.evaluate(
+                    "$util.getClass().forName('java.lang.System').getName()", defaultCtx());
+            assertNotEquals("java.lang.System", result.output(),
+                    "expected Class.forName(...) to be blocked by SecureUberspector, but it resolved: "
+                            + result.output());
+        }
+
+        @Test
+        void k3_runtimeClassIsNotLoadableByName() {
+            var result = engine.evaluate(
+                    "$util.getClass().forName('java.lang.Runtime').getName()", defaultCtx());
+            assertNotEquals("java.lang.Runtime", result.output(),
+                    "expected Class.forName('java.lang.Runtime') to be blocked, but it resolved: "
+                            + result.output());
+        }
+
+        @Test
+        void k4_processBuilderClassIsNotLoadableByName() {
+            var result = engine.evaluate(
+                    "$util.getClass().forName('java.lang.ProcessBuilder').getName()", defaultCtx());
+            assertNotEquals("java.lang.ProcessBuilder", result.output(),
+                    "expected Class.forName('java.lang.ProcessBuilder') to be blocked, but it resolved: "
+                            + result.output());
+        }
+
+        @Test
+        void k5_getClassStillPermitsGetName() {
+            // getName() on a Class receiver must remain permitted (SecureUberspector's one
+            // exception), so ordinary reflection-free VTL idioms relying on it keep working.
+            var result = engine.evaluate("$util.getClass().getName()", defaultCtx());
+            assertTrue(result.output().toString().contains("AppSyncUtil"),
+                    "expected getName() on Class to still work, got: " + result.output());
+        }
+
+        @Test
+        void k6_foreachLoopCountIsBounded() {
+            // 50,000 requested iterations, each writing a single character. With no cap this
+            // renders 50,000 characters; the configured default
+            // (AppSyncServiceConfig.vtlMaxLoops = 10000) must cap the loop well before that.
+            String template = "#foreach($i in [1..50000])x#end";
+            var result = engine.evaluate(template, defaultCtx());
+            assertEquals(10000, result.output().toString().length(),
+                    "expected #foreach to be capped at the configured vtlMaxLoops, but rendered "
+                            + result.output().toString().length() + " characters");
+        }
+
+        @Test
+        void k7_outputSizeIsBounded() {
+            // 21 doublings of a 2-character seed produce roughly 4 million characters, comfortably
+            // over the default 1,048,576-character output cap, in only 21 loop iterations (well
+            // under the 10,000-iteration loop cap), so this exercises the output limit
+            // specifically.
+            String template = "#set($s = \"xy\")#foreach($i in [1..21])#set($s = \"$s$s\")#end$s";
+            assertThrows(RuntimeException.class, () -> engine.evaluate(template, defaultCtx()),
+                    "expected output exceeding the configured vtlMaxOutputChars to throw");
         }
     }
 }

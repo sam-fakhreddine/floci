@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.config;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.services.acm.CertificateGenerator;
 import io.github.hectorvent.floci.services.acm.model.KeyAlgorithm;
 import org.eclipse.microprofile.config.spi.ConfigSource;
@@ -45,6 +46,16 @@ public class TlsConfigSource implements ConfigSource {
 
     private static final Logger LOG = Logger.getLogger(TlsConfigSource.class);
 
+    static final String NAME = "FlociTlsConfigSource";
+
+    /**
+     * Internal ports Quarkus binds when TLS is enabled. {@link TlsProxyServer} listens on the
+     * public Floci port and routes to these by protocol, so the two classes must agree; they are
+     * declared here, next to the properties that set them, and referenced from the proxy.
+     */
+    static final int HTTP_INTERNAL_PORT = 4510;
+    static final int HTTPS_INTERNAL_PORT = 4511;
+
     private static final String SERVER_CERT_NAME = "floci-server.crt";
     private static final String SERVER_KEY_NAME = "floci-server.key";
     private static final String SERVER_METADATA_NAME = "floci-server.metadata.json";
@@ -52,11 +63,23 @@ public class TlsConfigSource implements ConfigSource {
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
     // host.docker.internal: how Lambda containers reach Floci when it runs on the host (not in a container).
-    private static final List<String> DEFAULT_SAN_HOSTNAMES = List.of(
-            "localhost", "127.0.0.1", "0.0.0.0", "*.localhost",
-            "localhost.floci.io", "*.localhost.floci.io",
-            "*.execute-api.localhost.floci.io",
-            "*.execute-api.localhost.localstack.cloud", "host.docker.internal");
+    // A wildcard SAN covers one label, so every two-label service form needs its own entry.
+    // Package-private so the tests assert against this list instead of copying it.
+    static final List<String> DEFAULT_SAN_HOSTNAMES = defaultSanHostnames();
+
+    private static List<String> defaultSanHostnames() {
+        List<String> sans = new ArrayList<>(List.of(
+                "localhost", "127.0.0.1", "0.0.0.0", "*.localhost",
+                "localhost.floci.io", "*.localhost.floci.io",
+                "*.execute-api.localhost.floci.io",
+                "*.execute-api.localhost.localstack.cloud",
+                "*.cloudfront.localhost.floci.io", "*.cloudfront.localhost",
+                "host.docker.internal"));
+        for (String region : AwsRegions.KNOWN_IDS.stream().sorted().toList()) {
+            sans.add("*.dkr.ecr." + region + ".localhost.floci.io");
+        }
+        return List.copyOf(sans);
+    }
 
     private static volatile Path resolvedTlsDir;
 
@@ -136,8 +159,8 @@ public class TlsConfigSource implements ConfigSource {
         // and does protocol detection to route HTTP and HTTPS to the correct backend.
         properties.put("quarkus.http.insecure-requests", "enabled");
         properties.put("quarkus.http.host", "127.0.0.1");
-        properties.put("quarkus.http.port", "4510");
-        properties.put("quarkus.http.ssl-port", "4511");
+        properties.put("quarkus.http.port", String.valueOf(HTTP_INTERNAL_PORT));
+        properties.put("quarkus.http.ssl-port", String.valueOf(HTTPS_INTERNAL_PORT));
 
         LOG.infov("TLS: HTTPS enabled, proxy will listen on port {0} (HTTP+HTTPS), cert={1}",
                 resolveProperty("floci.port", "4566"), certPath);
@@ -161,7 +184,7 @@ public class TlsConfigSource implements ConfigSource {
 
     @Override
     public String getName() {
-        return "FlociTlsConfigSource";
+        return NAME;
     }
 
     /**

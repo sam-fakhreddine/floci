@@ -1,9 +1,11 @@
 package io.github.hectorvent.floci.services.ecr;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
-import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.core.common.Pagination;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
 import io.github.hectorvent.floci.core.resource.ResourceProvider;
 import io.github.hectorvent.floci.core.resource.SupportedResourceType;
@@ -16,6 +18,7 @@ import io.github.hectorvent.floci.services.ecr.model.ImageFailure;
 import io.github.hectorvent.floci.services.ecr.model.ImageIdentifier;
 import io.github.hectorvent.floci.services.ecr.model.ImageMetadata;
 import io.github.hectorvent.floci.services.ecr.model.Image;
+import io.github.hectorvent.floci.services.ecr.model.PullThroughCacheRule;
 import io.github.hectorvent.floci.services.ecr.model.Repository;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.ecr.registry.RegistryHttpClient;
@@ -39,10 +42,23 @@ public class EcrService implements ResourceProvider {
     private static final Logger LOG = Logger.getLogger(EcrService.class);
     private static final Pattern REPO_NAME = Pattern.compile(
             "(?:[a-z0-9]+(?:[._-][a-z0-9]+)*/)*[a-z0-9]+(?:[._-][a-z0-9]+)*");
+    private static final Pattern PULL_THROUGH_CACHE_PREFIX = Pattern.compile(
+            "(?:[a-z0-9]+(?:(?:\\.|_|__|-+)[a-z0-9]+)*(?:/[a-z0-9]+"
+                    + "(?:(?:\\.|_|__|-+)[a-z0-9]+)*)*/?|ROOT)");
+    private static final Pattern REGISTRY_ID = Pattern.compile("[0-9]{12}");
+    private static final Pattern CREDENTIAL_ARN = Pattern.compile(
+            "arn:" + AwsArnUtils.PARTITION_REGEX + ":secretsmanager:[a-zA-Z0-9-:]+:secret:ecr-pullthroughcache/"
+                    + "[a-zA-Z0-9/_+=.@-]+");
+    private static final Set<String> UPSTREAM_REGISTRIES = Set.of(
+            "ecr", "ecr-public", "quay", "k8s", "docker-hub",
+            "github-container-registry", "azure-container-registry",
+            "gitlab-container-registry", "chainguard");
     private static final int MAX_REPO_NAME_LENGTH = 256;
+    private static final int MAX_PULL_THROUGH_CACHE_PREFIX_LENGTH = 30;
 
     private final StorageBackend<String, Repository> repoStore;
     private final StorageBackend<String, ImageMetadata> imageMetaStore;
+    private final StorageBackend<String, PullThroughCacheRule> pullThroughCacheRuleStore;
     private final EcrRegistryManager registryManager;
     private final EmulatorConfig config;
     private final RegionResolver regionResolver;
@@ -56,42 +72,194 @@ public class EcrService implements ResourceProvider {
                         new TypeReference<Map<String, Repository>>() {}),
                 factory.create("ecr", "image-metadata.json",
                         new TypeReference<Map<String, ImageMetadata>>() {}),
+                factory.create("ecr", "pull-through-cache-rules.json",
+                        new TypeReference<Map<String, PullThroughCacheRule>>() {}),
                 registryManager, config, regionResolver);
     }
 
     EcrService(StorageBackend<String, Repository> repoStore,
                StorageBackend<String, ImageMetadata> imageMetaStore,
+               StorageBackend<String, PullThroughCacheRule> pullThroughCacheRuleStore,
                EcrRegistryManager registryManager,
                EmulatorConfig config,
                RegionResolver regionResolver) {
         this.repoStore = repoStore;
         this.imageMetaStore = imageMetaStore;
+        this.pullThroughCacheRuleStore = pullThroughCacheRuleStore;
         this.registryManager = registryManager;
         this.config = config;
         this.regionResolver = regionResolver;
         this.registryManager.setReconcileHook(this::reconcileFromCatalog);
     }
 
+    // ============================================================
+    // Pull through cache rules
+    // ============================================================
+
+    public PullThroughCacheRule createPullThroughCacheRule(String ecrRepositoryPrefix,
+                                                           String upstreamRegistryUrl,
+                                                           String registryId,
+                                                           String upstreamRegistry,
+                                                           String credentialArn,
+                                                           String customRoleArn,
+                                                           String upstreamRepositoryPrefix,
+                                                           String region) {
+        String prefix = normalizePullThroughCachePrefix(ecrRepositoryPrefix);
+        validatePullThroughCachePrefix(prefix, "ecrRepositoryPrefix");
+        validateUpstreamRegistryUrl(upstreamRegistryUrl);
+        validateCredentialArn(credentialArn);
+        validateCustomRoleArn(customRoleArn);
+        String upstreamPrefix = upstreamRepositoryPrefix == null || upstreamRepositoryPrefix.isBlank()
+                ? "ROOT"
+                : normalizePullThroughCachePrefix(upstreamRepositoryPrefix);
+        validatePullThroughCachePrefix(upstreamPrefix, "upstreamRepositoryPrefix");
+        if ("ROOT".equals(prefix) && !"ROOT".equals(upstreamPrefix)) {
+            throw new AwsException("InvalidParameterException",
+                    "upstreamRepositoryPrefix must be ROOT when ecrRepositoryPrefix is ROOT", 400);
+        }
+        String account = effectiveAccount(registryId);
+        validateRegistryId(account);
+        String resolvedUpstreamRegistry = resolveUpstreamRegistry(upstreamRegistry, upstreamRegistryUrl);
+        String key = pullThroughCacheRuleKey(region, account, prefix);
+        if (pullThroughCacheRuleStore.get(key).isPresent()) {
+            throw new AwsException("PullThroughCacheRuleAlreadyExistsException",
+                    "A pull through cache rule with repository prefix '" + prefix
+                            + "' already exists in registry '" + account + "'", 400);
+        }
+
+        Instant now = Instant.now();
+        PullThroughCacheRule rule = new PullThroughCacheRule();
+        rule.setRegistryId(account);
+        rule.setEcrRepositoryPrefix(prefix);
+        rule.setUpstreamRegistryUrl(upstreamRegistryUrl);
+        rule.setUpstreamRegistry(resolvedUpstreamRegistry);
+        rule.setCredentialArn(credentialArn);
+        rule.setCustomRoleArn(customRoleArn);
+        rule.setUpstreamRepositoryPrefix(upstreamPrefix);
+        rule.setCreatedAt(now);
+        rule.setUpdatedAt(now);
+        pullThroughCacheRuleStore.put(key, rule);
+        return rule;
+    }
+
+    public PaginatedResult<PullThroughCacheRule> describePullThroughCacheRules(
+            String registryId,
+            List<String> ecrRepositoryPrefixes,
+            Integer maxResults,
+            String nextToken,
+            String region) {
+        String account = effectiveAccount(registryId);
+        validateRegistryId(account);
+        List<PullThroughCacheRule> rules;
+        if (ecrRepositoryPrefixes == null) {
+            String keyPrefix = region + "::" + account + "::";
+            rules = pullThroughCacheRuleStore.scan(key -> key.startsWith(keyPrefix));
+        } else {
+            if (ecrRepositoryPrefixes.isEmpty() || ecrRepositoryPrefixes.size() > 100) {
+                throw new AwsException("InvalidParameterException",
+                        "ecrRepositoryPrefixes must contain between 1 and 100 items", 400);
+            }
+            rules = new ArrayList<>();
+            for (String requestedPrefix : ecrRepositoryPrefixes) {
+                String prefix = normalizePullThroughCachePrefix(requestedPrefix);
+                validatePullThroughCachePrefix(prefix, "ecrRepositoryPrefixes");
+                rules.add(pullThroughCacheRuleStore.get(pullThroughCacheRuleKey(region, account, prefix))
+                        .orElseThrow(() -> pullThroughCacheRuleNotFound(prefix, account)));
+            }
+        }
+        return Pagination.paginate(rules, PullThroughCacheRule::getEcrRepositoryPrefix,
+                maxResults, nextToken, 100, 1000, "InvalidParameterException");
+    }
+
+    public PullThroughCacheRule deletePullThroughCacheRule(String ecrRepositoryPrefix,
+                                                           String registryId,
+                                                           String region) {
+        String prefix = normalizePullThroughCachePrefix(ecrRepositoryPrefix);
+        validatePullThroughCachePrefix(prefix, "ecrRepositoryPrefix");
+        String account = effectiveAccount(registryId);
+        validateRegistryId(account);
+        String key = pullThroughCacheRuleKey(region, account, prefix);
+        PullThroughCacheRule rule = pullThroughCacheRuleStore.get(key)
+                .orElseThrow(() -> pullThroughCacheRuleNotFound(prefix, account));
+        pullThroughCacheRuleStore.delete(key);
+        return rule;
+    }
+
+    public PullThroughCacheRule updatePullThroughCacheRule(String ecrRepositoryPrefix,
+                                                           String registryId,
+                                                           String credentialArn,
+                                                           String customRoleArn,
+                                                           String region) {
+        String prefix = normalizePullThroughCachePrefix(ecrRepositoryPrefix);
+        validatePullThroughCachePrefix(prefix, "ecrRepositoryPrefix");
+        String account = effectiveAccount(registryId);
+        validateRegistryId(account);
+        validateCredentialArn(credentialArn);
+        validateCustomRoleArn(customRoleArn);
+
+        String key = pullThroughCacheRuleKey(region, account, prefix);
+        PullThroughCacheRule rule = pullThroughCacheRuleStore.get(key)
+                .orElseThrow(() -> pullThroughCacheRuleNotFound(prefix, account));
+        if (credentialArn != null) {
+            rule.setCredentialArn(credentialArn);
+        }
+        if (customRoleArn != null) {
+            rule.setCustomRoleArn(customRoleArn);
+        }
+        rule.setUpdatedAt(Instant.now());
+        pullThroughCacheRuleStore.put(key, rule);
+        return rule;
+    }
+
+    public PullThroughCacheRule validatePullThroughCacheRule(String ecrRepositoryPrefix,
+                                                             String registryId,
+                                                             String region) {
+        String prefix = normalizePullThroughCachePrefix(ecrRepositoryPrefix);
+        validatePullThroughCachePrefix(prefix, "ecrRepositoryPrefix");
+        String account = effectiveAccount(registryId);
+        validateRegistryId(account);
+        return pullThroughCacheRuleStore.get(pullThroughCacheRuleKey(region, account, prefix))
+                .orElseThrow(() -> pullThroughCacheRuleNotFound(prefix, account));
+    }
+
     /**
-     * Recreates {@link Repository} metadata entries for any internal-namespaced
-     * repos found in the registry catalog that are missing from local storage.
-     * Internal names are of the form {@code <account>/<region>/<repoName>}.
+     * Recreates {@link Repository} metadata entries for registry namespaces found in the catalog.
+     * Namespaces created by Floci are {@code <account>/<region>/<repoName>}; pre-proxy registry
+     * namespaces are recovered for the default account and region without moving image storage.
      */
     void reconcileFromCatalog(List<String> catalog) {
         if (catalog == null || catalog.isEmpty()) {
             return;
         }
         int recreated = 0;
-        for (String internal : catalog) {
-            String[] parts = internal.split("/", 3);
-            if (parts.length < 3) {
+        for (String registryRepositoryName : catalog) {
+            String defaultAccount = regionResolver.getAccountId();
+            String defaultRegion = regionResolver.getDefaultRegion();
+            String legacyKey = key(defaultRegion, defaultAccount, registryRepositoryName);
+            var legacyRepository = repoStore.get(legacyKey);
+            if (legacyRepository.isPresent()) {
+                Repository repo = legacyRepository.get();
+                repo.setRepositoryUri(registryManager.getRepositoryUri(
+                        defaultAccount, defaultRegion, repo.getRepositoryName()));
+                repo.setRegistryRepositoryName(registryRepositoryName);
+                repoStore.put(legacyKey, repo);
                 continue;
             }
-            String account = parts[0];
-            String region = parts[1];
-            String repoName = parts[2];
+            String[] parts = registryRepositoryName.split("/", 3);
+            boolean namespaced = parts.length == 3 && parts[0].matches("[0-9]{12}")
+                    && parts[1].matches("[a-z0-9-]+");
+            String account = namespaced ? parts[0] : defaultAccount;
+            String region = namespaced ? parts[1] : defaultRegion;
+            String repoName = namespaced ? parts[2] : registryRepositoryName;
             String key = key(region, account, repoName);
-            if (repoStore.get(key).isPresent()) {
+            var existing = repoStore.get(key);
+            if (existing.isPresent()) {
+                Repository repo = existing.get();
+                repo.setRepositoryUri(registryManager.getRepositoryUri(account, region, repoName));
+                if (!namespaced) {
+                    repo.setRegistryRepositoryName(registryRepositoryName);
+                }
+                repoStore.put(key, repo);
                 continue;
             }
             Repository repo = new Repository();
@@ -99,6 +267,9 @@ public class EcrService implements ResourceProvider {
             repo.setRegistryId(account);
             repo.setRepositoryArn(AwsArnUtils.Arn.of("ecr", region, account, "repository/" + repoName).toString());
             repo.setRepositoryUri(registryManager.getRepositoryUri(account, region, repoName));
+            if (!namespaced) {
+                repo.setRegistryRepositoryName(registryRepositoryName);
+            }
             repo.setCreatedAt(Instant.now());
             repoStore.put(key, repo);
             recreated++;
@@ -171,14 +342,16 @@ public class EcrService implements ResourceProvider {
         String prefix = region + "::" + account + "::";
 
         if (repositoryNames == null || repositoryNames.isEmpty()) {
-            return repoStore.scan(k -> k.startsWith(prefix));
+            return repoStore.scan(k -> k.startsWith(prefix)).stream()
+                    .map(repo -> refreshRepositoryUri(repo, region))
+                    .toList();
         }
 
         List<Repository> out = new ArrayList<>();
         for (String name : repositoryNames) {
             String key = key(region, account, name);
             Repository repo = repoStore.get(key).orElseThrow(() -> notFound(name, account));
-            out.add(repo);
+            out.add(refreshRepositoryUri(repo, region));
         }
         return out;
     }
@@ -195,16 +368,45 @@ public class EcrService implements ResourceProvider {
         String key = key(region, account, repositoryName);
         Repository repo = repoStore.get(key).orElseThrow(() -> notFound(repositoryName, account));
 
-        List<String> tags = listTagsBestEffort(account, region, repositoryName);
-        if (!force && !tags.isEmpty()) {
+        // Check whether the registry has any tagged images for this repo.
+        // A test double with no HTTP client means no backing registry exists,
+        // so there is nothing to clean up. Any failure against a real client
+        // aborts the delete: an unreachable registry cannot prove the repo
+        // empty (non-force must not bypass RepositoryNotEmptyException) and
+        // force must not orphan pullable images behind deleted metadata.
+        List<String> tags;
+        boolean registryAvailable = true;
+        if (registryManager.httpClient() == null) {
+            // Test double without an HTTP layer (Mockito default): no backing
+            // registry exists, so there is nothing to clean up.
+            tags = List.of();
+            registryAvailable = false;
+        } else try {
+            tags = listTagsOrThrow(account, region, repositoryName);
+        } catch (Exception e) {
+            if (isRegistryUnreachable(e)) {
+                throw new AwsException("ServerException",
+                        "Backing registry unreachable for repository '" + repositoryName
+                                + "': retry after the registry recovers (" + e.getMessage() + ")",
+                        500);
+            }
+            throw new AwsException("ServerException",
+                    "Failed to clean up the backing registry for repository '" + repositoryName + "': "
+                            + e.getMessage(),
+                    500);
+        }
+        if (!tags.isEmpty() && !force) {
             throw new AwsException("RepositoryNotEmptyException",
                     "The repository with name '" + repositoryName
                             + "' in registry with id '" + account + "' cannot be deleted because it still contains images",
                     400);
         }
-
-        if (force) {
-            deleteRepositoryStorage(account, region, repositoryName);
+        if (force && registryAvailable) {
+            // Single cleanup mechanism (#2982): remove the repository storage
+            // directories inside the registry container. Routed through
+            // resolveRegistryRepoName so content pushed under the bare name
+            // via hostname-style URIs is removed too (issue #2444).
+            deleteRepositoryStorageResolved(account, region, repositoryName);
         }
 
         repoStore.delete(key);
@@ -217,6 +419,7 @@ public class EcrService implements ResourceProvider {
             registryManager.pruneStorage();
         }
         LOG.infov("Deleted ECR repository {0}/{1}/{2}", region, account, repositoryName);
+        repo.setRepositoryUri(registryManager.getRepositoryUri(account, region, repositoryName));
         return repo;
     }
 
@@ -240,7 +443,7 @@ public class EcrService implements ResourceProvider {
     public List<ImageIdentifier> listImages(String repositoryName, String registryId, String region) {
         Repository repo = requireRepo(repositoryName, registryId, region);
         requireRegistry();
-        String internal = registryManager.internalRepoName(repo.getRegistryId(), region, repositoryName);
+        String internal = resolveRegistryRepoName(repo.getRegistryId(), region, repositoryName);
         try {
             RegistryHttpClient http = registryManager.httpClient();
             List<String> tags = http.listTags(internal);
@@ -262,7 +465,7 @@ public class EcrService implements ResourceProvider {
                                                 String region) {
         Repository repo = requireRepo(repositoryName, registryId, region);
         requireRegistry();
-        String internal = registryManager.internalRepoName(repo.getRegistryId(), region, repositoryName);
+        String internal = resolveRegistryRepoName(repo.getRegistryId(), region, repositoryName);
         RegistryHttpClient http = registryManager.httpClient();
 
         List<String> refs = new ArrayList<>();
@@ -337,7 +540,7 @@ public class EcrService implements ResourceProvider {
                                               String region) {
         Repository repo = requireRepo(repositoryName, registryId, region);
         requireRegistry();
-        String internal = registryManager.internalRepoName(repo.getRegistryId(), region, repositoryName);
+        String internal = resolveRegistryRepoName(repo.getRegistryId(), region, repositoryName);
         RegistryHttpClient http = registryManager.httpClient();
 
         List<Image> images = new ArrayList<>();
@@ -377,7 +580,7 @@ public class EcrService implements ResourceProvider {
                                                     String region) {
         Repository repo = requireRepo(repositoryName, registryId, region);
         requireRegistry();
-        String internal = registryManager.internalRepoName(repo.getRegistryId(), region, repositoryName);
+        String internal = resolveRegistryRepoName(repo.getRegistryId(), region, repositoryName);
         RegistryHttpClient http = registryManager.httpClient();
 
         List<ImageIdentifier> deleted = new ArrayList<>();
@@ -422,6 +625,23 @@ public class EcrService implements ResourceProvider {
         repo.setImageTagMutability(mutability);
         repoStore.put(key(region, repo.getRegistryId(), repositoryName), repo);
         return repo;
+    }
+
+    /** Returns whether the repository rejects a second manifest write for an existing tag. */
+    public boolean isImageTagImmutable(String repositoryName, String registryId, String region) {
+        String account = effectiveAccount(registryId);
+        return repoStore.get(key(region, account, repositoryName))
+                .map(Repository::getImageTagMutability)
+                .filter("IMMUTABLE"::equals)
+                .isPresent();
+    }
+
+    /** Returns the physical registry namespace selected for an ECR repository. */
+    public String registryRepositoryName(String repositoryName, String registryId, String region) {
+        String account = effectiveAccount(registryId);
+        return repoStore.get(key(region, account, repositoryName))
+                .map(repo -> registryRepositoryName(repo, region))
+                .orElseGet(() -> registryManager.internalRepoName(account, region, repositoryName));
     }
 
     public void tagResource(String repoName, String registryId, Map<String, String> tags, String region) {
@@ -530,11 +750,16 @@ public class EcrService implements ResourceProvider {
 
     private Repository requireRepo(String name, String registryId, String region) {
         String account = effectiveAccount(registryId);
-        return repoStore.get(key(region, account, name)).orElseThrow(() -> notFound(name, account));
+        Repository repo = repoStore.get(key(region, account, name)).orElseThrow(() -> notFound(name, account));
+        return refreshRepositoryUri(repo, region);
     }
 
     private static String imageMetaKey(String region, String account, String repoName, String digest) {
         return key(region, account, repoName) + "::" + digest;
+    }
+
+    private static String pullThroughCacheRuleKey(String region, String account, String prefix) {
+        return region + "::" + account + "::" + prefix;
     }
 
 
@@ -552,19 +777,40 @@ public class EcrService implements ResourceProvider {
         }
     }
 
-    private List<String> listTagsBestEffort(String account, String region, String repoName) {
+    private Repository refreshRepositoryUri(Repository repo, String region) {
+        repo.setRepositoryUri(registryManager.getRepositoryUri(repo.getRegistryId(), region, repo.getRepositoryName()));
+        repoStore.put(key(region, repo.getRegistryId(), repo.getRepositoryName()), repo);
+        return repo;
+    }
+
+    private String registryRepositoryName(Repository repo, String region) {
+        String registryRepositoryName = repo.getRegistryRepositoryName();
+        if (registryRepositoryName != null && !registryRepositoryName.isBlank()) {
+            return registryRepositoryName;
+        }
+        return registryManager.internalRepoName(repo.getRegistryId(), region, repo.getRepositoryName());
+    }
+
+    private List<String> listTagsBestEffort(Repository repo, String region) {
         try {
             return registryManager.httpClient()
-                    .listTags(registryManager.internalRepoName(account, region, repoName));
+                    .listTags(resolveRegistryRepoName(repo.getRegistryId(), region, repo.getRepositoryName()));
         } catch (Exception e) {
-            LOG.debugv("Could not list tags for {0} (registry not available): {1}", repoName, e.getMessage());
+            LOG.debugv("Could not list tags for {0} (registry not available): {1}",
+                    repo.getRepositoryName(), e.getMessage());
             return List.of();
         }
     }
 
-    private void deleteRepositoryStorage(String account, String region, String repositoryName) {
+    /**
+     * Deletes registry storage for the repository under the name it was
+     * actually pushed as. Hostname-style pushes land under the bare name,
+     * which {@code internalRepoName} alone never addresses (issue #2444).
+     */
+    private void deleteRepositoryStorageResolved(String account, String region, String repositoryName) {
+        String internal = resolveRegistryRepoName(account, region, repositoryName);
         try {
-            registryManager.deleteRepositoryStorage(account, region, repositoryName);
+            registryManager.deleteRepositoryStorageByInternalName(internal);
         } catch (Exception e) {
             throw registryFailure(repositoryName, e);
         }
@@ -584,6 +830,90 @@ public class EcrService implements ResourceProvider {
                 "Could not delete images from repository '" + repositoryName + "'", 500);
     }
 
+    /**
+     * Lists tags and propagates registry failures. Used by force-delete to
+     * distinguish "registry unreachable" (skip cleanup) from "registry
+     * available but listing failed" (abort deletion).
+     */
+    private List<String> listTagsOrThrow(String account, String region, String repoName) throws Exception {
+        return registryManager.httpClient()
+                .listTagsStrict(resolveRegistryRepoNameStrict(account, region, repoName));
+    }
+
+    /**
+     * Resolves the repository name as stored in the backing registry.
+     * Hostname-style URIs ({@code <account>.dkr.ecr.<region>.localhost:<port>/<repo>})
+     * reach the raw registry, so docker pushes land under the bare repo name,
+     * while path-style URIs land under {@code <account>/<region>/<repo>}.
+     * Resolution uses catalog membership (not tag listing) so untagged,
+     * digest-only repositories resolve correctly. The namespaced form wins
+     * when both exist.
+     *
+     * <p>Ambiguity guard: a bare-name entry can only be claimed when no
+     * <em>other</em> account/region has metadata for the same repository name.
+     * Otherwise the bare entry's owning scope is unknown and resolving to it
+     * would let one scope read or delete another scope's images, so the call
+     * falls back to the (empty) namespaced form.
+     */
+    private String resolveRegistryRepoName(String account, String region, String repoName) {
+        try {
+            return resolveRegistryRepoNameStrict(account, region, repoName);
+        } catch (Exception e) {
+            LOG.debugv("Registry lookup failed while resolving {0}: {1}", repoName, e.getMessage());
+            return registryManager.internalRepoName(account, region, repoName);
+        }
+    }
+
+    private String resolveRegistryRepoNameStrict(String account, String region, String repoName) throws Exception {
+        String internal = registryManager.internalRepoName(account, region, repoName);
+        List<String> catalog = registryManager.httpClient().catalogStrict();
+        if (catalog.contains(internal)) {
+            return internal;
+        }
+        if (catalog.contains(repoName)) {
+            String currentKey = region + "::" + account + "::" + repoName;
+            boolean otherScopeClaimsIt = hasOtherScopeClaim(repoName, currentKey);
+            if (!otherScopeClaimsIt) {
+                return repoName;
+            }
+            LOG.warnv("Bare registry entry {0} claimed by another account/region; "
+                    + "resolving {0} to its namespaced form", repoName, internal);
+        }
+        return internal;
+    }
+
+    private boolean hasOtherScopeClaim(String repoName, String currentKey) {
+        String suffix = "::" + repoName;
+        if (repoStore instanceof AccountAwareStorageBackend<?> aware) {
+            @SuppressWarnings("unchecked")
+            AccountAwareStorageBackend<Repository> typed = (AccountAwareStorageBackend<Repository>) aware;
+            return typed.scanAllAccountEntries(k -> k.endsWith(suffix) && !k.equals(currentKey))
+                    .stream().findAny().isPresent();
+        }
+        return repoStore.keys().stream()
+                .anyMatch(k -> k.endsWith(suffix) && !k.equals(currentKey));
+    }
+
+    private static boolean isRegistryUnreachable(Throwable e) {
+        // Only genuine connectivity failures qualify. An NPE or an "is null"
+        // message means a bug or an answered error body, those must abort
+        // the delete, never masquerade as an outage.
+        Throwable t = e;
+        while (t != null) {
+            if (t instanceof java.net.ConnectException || t instanceof java.net.UnknownHostException
+                    || t instanceof java.net.SocketTimeoutException) {
+                return true;
+            }
+            String msg = t.getMessage();
+            if (msg != null && (msg.contains("Connection refused") || msg.contains("Connection reset")
+                    || msg.contains("Failed to connect") || msg.contains("Connection timed out"))) {
+                return true;
+            }
+            t = t.getCause();
+        }
+        return false;
+    }
+
     private static String key(String region, String account, String repoName) {
         return region + "::" + account + "::" + repoName;
     }
@@ -593,6 +923,110 @@ public class EcrService implements ResourceProvider {
             return registryId;
         }
         return regionResolver.getAccountId();
+    }
+
+    private static String normalizePullThroughCachePrefix(String prefix) {
+        if (prefix == null || prefix.isBlank() || "ROOT".equals(prefix)) {
+            return prefix;
+        }
+        return prefix.endsWith("/") ? prefix.substring(0, prefix.length() - 1) : prefix;
+    }
+
+    private static void validatePullThroughCachePrefix(String prefix, String fieldName) {
+        if (prefix == null || prefix.length() < 2 || prefix.length() > MAX_PULL_THROUGH_CACHE_PREFIX_LENGTH
+                || !PULL_THROUGH_CACHE_PREFIX.matcher(prefix).matches()) {
+            throw new AwsException("InvalidParameterException",
+                    fieldName + " must match the ECR pull through cache repository prefix pattern", 400);
+        }
+    }
+
+    private static void validateRegistryId(String registryId) {
+        if (!REGISTRY_ID.matcher(registryId).matches()) {
+            throw new AwsException("InvalidParameterException",
+                    "registryId must be a 12 digit account ID", 400);
+        }
+    }
+
+    private static void validateUpstreamRegistryUrl(String upstreamRegistryUrl) {
+        if (upstreamRegistryUrl == null || upstreamRegistryUrl.isBlank()) {
+            throw new AwsException("InvalidParameterException",
+                    "upstreamRegistryUrl must not be empty", 400);
+        }
+    }
+
+    private static void validateCredentialArn(String credentialArn) {
+        if (credentialArn == null) {
+            return;
+        }
+        if (credentialArn.length() < 50 || credentialArn.length() > 612
+                || !CREDENTIAL_ARN.matcher(credentialArn).matches()) {
+            throw new AwsException("InvalidParameterException",
+                    "credentialArn does not match the ECR pull through cache secret ARN pattern", 400);
+        }
+    }
+
+    private static void validateCustomRoleArn(String customRoleArn) {
+        if (customRoleArn != null && customRoleArn.length() > 2048) {
+            throw new AwsException("InvalidParameterException",
+                    "customRoleArn exceeds 2048 characters", 400);
+        }
+    }
+
+    private static String resolveUpstreamRegistry(String upstreamRegistry, String upstreamRegistryUrl) {
+        if (upstreamRegistry != null && !upstreamRegistry.isBlank()) {
+            if (!UPSTREAM_REGISTRIES.contains(upstreamRegistry)) {
+                throw unsupportedUpstreamRegistry(upstreamRegistry);
+            }
+            return upstreamRegistry;
+        }
+        String host = upstreamRegistryUrl.toLowerCase();
+        if (host.startsWith("https://")) {
+            host = host.substring("https://".length());
+        } else if (host.startsWith("http://")) {
+            host = host.substring("http://".length());
+        }
+        while (host.endsWith("/")) {
+            host = host.substring(0, host.length() - 1);
+        }
+        if (host.equals("registry-1.docker.io")) {
+            return "docker-hub";
+        }
+        if (host.equals("public.ecr.aws")) { // partition-literal: ECR Public's fixed registry host; the service exists only in the commercial partition
+            return "ecr-public";
+        }
+        if (host.equals("quay.io")) {
+            return "quay";
+        }
+        if (host.equals("registry.k8s.io")) {
+            return "k8s";
+        }
+        if (host.equals("ghcr.io")) {
+            return "github-container-registry";
+        }
+        if (host.equals("registry.gitlab.com")) {
+            return "gitlab-container-registry";
+        }
+        if (host.endsWith(".azurecr.io")) {
+            return "azure-container-registry";
+        }
+        if (host.equals("cgr.dev")) {
+            return "chainguard";
+        }
+        if (host.matches("[0-9]{12}\\.dkr\\.ecr\\.[a-z0-9-]+\\.amazonaws\\.com(?:\\.cn)?")) {
+            return "ecr";
+        }
+        throw unsupportedUpstreamRegistry(upstreamRegistryUrl);
+    }
+
+    private static AwsException unsupportedUpstreamRegistry(String value) {
+        return new AwsException("UnsupportedUpstreamRegistryException",
+                "The upstream registry '" + value + "' is not supported", 400);
+    }
+
+    private static AwsException pullThroughCacheRuleNotFound(String prefix, String account) {
+        return new AwsException("PullThroughCacheRuleNotFoundException",
+                "The pull through cache rule with repository prefix '" + prefix
+                        + "' does not exist in registry '" + account + "'", 400);
     }
 
     private static void validateRepoName(String name) {

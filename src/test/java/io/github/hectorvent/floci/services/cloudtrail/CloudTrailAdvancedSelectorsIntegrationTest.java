@@ -19,6 +19,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * This is the reproduction case for the CloudTrail circular-logging cost problem: excluding the
  * trail's own destination bucket via {@code resources.ARN notStartsWith} stops the trail from
  * recording its own delivery writes.
+ *
+ * <p>Delivery is driven explicitly through {@link CloudTrailLogWriter#flushNow()} rather than by
+ * the background flush, which the configured {@code cloudtrail.flush-interval-seconds} of an hour
+ * keeps out of the way. Every bucket and trail name here carries a random suffix and the
+ * assertions match on those names, so the class does not need an application of its own.
  */
 @QuarkusTest
 class CloudTrailAdvancedSelectorsIntegrationTest {

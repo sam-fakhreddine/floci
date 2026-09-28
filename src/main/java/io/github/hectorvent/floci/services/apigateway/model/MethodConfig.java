@@ -4,7 +4,9 @@ import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 @JsonIgnoreProperties(ignoreUnknown = true)
@@ -14,7 +16,9 @@ public class MethodConfig {
     private String httpMethod;
     private String authorizationType;
     private String authorizerId;
+    private List<String> authorizationScopes = new ArrayList<>();
     private String requestValidatorId;
+    private boolean apiKeyRequired;
     private Map<String, Boolean> requestParameters = new HashMap<>();
     private Map<String, String> requestModels = new HashMap<>();
     private Map<String, MethodResponse> methodResponses = new HashMap<>();
@@ -29,8 +33,16 @@ public class MethodConfig {
     public String getAuthorizerId() { return authorizerId; }
     public void setAuthorizerId(String authorizerId) { this.authorizerId = authorizerId; }
 
+    public List<String> getAuthorizationScopes() { return authorizationScopes; }
+    public void setAuthorizationScopes(List<String> authorizationScopes) {
+        this.authorizationScopes = authorizationScopes != null ? new ArrayList<>(authorizationScopes) : new ArrayList<>();
+    }
+
     public String getRequestValidatorId() { return requestValidatorId; }
     public void setRequestValidatorId(String requestValidatorId) { this.requestValidatorId = requestValidatorId; }
+
+    public boolean isApiKeyRequired() { return apiKeyRequired; }
+    public void setApiKeyRequired(boolean apiKeyRequired) { this.apiKeyRequired = apiKeyRequired; }
 
     public Map<String, String> getRequestModels() { return requestModels; }
     public void setRequestModels(Map<String, String> requestModels) {

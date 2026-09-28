@@ -2,14 +2,18 @@ package io.github.hectorvent.floci.services.stepfunctions;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.services.dynamodb.DynamoDbFacade;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbJsonHandler;
-import io.github.hectorvent.floci.services.dynamodb.DynamoDbService;
+import io.github.hectorvent.floci.services.dynamodb.backend.RecordingDynamoDbBackend;
+import io.github.hectorvent.floci.services.dynamodb.backend.RecordingDynamoDbBackend.Invocation;
 import io.github.hectorvent.floci.services.lambda.LambdaExecutorService;
 import io.github.hectorvent.floci.services.lambda.LambdaFunctionStore;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import io.github.hectorvent.floci.services.s3.S3Service;
+import io.github.hectorvent.floci.services.sns.SnsJsonHandler;
 import io.github.hectorvent.floci.services.sqs.SqsJsonHandler;
 import io.github.hectorvent.floci.services.stepfunctions.model.Execution;
 import io.github.hectorvent.floci.services.stepfunctions.model.HistoryEvent;
@@ -23,6 +27,7 @@ import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -33,6 +38,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -56,17 +62,26 @@ class AslExecutorTaskHistoryEventsTest {
     @Inject
     Vertx vertx;
 
+    @Inject
+    RegionResolver regionResolver;
+
     @BeforeEach
     void setUp() {
         lambdaExecutor = mock(LambdaExecutorService.class);
         functionStore = mock(LambdaFunctionStore.class);
+        executor = newExecutor(mock(DynamoDbFacade.class));
+    }
 
-        executor = new AslExecutor(
+    private AslExecutor newExecutor(DynamoDbFacade dynamoDb) {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().stepfunctions().maxWaitSeconds()).thenReturn(30);
+
+        return new AslExecutor(
                 lambdaExecutor,
                 functionStore,
-                mock(DynamoDbService.class),
+                dynamoDb,
                 mock(DynamoDbJsonHandler.class),
-                mock(SqsJsonHandler.class),
+                mock(SqsJsonHandler.class), mock(SnsJsonHandler.class),
                 mock(io.github.hectorvent.floci.services.cloudformation.CloudFormationQueryHandler.class),
                 mock(io.github.hectorvent.floci.services.ec2.Ec2Service.class),
                 mock(S3Service.class),
@@ -77,8 +92,38 @@ class AslExecutorTaskHistoryEventsTest {
                 mock(io.github.hectorvent.floci.services.scheduler.SchedulerController.class),
                 objectMapper,
                 new JsonataEvaluator(objectMapper),
-                mock(Instance.class), mock(EmulatorConfig.class), vertx,
+                mock(Instance.class), config, vertx,
                 mock(io.github.hectorvent.floci.core.common.CustomResourceLiveness.class));
+    }
+
+    /**
+     * The optimized DynamoDB integration scopes to the ambient account, which the executor sets to
+     * the one in the state machine ARN, and to the state machine's region.
+     */
+    @Test
+    void optimizedDynamoDbTaskRunsAsTheExecutionAccountInTheStateMachineRegion() {
+        RecordingDynamoDbBackend backend = new RecordingDynamoDbBackend();
+        AslExecutor recordingExecutor = newExecutor(new DynamoDbFacade(backend, backend, regionResolver));
+        StateMachine stateMachine = new StateMachine();
+        stateMachine.setName("ddb");
+        stateMachine.setStateMachineArn("arn:aws:states:eu-west-1:111122223333:stateMachine:ddb");
+        stateMachine.setRoleArn("arn:aws:iam::111122223333:role/test-role");
+        stateMachine.setDefinition("""
+                {"StartAt": "Put", "States": {"Put": {"Type": "Task",
+                  "Resource": "arn:aws:states:::dynamodb:putItem",
+                  "Parameters": {"TableName": "orders", "Item": {"id": {"S": "k1"}}}, "End": true}}}
+                """);
+        Execution execution = new Execution();
+        execution.setName("ddb-execution");
+        execution.setExecutionArn("arn:aws:states:eu-west-1:111122223333:execution:ddb:ddb-execution");
+        execution.setStateMachineArn(stateMachine.getStateMachineArn());
+        execution.setInput("{}");
+
+        recordingExecutor.executeSync(stateMachine, execution, new ArrayList<>(), (updated, events) -> {
+        });
+
+        assertEquals("SUCCEEDED", execution.getStatus(), execution.getCause());
+        assertEquals(List.of(new Invocation("putItem", "111122223333", "eu-west-1")), backend.invocations());
     }
 
     @Test
@@ -257,6 +302,106 @@ class AslExecutorTaskHistoryEventsTest {
         assertNull(started.getDetails());
     }
 
+    @Test
+    void directLambdaFailurePreservesFunctionErrorInHistory() {
+        var functionName = "failing-lambda";
+        var functionArn = lambdaArn(functionName);
+        var errorPayload = "{\"errorType\":\"ValidationError\",\"errorMessage\":\"invalid input\"}";
+        stubLambdaFailure(functionName, functionArn, errorPayload.getBytes(StandardCharsets.UTF_8));
+
+        var history = new ArrayList<HistoryEvent>();
+        var execution = run("""
+                {
+                  "StartAt": "Call",
+                  "States": {
+                    "Call": {
+                      "Type": "Task",
+                      "Resource": "%s",
+                      "End": true
+                    }
+                  }
+                }
+                """.formatted(functionArn), "{}", null, history);
+
+        assertEquals("FAILED", execution.getStatus());
+        assertEquals("ValidationError", execution.getError());
+        assertEquals(errorPayload, execution.getCause());
+        assertEquals(
+                List.of("TaskStateEntered", "LambdaFunctionScheduled", "LambdaFunctionStarted",
+                        "LambdaFunctionFailed", "ExecutionFailed"),
+                typesOf(history));
+        var failed = eventOfType(history, "LambdaFunctionFailed");
+        assertEquals("ValidationError", failed.getDetails().get("error"));
+        assertEquals(errorPayload, failed.getDetails().get("cause"));
+        assertChain(history);
+    }
+
+    @Test
+    void optimizedLambdaFailurePreservesFunctionErrorInHistory() {
+        var functionName = "failing-lambda";
+        var functionArn = lambdaArn(functionName);
+        var errorPayload = "{\"errorType\":\"ValidationError\",\"errorMessage\":\"invalid input\"}";
+        stubLambdaFailure(functionName, functionArn, errorPayload.getBytes(StandardCharsets.UTF_8));
+
+        var history = new ArrayList<HistoryEvent>();
+        var execution = run("""
+                {
+                  "StartAt": "Call",
+                  "States": {
+                    "Call": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "%s",
+                        "Payload": {"value": 1}
+                      },
+                      "End": true
+                    }
+                  }
+                }
+                """.formatted(functionArn), "{}", null, history);
+
+        assertEquals("FAILED", execution.getStatus());
+        assertEquals("ValidationError", execution.getError());
+        assertEquals(errorPayload, execution.getCause());
+        assertEquals(
+                List.of("TaskStateEntered", "TaskScheduled", "TaskStarted", "TaskFailed", "ExecutionFailed"),
+                typesOf(history));
+        var failed = eventOfType(history, "TaskFailed");
+        assertEquals("lambda", failed.getDetails().get("resourceType"));
+        assertEquals("invoke", failed.getDetails().get("resource"));
+        assertEquals("ValidationError", failed.getDetails().get("error"));
+        assertEquals(errorPayload, failed.getDetails().get("cause"));
+        assertChain(history);
+    }
+
+    @Test
+    void malformedLambdaErrorPayloadFallsBackToException() {
+        var functionName = "failing-lambda";
+        var functionArn = lambdaArn(functionName);
+        var errorPayload = "not-json";
+        stubLambdaFailure(functionName, functionArn, errorPayload.getBytes(StandardCharsets.UTF_8));
+
+        var execution = run(directLambdaDefinition(functionArn), "{}", null, new ArrayList<>());
+
+        assertEquals("FAILED", execution.getStatus());
+        assertEquals("Exception", execution.getError());
+        assertEquals(errorPayload, execution.getCause());
+    }
+
+    @Test
+    void missingLambdaErrorPayloadFallsBackToException() {
+        var functionName = "failing-lambda";
+        var functionArn = lambdaArn(functionName);
+        stubLambdaFailure(functionName, functionArn, null);
+
+        var execution = run(directLambdaDefinition(functionArn), "{}", null, new ArrayList<>());
+
+        assertEquals("FAILED", execution.getStatus());
+        assertEquals("Exception", execution.getError());
+        assertNull(execution.getCause());
+    }
+
     /**
      * A Parallel branch and a Map iteration run states of their own whose events floci does not
      * publish. The published history is still one unbroken chain: the ids of the events around them
@@ -345,6 +490,30 @@ class AslExecutorTaskHistoryEventsTest {
         return new MockedResponseStep(from, to, null, error, cause);
     }
 
+    private void stubLambdaFailure(String functionName, String functionArn, byte[] errorPayload) {
+        var function = new LambdaFunction();
+        function.setFunctionName(functionName);
+        function.setFunctionArn(functionArn);
+        when(functionStore.get(REGION, functionName)).thenReturn(Optional.of(function));
+        when(lambdaExecutor.invoke(eq(function), any(byte[].class), eq(InvocationType.RequestResponse)))
+                .thenReturn(new InvokeResult(200, "Handled", errorPayload, null, "failure-request"));
+    }
+
+    private static String directLambdaDefinition(String functionArn) {
+        return """
+                {
+                  "StartAt": "Call",
+                  "States": {
+                    "Call": {
+                      "Type": "Task",
+                      "Resource": "%s",
+                      "End": true
+                    }
+                  }
+                }
+                """.formatted(functionArn);
+    }
+
     private Execution run(String definition, String input, MockedTestCase mocks, List<HistoryEvent> history) {
         var stateMachine = new StateMachine();
         stateMachine.setName("history-events-test");
@@ -362,5 +531,9 @@ class AslExecutorTaskHistoryEventsTest {
         executor.executeSync(stateMachine, execution, history, mocks, (updated, events) -> {
         });
         return execution;
+    }
+
+    private static String lambdaArn(String name) {
+        return "arn:aws:lambda:%s:%s:function:%s".formatted(REGION, ACCOUNT, name);
     }
 }

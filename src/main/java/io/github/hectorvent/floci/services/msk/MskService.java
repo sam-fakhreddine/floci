@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.msk;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.Pagination;
@@ -118,19 +119,26 @@ public class MskService implements ResourceProvider {
     public MskCluster createCluster(CreateClusterRequest request) {
         validateCreateRequest(request);
         String clusterName = request.getClusterName();
-        if (storage.scan(k -> true).stream().anyMatch(c -> c.getClusterName().equals(clusterName))) {
+        if (storage.scan(k -> true).stream().anyMatch(c -> isCurrentRegion(c)
+                && c.getClusterName().equals(clusterName))) {
             throw new AwsException("ConflictException", "Cluster already exists: " + clusterName, 409);
         }
 
         String accountId = regionResolver.getAccountId();
-        String clusterArn = AwsArnUtils.Arn.of("kafka", config.defaultRegion(), accountId, "cluster/" + clusterName + "/" + java.util.UUID.randomUUID()).toString();
+        String clusterArn = AwsArnUtils.Arn.of("kafka", regionResolver.getRegion(), accountId,
+                "cluster/" + clusterName + "/" + java.util.UUID.randomUUID()).toString();
 
         String kafkaVersion = request.getKafkaVersion();
         String resolvedKafkaVersion = (kafkaVersion == null || kafkaVersion.isBlank()) ? DEFAULT_KAFKA_VERSION : kafkaVersion;
         MskCluster cluster = new MskCluster(clusterArn, clusterName, resolvedKafkaVersion);
         cluster.setClusterType(PROVISIONED_CLUSTER_TYPE);
         cluster.setAccountId(accountId);
+        cluster.setResourceRegion(regionResolver.getRegion());
         cluster.setVolumeId(String.format("%06x", new SecureRandom().nextInt(0xFFFFFF)));
+        // Stamp the volume name now, with the current prefix, so it is persisted rather than
+        // recomputed later. Only records predating this field fall back to the legacy name.
+        cluster.setDockerVolumeName(ContainerStorageHelper.resourceName(
+                config, "msk", cluster.getVolumeId(), cluster.getClusterName()));
 
         if (request.getNumberOfBrokerNodes() != null) {
             cluster.setNumberOfBrokerNodes(request.getNumberOfBrokerNodes());
@@ -326,12 +334,13 @@ public class MskService implements ResourceProvider {
             throw badRequest("clusterName",
                     "clusterName must be between 1 and " + MAX_CLUSTER_NAME_LENGTH + " characters.");
         }
-        if (storage.scan(k -> true).stream().anyMatch(c -> c.getClusterName().equals(clusterName))) {
+        if (storage.scan(k -> true).stream().anyMatch(c -> isCurrentRegion(c)
+                && c.getClusterName().equals(clusterName))) {
             throw new AwsException("ConflictException", "Cluster already exists: " + clusterName, 409);
         }
 
         String accountId = regionResolver.getAccountId();
-        String clusterArn = AwsArnUtils.Arn.of("kafka", config.defaultRegion(), accountId,
+        String clusterArn = AwsArnUtils.Arn.of("kafka", regionResolver.getRegion(), accountId,
                 "cluster/" + clusterName + "/" + UUID.randomUUID()).toString();
 
         MskCluster cluster = new MskCluster(clusterArn, clusterName, DEFAULT_KAFKA_VERSION);
@@ -339,7 +348,12 @@ public class MskService implements ResourceProvider {
         cluster.setServerless(request.getServerless());
         cluster.setTags(request.getTags());
         cluster.setAccountId(accountId);
+        cluster.setResourceRegion(regionResolver.getRegion());
         cluster.setVolumeId(String.format("%06x", new SecureRandom().nextInt(0xFFFFFF)));
+        // Stamp the volume name now, with the current prefix, so it is persisted rather than
+        // recomputed later. Only records predating this field fall back to the legacy name.
+        cluster.setDockerVolumeName(ContainerStorageHelper.resourceName(
+                config, "msk", cluster.getVolumeId(), cluster.getClusterName()));
 
         // Provisioned-only members must not surface on a serverless cluster.
         cluster.setNumberOfBrokerNodes(0);
@@ -377,21 +391,21 @@ public class MskService implements ResourceProvider {
 
     /** ListClusters for the v1 API, which likewise cannot represent serverless clusters. */
     public List<MskCluster> listProvisionedClusters() {
-        return storage.scan(k -> true).stream().filter(c -> !isServerless(c)).toList();
+        return storage.scan(k -> true).stream().filter(this::isCurrentRegion)
+                .filter(c -> !isServerless(c)).toList();
     }
 
     public MskCluster describeCluster(String clusterArn) {
-        return storage.get(clusterArn)
+        return storage.get(clusterArn).filter(this::isCurrentRegion)
                 .orElseThrow(() -> new AwsException("NotFoundException", "Cluster not found: " + clusterArn, 404));
     }
 
     public List<MskCluster> listClusters() {
-        return storage.scan(k -> true);
+        return storage.scan(k -> true).stream().filter(this::isCurrentRegion).toList();
     }
 
     public void deleteCluster(String clusterArn) {
-        MskCluster cluster = storage.get(clusterArn)
-                .orElseThrow(() -> new AwsException("NotFoundException", "Cluster not found: " + clusterArn, 404));
+        MskCluster cluster = describeCluster(clusterArn);
 
         cluster.setState(ClusterState.DELETING);
         if (!config.services().msk().mock()) {
@@ -541,7 +555,7 @@ public class MskService implements ResourceProvider {
     // DescribeConfiguration, whose 400 is a deliberate terraform-provider contract.
 
     public Map<String, String> listTagsForResource(String arn) {
-        MskCluster cluster = storage.get(arn).orElse(null);
+        MskCluster cluster = storage.get(arn).filter(this::isCurrentRegion).orElse(null);
         if (cluster != null) {
             return cluster.getTags() != null ? cluster.getTags() : Map.of();
         }
@@ -553,7 +567,7 @@ public class MskService implements ResourceProvider {
     }
 
     public void tagResource(String arn, Map<String, String> tags) {
-        MskCluster cluster = storage.get(arn).orElse(null);
+        MskCluster cluster = storage.get(arn).filter(this::isCurrentRegion).orElse(null);
         if (cluster != null) {
             cluster.setTags(merged(cluster.getTags(), tags));
             storage.put(arn, cluster);
@@ -569,7 +583,7 @@ public class MskService implements ResourceProvider {
     }
 
     public void untagResource(String arn, List<String> tagKeys) {
-        MskCluster cluster = storage.get(arn).orElse(null);
+        MskCluster cluster = storage.get(arn).filter(this::isCurrentRegion).orElse(null);
         if (cluster != null) {
             cluster.setTags(without(cluster.getTags(), tagKeys));
             storage.put(arn, cluster);
@@ -643,7 +657,7 @@ public class MskService implements ResourceProvider {
     @Override
     public List<ExplorerResource> getResources() {
         List<ExplorerResource> resources = new ArrayList<>();
-        for (MskCluster cluster : storage.scan(k -> true)) {
+        for (MskCluster cluster : storage.scan(k -> true).stream().filter(this::isCurrentRegion).toList()) {
             String arn = cluster.getClusterArn();
             if (arn == null) {
                 continue;
@@ -661,5 +675,15 @@ public class MskService implements ResourceProvider {
     @Override
     public Set<SupportedResourceType> getSupportedResourceTypes() {
         return Set.of(new SupportedResourceType("kafka:cluster", "kafka", true));
+    }
+
+    private boolean isCurrentRegion(MskCluster cluster) {
+        if (cluster.getResourceRegion() != null) {
+            return regionResolver.getRegion().equals(cluster.getResourceRegion());
+        }
+        // Older records have no request-region marker and their ARN always used the configured
+        // default. Keep them visible until they are recreated so an upgrade does not hide or
+        // strand persisted clusters whose original request region was not stored.
+        return true;
     }
 }

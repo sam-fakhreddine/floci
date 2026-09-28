@@ -2,14 +2,15 @@ package io.github.hectorvent.floci.services.stepfunctions;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.dynamodb.DynamoDbFacade;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbJsonHandler;
-import io.github.hectorvent.floci.services.dynamodb.DynamoDbService;
 import io.github.hectorvent.floci.services.lambda.LambdaExecutorService;
 import io.github.hectorvent.floci.services.lambda.LambdaFunctionStore;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import io.github.hectorvent.floci.services.s3.S3Service;
+import io.github.hectorvent.floci.services.sns.SnsJsonHandler;
 import io.github.hectorvent.floci.services.sqs.SqsJsonHandler;
 import io.github.hectorvent.floci.services.stepfunctions.model.Execution;
 import io.github.hectorvent.floci.services.stepfunctions.model.HistoryEvent;
@@ -65,12 +66,20 @@ class AslExecutorRetryTest {
         flakyFunction.setFunctionArn(FLAKY_FUNCTION_ARN);
         when(functionStore.get(REGION, FLAKY_FUNCTION_NAME)).thenReturn(Optional.of(flakyFunction));
 
+        EmulatorConfig config = mock(EmulatorConfig.class);
+        EmulatorConfig.ServicesConfig servicesConfig = mock(EmulatorConfig.ServicesConfig.class);
+        EmulatorConfig.StepFunctionsServiceConfig stepFunctionsConfig =
+                mock(EmulatorConfig.StepFunctionsServiceConfig.class);
+        when(config.services()).thenReturn(servicesConfig);
+        when(servicesConfig.stepfunctions()).thenReturn(stepFunctionsConfig);
+        when(stepFunctionsConfig.maxWaitSeconds()).thenReturn(30);
+
         executor = new AslExecutor(
                 lambdaExecutor,
                 functionStore,
-                mock(DynamoDbService.class),
+                mock(DynamoDbFacade.class),
                 mock(DynamoDbJsonHandler.class),
-                mock(SqsJsonHandler.class),
+                mock(SqsJsonHandler.class), mock(SnsJsonHandler.class),
                 mock(io.github.hectorvent.floci.services.cloudformation.CloudFormationQueryHandler.class),
                 mock(io.github.hectorvent.floci.services.ec2.Ec2Service.class),
                 mock(S3Service.class),
@@ -81,7 +90,7 @@ class AslExecutorRetryTest {
                 mock(io.github.hectorvent.floci.services.scheduler.SchedulerController.class),
                 objectMapper,
                 new JsonataEvaluator(objectMapper),
-                mock(Instance.class), mock(EmulatorConfig.class), vertx, null);
+                mock(Instance.class), config, vertx, null);
     }
 
     @Test
@@ -101,7 +110,7 @@ class AslExecutorRetryTest {
                       "Resource": "%s",
                       "End": true,
                       "Retry": [{
-                        "ErrorEquals": ["Lambda.AWSLambdaException"],
+                        "ErrorEquals": ["Boom"],
                         "IntervalSeconds": 1,
                         "BackoffRate": 1.0,
                         "MaxAttempts": 2
@@ -132,7 +141,7 @@ class AslExecutorRetryTest {
                       "Resource": "%s",
                       "End": true,
                       "Retry": [{
-                        "ErrorEquals": ["Lambda.AWSLambdaException"],
+                        "ErrorEquals": ["Boom"],
                         "IntervalSeconds": 1,
                         "BackoffRate": 1.0,
                         "MaxAttempts": 1
@@ -143,13 +152,13 @@ class AslExecutorRetryTest {
                 """.formatted(FLAKY_FUNCTION_ARN));
 
         assertEquals("FAILED", execution.getStatus());
-        assertEquals("Lambda.AWSLambdaException", execution.getError());
+        assertEquals("Boom", execution.getError());
         verify(lambdaExecutor, times(2))
                 .invoke(eq(flakyFunction), any(byte[].class), eq(InvocationType.RequestResponse));
     }
 
     @Test
-    void unmatchedErrorIsNotRetried() {
+    void lambdaServiceErrorRetrierDoesNotMatchFunctionError() {
         when(lambdaExecutor.invoke(eq(flakyFunction), any(byte[].class), eq(InvocationType.RequestResponse)))
                 .thenReturn(new InvokeResult(200, "Handled",
                         "{\"errorType\":\"Boom\"}".getBytes(StandardCharsets.UTF_8), null, "req-1"));
@@ -163,7 +172,8 @@ class AslExecutorRetryTest {
                       "Resource": "%s",
                       "End": true,
                       "Retry": [{
-                        "ErrorEquals": ["SomeOther.Error"],
+                        "ErrorEquals": ["Lambda.ClientExecutionTimeoutException", "Lambda.ServiceException",
+                                        "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
                         "IntervalSeconds": 1,
                         "MaxAttempts": 3
                       }]
@@ -173,7 +183,7 @@ class AslExecutorRetryTest {
                 """.formatted(FLAKY_FUNCTION_ARN));
 
         assertEquals("FAILED", execution.getStatus());
-        assertEquals("Lambda.AWSLambdaException", execution.getError());
+        assertEquals("Boom", execution.getError());
         verify(lambdaExecutor, times(1))
                 .invoke(eq(flakyFunction), any(byte[].class), eq(InvocationType.RequestResponse));
     }
@@ -212,7 +222,7 @@ class AslExecutorRetryTest {
                 """.formatted(FLAKY_FUNCTION_ARN));
 
         assertEquals("SUCCEEDED", execution.getStatus());
-        assertEquals("Lambda.AWSLambdaException",
+        assertEquals("Boom",
                 objectMapper.readTree(execution.getOutput()).path("Error").asText());
         verify(lambdaExecutor, times(2))
                 .invoke(eq(flakyFunction), any(byte[].class), eq(InvocationType.RequestResponse));
@@ -233,7 +243,7 @@ class AslExecutorRetryTest {
                         "States": {"Inner": {"Type": "Task", "Resource": "%s", "End": true}}
                       }],
                       "Retry": [{
-                        "ErrorEquals": ["Lambda.AWSLambdaException"],
+                        "ErrorEquals": ["Boom"],
                         "IntervalSeconds": 1,
                         "BackoffRate": 1.0,
                         "MaxAttempts": 1
@@ -278,7 +288,7 @@ class AslExecutorRetryTest {
                 """.formatted(FLAKY_FUNCTION_ARN));
 
         assertEquals("SUCCEEDED", execution.getStatus());
-        assertEquals("Lambda.AWSLambdaException",
+        assertEquals("Boom",
                 objectMapper.readTree(execution.getOutput()).path("Error").asText());
         verify(lambdaExecutor, times(1))
                 .invoke(eq(flakyFunction), any(byte[].class), eq(InvocationType.RequestResponse));
@@ -302,7 +312,7 @@ class AslExecutorRetryTest {
                             "Resource": "%s",
                             "End": true,
                             "Retry": [{
-                              "ErrorEquals": ["Lambda.AWSLambdaException"],
+                              "ErrorEquals": ["Boom"],
                               "IntervalSeconds": 1,
                               "BackoffRate": 1.0,
                               "MaxAttempts": 1
@@ -339,7 +349,7 @@ class AslExecutorRetryTest {
                         "States": {"Inner": {"Type": "Task", "Resource": "%s", "End": true}}
                       },
                       "Retry": [{
-                        "ErrorEquals": ["Lambda.AWSLambdaException"],
+                        "ErrorEquals": ["Boom"],
                         "IntervalSeconds": 1,
                         "BackoffRate": 1.0,
                         "MaxAttempts": 1
@@ -397,8 +407,19 @@ class AslExecutorRetryTest {
         assertEquals(10.0, delay("{\"IntervalSeconds\": 10, \"BackoffRate\": 1.0, \"JitterStrategy\": \"NONE\"}", 1, 0.5));
     }
 
+    @Test
+    void theDelayCapIsTheConfiguredWaitCeiling() throws Exception {
+        String retrier = "{\"IntervalSeconds\": 100, \"BackoffRate\": 2.0}";
+        assertEquals(30.0, delay(retrier, 2, 0.5));
+        assertEquals(120.0, delay(retrier, 2, 0.5, 120));
+    }
+
     private double delay(String retrierJson, int attemptsUsed, double random) throws Exception {
-        return AslExecutor.retryDelaySeconds(objectMapper.readTree(retrierJson), attemptsUsed, random);
+        return delay(retrierJson, attemptsUsed, random, 30);
+    }
+
+    private double delay(String retrierJson, int attemptsUsed, double random, int maxWaitSeconds) throws Exception {
+        return AslExecutor.retryDelaySeconds(objectMapper.readTree(retrierJson), attemptsUsed, random, maxWaitSeconds);
     }
 
     private void failOnceThenSucceed() {

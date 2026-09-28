@@ -24,6 +24,7 @@ import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasItems;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * End-to-end MemoryDB test: JSON 1.1 control plane (CreateCluster/DescribeClusters/
@@ -122,6 +123,20 @@ class MemoryDbIntegrationTest {
 
     @Test
     @Order(4)
+    void explicitAuthIsAcceptedWhenAuthIsNotRequired() throws Exception {
+        // open-access clusters never demand AUTH, but a client that sends one anyway
+        // (common with generic Redis clients) must still get +OK and stay usable.
+        try (Socket socket = openSocket(openPort)) {
+            write(socket, respArray("AUTH", "any-password"));
+            assertEquals("+OK\r\n", readLine(socket));
+
+            write(socket, respArray("PING"));
+            assertEquals("+PONG\r\n", readLine(socket));
+        }
+    }
+
+    @Test
+    @Order(5)
     void createPasswordUserAndAcl() {
         // A password user attached to an ACL is how real MemoryDB models auth — the
         // cluster then references that ACL via ACLName.
@@ -145,7 +160,7 @@ class MemoryDbIntegrationTest {
     }
 
     @Test
-    @Order(5)
+    @Order(6)
     void createClusterReferencingAcl() {
         authPort = memorydb("CreateCluster", "{"
                 + "\"ClusterName\":\"" + AUTH_CLUSTER + "\","
@@ -160,14 +175,14 @@ class MemoryDbIntegrationTest {
     }
 
     @Test
-    @Order(6)
+    @Order(7)
     void aclClusterRejectsUnauthenticatedCommand() throws Exception {
         assertEquals("-NOAUTH Authentication required.\r\n",
                 sendCommand(authPort, respArray("PING")));
     }
 
     @Test
-    @Order(7)
+    @Order(8)
     void aclUserCredentialsAllowAccess() throws Exception {
         // Exercises end-to-end that the proxy resolves auth through the ACL's user.
         try (Socket socket = openSocket(authPort)) {
@@ -180,14 +195,26 @@ class MemoryDbIntegrationTest {
     }
 
     @Test
-    @Order(8)
+    @Order(9)
+    void aclUserCredentialsWorkWithHelloAuth() throws Exception {
+        try (Socket socket = openSocket(authPort)) {
+            write(socket, respArray("HELLO", "3", "AUTH", AUTH_USER, AUTH_PASSWORD));
+            assertTrue(readRespValue(socket).startsWith("%"));
+
+            write(socket, respArray("PING"));
+            assertEquals("+PONG\r\n", readLine(socket));
+        }
+    }
+
+    @Test
+    @Order(10)
     void wrongPasswordRejected() throws Exception {
         assertEquals("-ERR invalid username-password pair or user is disabled.\r\n",
                 sendCommand(authPort, respArray("AUTH", AUTH_USER, "wrong-password")));
     }
 
     @Test
-    @Order(9)
+    @Order(11)
     void deleteClusterReleasesProxyPortForReuse() {
         deleteCluster(OPEN_CLUSTER)
             .then()
@@ -291,6 +318,51 @@ class MemoryDbIntegrationTest {
             }
         }
         return new String(buffer, 0, offset, StandardCharsets.UTF_8);
+    }
+
+    private static String readRespValue(Socket socket) throws IOException {
+        String header = readLine(socket);
+        if (header.length() < 3) {
+            throw new IOException("Invalid RESP value header: " + header);
+        }
+
+        char type = header.charAt(0);
+        return switch (type) {
+            case '$', '!', '=' -> {
+                int count = parseRespLength(header);
+                if (count >= 0) {
+                    byte[] payload = socket.getInputStream().readNBytes(count + 2);
+                    if (payload.length != count + 2
+                            || payload[count] != '\r' || payload[count + 1] != '\n') {
+                        throw new IOException("Incomplete RESP bulk payload");
+                    }
+                }
+                yield header;
+            }
+            case '*', '~', '>' -> {
+                int count = parseRespLength(header);
+                for (int index = 0; index < count; index++) {
+                    readRespValue(socket);
+                }
+                yield header;
+            }
+            case '%', '|' -> {
+                int count = parseRespLength(header);
+                for (int index = 0; index < count * 2; index++) {
+                    readRespValue(socket);
+                }
+                yield header;
+            }
+            default -> header;
+        };
+    }
+
+    private static int parseRespLength(String header) throws IOException {
+        try {
+            return Integer.parseInt(header.substring(1, header.length() - 2));
+        } catch (NumberFormatException e) {
+            throw new IOException("Invalid RESP length: " + header, e);
+        }
     }
 
     private static String respArray(String... parts) {

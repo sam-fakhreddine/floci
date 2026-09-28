@@ -23,6 +23,11 @@ public class DbCluster {
     private DbEndpoint readerEndpoint;
     private boolean iamDatabaseAuthenticationEnabled;
     private List<String> dbClusterMembers = new ArrayList<>();
+    // The member that holds the writer role. Null on a cluster persisted before the role was
+    // modelled, in which case the first member is the writer, as it always was reported.
+    private String clusterWriterIdentifier;
+    // Set while the cluster is the primary or a secondary of a global cluster.
+    private String globalClusterIdentifier;
     private String parameterGroupName;
     private String dbSubnetGroupName;
     private String vpcId;
@@ -37,6 +42,8 @@ public class DbCluster {
     private Instant createdAt;
     private int proxyPort;
     private Map<String, String> tags = new LinkedHashMap<>();
+    private String engineMode;
+    private boolean storageEncrypted;
 
     private String dockerVolumeName;
     private String volumeId;
@@ -113,6 +120,20 @@ public class DbCluster {
     public List<String> getDbClusterMembers() { return dbClusterMembers; }
     public void setDbClusterMembers(List<String> dbClusterMembers) { this.dbClusterMembers = dbClusterMembers; }
 
+    public String getClusterWriterIdentifier() { return clusterWriterIdentifier; }
+    public void setClusterWriterIdentifier(String clusterWriterIdentifier) { this.clusterWriterIdentifier = clusterWriterIdentifier; }
+
+    /** The member DescribeDBClusters reports as the writer; null only when there are no members. */
+    public String resolveWriterIdentifier() {
+        if (clusterWriterIdentifier != null && dbClusterMembers.contains(clusterWriterIdentifier)) {
+            return clusterWriterIdentifier;
+        }
+        return dbClusterMembers.isEmpty() ? null : dbClusterMembers.get(0);
+    }
+
+    public String getGlobalClusterIdentifier() { return globalClusterIdentifier; }
+    public void setGlobalClusterIdentifier(String globalClusterIdentifier) { this.globalClusterIdentifier = globalClusterIdentifier; }
+
     public String getParameterGroupName() { return parameterGroupName; }
     public void setParameterGroupName(String parameterGroupName) { this.parameterGroupName = parameterGroupName; }
 
@@ -160,6 +181,12 @@ public class DbCluster {
 
     public Map<String, String> getTags() { return tags; }
     public void setTags(Map<String, String> tags) { this.tags = tags != null ? new LinkedHashMap<>(tags) : new LinkedHashMap<>(); }
+
+    public String getEngineMode() { return engineMode; }
+    public void setEngineMode(String engineMode) { this.engineMode = engineMode; }
+
+    public boolean isStorageEncrypted() { return storageEncrypted; }
+    public void setStorageEncrypted(boolean storageEncrypted) { this.storageEncrypted = storageEncrypted; }
 
     public String getDockerVolumeName() { return dockerVolumeName; }
     public void setDockerVolumeName(String dockerVolumeName) { this.dockerVolumeName = dockerVolumeName; }

@@ -36,10 +36,10 @@ final class ProjectionEvaluator {
         if (item == null || projectionExpression == null || projectionExpression.isBlank()) {
             return (ObjectNode) item;
         }
-        validateExpression(projectionExpression);
+        validateExpression(projectionExpression, exprAttrNames);
         PathTrie root = new PathTrie();
         for (String rawPath : splitProjectionPaths(projectionExpression)) {
-            List<String> segments = resolvePath(rawPath.trim(), exprAttrNames);
+            List<PathSegment> segments = resolvePath(rawPath.trim(), exprAttrNames);
             if (segments.isEmpty()) {
                 continue;
             }
@@ -66,9 +66,9 @@ final class ProjectionEvaluator {
     static Set<String> topLevelAttributes(String projectionExpression, JsonNode exprAttrNames) {
         var attributes = new java.util.HashSet<String>();
         for (String rawPath : splitProjectionPaths(projectionExpression)) {
-            List<String> segments = resolvePath(rawPath.trim(), exprAttrNames);
+            List<PathSegment> segments = resolvePath(rawPath.trim(), exprAttrNames);
             if (!segments.isEmpty()) {
-                attributes.add(segments.getFirst());
+                attributes.add(segments.getFirst().name());
             }
         }
         return Set.copyOf(attributes);
@@ -88,9 +88,57 @@ final class ProjectionEvaluator {
                 "Invalid " + expressionType + ": Syntax error; token: \"" + token + "\", near: \"" + near + "\"", 400);
     }
 
-    static void validateExpression(String expression) {
+    static void validateExpression(String expression, JsonNode exprAttrNames) {
         validateSyntax(expression, "ProjectionExpression");
         DynamoDbReservedWords.check(expression, "ProjectionExpression");
+        validatePaths(expression, exprAttrNames);
+    }
+
+    /**
+     * Rejects an undefined #alias, and any two paths where one covers the other.
+     * DynamoDB applies both before the read, so a request that matches nothing still fails.
+     */
+    static void validatePaths(String expression, JsonNode exprAttrNames) {
+        if (expression == null || expression.isBlank()) {
+            return;
+        }
+        List<List<PathSegment>> paths = new ArrayList<>();
+        for (String rawPath : splitProjectionPaths(expression)) {
+            List<PathSegment> segments = resolvePath(rawPath.trim(), exprAttrNames, true);
+            if (!segments.isEmpty()) {
+                paths.add(segments);
+            }
+        }
+        for (int i = 0; i < paths.size(); i++) {
+            List<PathSegment> first = paths.get(i);
+            for (int j = i + 1; j < paths.size(); j++) {
+                List<PathSegment> second = paths.get(j);
+                if (covers(first, second) || covers(second, first)) {
+                    throw new AwsException("ValidationException",
+                            "Invalid ProjectionExpression: Two document paths overlap with each other; "
+                            + "must remove or rewrite one of these paths; path one: " + render(first)
+                            + ", path two: " + render(second), 400);
+                }
+            }
+        }
+    }
+
+    private static boolean covers(List<PathSegment> outer, List<PathSegment> inner) {
+        return outer.size() <= inner.size() && inner.subList(0, outer.size()).equals(outer);
+    }
+
+    // DynamoDB prints a document path as its elements inside brackets, with a list
+    // index carrying brackets of its own: a.b is [a, b] and l[0] is [l, [0]].
+    private static String render(List<PathSegment> segments) {
+        StringBuilder rendered = new StringBuilder("[");
+        for (int i = 0; i < segments.size(); i++) {
+            if (i > 0) {
+                rendered.append(", ");
+            }
+            PathSegment segment = segments.get(i);
+            rendered.append(segment.isIndex() ? "[" + segment.index() + "]" : segment.name());
+        }
+        return rendered.append(']').toString();
     }
 
     // ── Path splitting ──
@@ -116,8 +164,29 @@ final class ProjectionEvaluator {
 
     // ── Path resolution ──
 
-    private static List<String> resolvePath(String path, JsonNode exprAttrNames) {
-        List<String> segments = new ArrayList<>();
+    /**
+     * One step of a document path. The kind is fixed by the raw expression: a name token
+     * (including a resolved #alias, whatever characters its value contains) addresses a map
+     * key, and only a [n] suffix written in the expression itself addresses a list index.
+     */
+    private record PathSegment(String name, long index, boolean isIndex) {
+
+        static PathSegment name(String name) {
+            return new PathSegment(name, -1L, false);
+        }
+
+        static PathSegment index(long index) {
+            return new PathSegment(null, index, true);
+        }
+    }
+
+    private static List<PathSegment> resolvePath(String path, JsonNode exprAttrNames) {
+        return resolvePath(path, exprAttrNames, false);
+    }
+
+    private static List<PathSegment> resolvePath(String path, JsonNode exprAttrNames,
+                                                 boolean requireDefinedNames) {
+        List<PathSegment> segments = new ArrayList<>();
         // Tokenize on dots, preserving [n] bracket indices
         String[] parts = path.split("\\.");
         for (String part : parts) {
@@ -126,7 +195,7 @@ final class ProjectionEvaluator {
             if (bracketIdx >= 0) {
                 String name = part.substring(0, bracketIdx);
                 if (!name.isEmpty()) {
-                    segments.add(resolveSegment(name, exprAttrNames));
+                    segments.add(PathSegment.name(resolveSegment(name, exprAttrNames, requireDefinedNames)));
                 }
                 // Parse each [n] suffix
                 String rest = part.substring(bracketIdx);
@@ -134,12 +203,13 @@ final class ProjectionEvaluator {
                 while (i < rest.length() && rest.charAt(i) == '[') {
                     int close = rest.indexOf(']', i);
                     if (close < 0) break;
-                    validateListIndex(rest.substring(i + 1, close));
-                    segments.add(rest.substring(i, close + 1)); // e.g. "[0]"
+                    String content = rest.substring(i + 1, close);
+                    validateListIndex(content);
+                    segments.add(PathSegment.index(Long.parseLong(content)));
                     i = close + 1;
                 }
             } else {
-                segments.add(resolveSegment(part, exprAttrNames));
+                segments.add(PathSegment.name(resolveSegment(part, exprAttrNames, requireDefinedNames)));
             }
         }
         return segments;
@@ -172,10 +242,18 @@ final class ProjectionEvaluator {
         }
     }
 
-    private static String resolveSegment(String seg, JsonNode exprAttrNames) {
-        if (seg.startsWith("#") && exprAttrNames != null) {
-            JsonNode resolved = exprAttrNames.get(seg);
-            return resolved != null ? resolved.asText() : seg;
+    private static String resolveSegment(String seg, JsonNode exprAttrNames, boolean requireDefinedNames) {
+        if (!seg.startsWith("#")) {
+            return seg;
+        }
+        JsonNode resolved = exprAttrNames != null ? exprAttrNames.get(seg) : null;
+        if (resolved != null) {
+            return resolved.asText();
+        }
+        if (requireDefinedNames) {
+            throw new AwsException("ValidationException",
+                    "Invalid ProjectionExpression: An expression attribute name used in the document path "
+                    + "is not defined; attribute name: " + seg, 400);
         }
         return seg;
     }
@@ -194,14 +272,13 @@ final class ProjectionEvaluator {
         // Long keys: the allowable index range (up to 4294967294) exceeds Integer.MAX_VALUE.
         private final TreeMap<Long, PathTrie> indices = new TreeMap<>();
 
-        void insert(List<String> segments) {
+        void insert(List<PathSegment> segments) {
             PathTrie node = this;
-            for (String seg : segments) {
-                if (seg.startsWith("[")) {
-                    long idx = Long.parseLong(seg.substring(1, seg.length() - 1));
-                    node = node.indices.computeIfAbsent(idx, k -> new PathTrie());
+            for (PathSegment seg : segments) {
+                if (seg.isIndex()) {
+                    node = node.indices.computeIfAbsent(seg.index(), k -> new PathTrie());
                 } else {
-                    node = node.names.computeIfAbsent(seg, k -> new PathTrie());
+                    node = node.names.computeIfAbsent(seg.name(), k -> new PathTrie());
                 }
             }
             node.terminal = true;

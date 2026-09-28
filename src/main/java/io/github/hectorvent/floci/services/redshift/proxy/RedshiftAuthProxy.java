@@ -1,10 +1,12 @@
 package io.github.hectorvent.floci.services.redshift.proxy;
 
+import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.rds.proxy.PasswordValidator;
 import io.github.hectorvent.floci.services.rds.proxy.PostgresProtocolHandler;
-import io.github.hectorvent.floci.services.rds.proxy.RdsAuthProxy;
 import io.github.hectorvent.floci.services.rds.proxy.RdsProxyTlsCertificates;
 import io.github.hectorvent.floci.services.rds.proxy.RdsSigV4Validator;
 import io.github.hectorvent.floci.services.s3.S3Service;
+import io.github.hectorvent.floci.services.redshift.spectrum.SpectrumInterceptor;
 import org.jboss.logging.Logger;
 
 import java.io.IOException;
@@ -12,6 +14,8 @@ import java.net.BindException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.util.List;
+import java.util.concurrent.Semaphore;
 
 /**
  * TCP auth proxy for a single Redshift cluster's backing PostgreSQL container.
@@ -32,8 +36,15 @@ public class RedshiftAuthProxy {
     private final String dbName;
     private final RdsSigV4Validator sigV4;
     private final RdsProxyTlsCertificates tlsCertificates;
-    private final RdsAuthProxy.PasswordValidator passwordValidator;
+    private final PasswordValidator passwordValidator;
     private final S3Service s3Service;
+    private final IamService iamService;
+    private final SpectrumInterceptor spectrumInterceptor;
+    private final String clusterAccountId;
+    private volatile List<String> iamRoleArns;
+    private final int handshakeTimeoutMillis;
+    private final int backendConnectTimeoutMillis;
+    private final Semaphore connectionPermits;
 
     private volatile boolean running;
     private ServerSocket serverSocket;
@@ -41,8 +52,39 @@ public class RedshiftAuthProxy {
     public RedshiftAuthProxy(String clusterKey, String backendHost, int backendPort,
                              String masterUsername, String masterPassword, String dbName,
                              RdsSigV4Validator sigV4, RdsProxyTlsCertificates tlsCertificates,
-                             RdsAuthProxy.PasswordValidator passwordValidator,
-                             S3Service s3Service) {
+                             PasswordValidator passwordValidator,
+                             S3Service s3Service, IamService iamService,
+                             int handshakeTimeoutMillis, int backendConnectTimeoutMillis,
+                             int maxConnections) {
+        this(clusterKey, backendHost, backendPort, masterUsername, masterPassword, dbName, sigV4,
+                tlsCertificates, passwordValidator, s3Service, iamService, null,
+                List.of(),
+                handshakeTimeoutMillis, backendConnectTimeoutMillis, maxConnections, null);
+    }
+
+    public RedshiftAuthProxy(String clusterKey, String backendHost, int backendPort,
+                             String masterUsername, String masterPassword, String dbName,
+                             RdsSigV4Validator sigV4, RdsProxyTlsCertificates tlsCertificates,
+                             PasswordValidator passwordValidator,
+                             S3Service s3Service, IamService iamService,
+                             String clusterAccountId,
+                             List<String> iamRoleArns,
+                             int handshakeTimeoutMillis, int backendConnectTimeoutMillis,
+                             int maxConnections) {
+        this(clusterKey, backendHost, backendPort, masterUsername, masterPassword, dbName, sigV4,
+                tlsCertificates, passwordValidator, s3Service, iamService, clusterAccountId, iamRoleArns,
+                handshakeTimeoutMillis, backendConnectTimeoutMillis, maxConnections, null);
+    }
+
+    public RedshiftAuthProxy(String clusterKey, String backendHost, int backendPort,
+                             String masterUsername, String masterPassword, String dbName,
+                             RdsSigV4Validator sigV4, RdsProxyTlsCertificates tlsCertificates,
+                             PasswordValidator passwordValidator,
+                             S3Service s3Service, IamService iamService,
+                             String clusterAccountId,
+                             List<String> iamRoleArns,
+                             int handshakeTimeoutMillis, int backendConnectTimeoutMillis,
+                             int maxConnections, SpectrumInterceptor spectrumInterceptor) {
         this.clusterKey = clusterKey;
         this.backendHost = backendHost;
         this.backendPort = backendPort;
@@ -53,6 +95,13 @@ public class RedshiftAuthProxy {
         this.tlsCertificates = tlsCertificates;
         this.passwordValidator = passwordValidator;
         this.s3Service = s3Service;
+        this.iamService = iamService;
+        this.spectrumInterceptor = spectrumInterceptor;
+        this.clusterAccountId = clusterAccountId;
+        this.iamRoleArns = iamRoleArns == null ? List.of() : List.copyOf(iamRoleArns);
+        this.handshakeTimeoutMillis = handshakeTimeoutMillis;
+        this.backendConnectTimeoutMillis = backendConnectTimeoutMillis;
+        this.connectionPermits = new Semaphore(Math.max(1, maxConnections));
     }
 
     public void start(int proxyPort) throws IOException {
@@ -109,6 +158,11 @@ public class RedshiftAuthProxy {
         this.masterPassword = newPassword;
     }
 
+    /** Swap the associated-role snapshot; new connections authorize COPY and UNLOAD against it. */
+    public void updateIamRoles(List<String> newIamRoleArns) {
+        this.iamRoleArns = newIamRoleArns == null ? List.of() : List.copyOf(newIamRoleArns);
+    }
+
     public void stop() {
         running = false;
         try {
@@ -125,8 +179,20 @@ public class RedshiftAuthProxy {
         while (running) {
             try {
                 Socket client = serverSocket.accept();
+                if (!connectionPermits.tryAcquire()) {
+                    LOG.warnv("Refusing Redshift connection for cluster {0}: connection limit reached",
+                            clusterKey);
+                    closeQuietly(client);
+                    continue;
+                }
                 Thread.ofVirtual().name("redshift-proxy-conn-" + clusterKey)
-                        .start(() -> handleConnection(client));
+                        .start(() -> {
+                            try {
+                                handleConnection(client);
+                            } finally {
+                                connectionPermits.release();
+                            }
+                        });
             } catch (IOException e) {
                 if (running) {
                     LOG.warnv("Accept error for Redshift cluster {0}: {1}", clusterKey, e.getMessage());
@@ -136,35 +202,48 @@ public class RedshiftAuthProxy {
     }
 
     private void handleConnection(Socket client) {
-        Socket backend = null;
+        PostgresProtocolHandler.AuthenticatedSession session = null;
         try {
             client.setTcpNoDelay(true);
-            backend = new Socket(backendHost, backendPort);
-            backend.setTcpNoDelay(true);
-            // iamEnabled = false: the SigV4 branch inside authenticate is never taken.
-            PostgresProtocolHandler.AuthenticatedSession session =
-                    PostgresProtocolHandler.authenticate(
-                            client, backend, masterUsername, masterPassword, dbName,
-                            false, sigV4, tlsCertificates, passwordValidator::validate);
+            PostgresProtocolHandler.BackendConnector connector = () -> {
+                Socket backendSocket = new Socket();
+                backendSocket.connect(new InetSocketAddress(backendHost, backendPort),
+                        backendConnectTimeoutMillis);
+                backendSocket.setTcpNoDelay(true);
+                return backendSocket;
+            };
+            // iamEnabled = false: the SigV4 branch inside authenticate is never taken, so no
+            // token binding is needed.
+            session = PostgresProtocolHandler.authenticate(
+                            client, connector, masterUsername, masterPassword, dbName,
+                            false, sigV4, null, tlsCertificates, passwordValidator,
+                            handshakeTimeoutMillis);
             if (session != null) {
                 // Redshift-only DDL (DISTKEY/SORTKEY/ENCODE/...) is rewritten for the plain
                 // PostgreSQL backend on the way through; every other message is relayed verbatim.
-                new RedshiftInterceptingBridge(session.client(), backend, s3Service).run();
+                new RedshiftInterceptingBridge(session.client(), session.backend(), s3Service, iamService,
+                        clusterAccountId, iamRoleArns, spectrumInterceptor).run();
             }
         } catch (Exception e) {
             LOG.debugv("Redshift connection error for cluster {0}: {1}", clusterKey, e.getMessage());
         } finally {
-            // authenticate's success path returns the client to bridge; every other path
-            // (early return on a bare probe, auth failure, thrown IOException) can leave the
-            // backend connection to Postgres open. Closing here is idempotent.
+            // authenticate's success path hands both sockets to the bridge, which closes both
+            // itself; every other path (early return on a bare probe, auth failure, thrown
+            // IOException) never had a backend connection to begin with. Closing here is
+            // idempotent, and also covers a RuntimeException thrown between authenticate()
+            // returning a session and the bridge finishing its own cleanup, which would
+            // otherwise leak session.backend().
             closeQuietly(client);
-            if (backend != null) {
-                closeQuietly(backend);
+            if (session != null) {
+                closeQuietly(session.backend());
             }
         }
     }
 
     private static void closeQuietly(Socket s) {
+        if (s == null) {
+            return;
+        }
         try {
             s.close();
         } catch (IOException e) {

@@ -2,7 +2,6 @@ package com.floci.test;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Assumptions;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
@@ -147,6 +146,27 @@ class RdsJdbcCompatTest {
 
     @Test
     @Order(4)
+    @DisplayName("IAM auth token generated for another host is rejected")
+    void rejectsIamAuthTokenGeneratedForAnotherHost() {
+        assumeInstanceCreated();
+
+        // Correctly signed, unexpired, same user: only the endpoint differs, as when a token
+        // minted for one instance is replayed against another.
+        String token = rds.utilities().generateAuthenticationToken(GenerateAuthenticationTokenRequest.builder()
+                .hostname("other-instance.example.local")
+                .port(proxyPort)
+                .username(USERNAME)
+                .region(REGION)
+                .credentialsProvider(CREDENTIALS)
+                .build());
+
+        assertThatThrownBy(() -> openPostgresConnection(USERNAME, token))
+                .isInstanceOf(SQLException.class)
+                .hasMessageContaining("password authentication failed");
+    }
+
+    @Test
+    @Order(5)
     @DisplayName("IAM auth rejected on instance created without IAM")
     void iamAuthRejectedWhenDisabledAtCreate() {
         assumeInstanceCreated();
@@ -191,15 +211,10 @@ class RdsJdbcCompatTest {
         }
     }
 
-    @Disabled("modifyDbInstance does not propagate iamEnabled to running proxy (RdsAuthProxy.iamEnabled is final)")
     @Test
-    @Order(5)
-    @DisplayName("Enable IAM via modify on instance created without IAM")
-    void enableIamViaModifyAndConnect() throws Exception {
-        // This test documents the expected toggle behavior: create without IAM,
-        // verify rejection, enable via modify, verify acceptance. Currently blocked
-        // because RdsAuthProxy captures iamEnabled at startup and ModifyDBInstance
-        // does not restart the proxy.
+    @Order(6)
+    @DisplayName("Toggle IAM via modify on a running instance")
+    void toggleIamViaModifyOnRunningInstance() throws Exception {
         assumeInstanceCreated();
 
         String toggleId = TestFixtures.uniqueName("rds-toggle");
@@ -233,6 +248,7 @@ class RdsJdbcCompatTest {
             rds.modifyDBInstance(ModifyDbInstanceRequest.builder()
                     .dbInstanceIdentifier(toggleId)
                     .enableIAMDatabaseAuthentication(true)
+                    .applyImmediately(true)
                     .build());
 
             // Should accept IAM after enable
@@ -250,6 +266,23 @@ class RdsJdbcCompatTest {
             } finally {
                 connection.close();
             }
+
+            rds.modifyDBInstance(ModifyDbInstanceRequest.builder()
+                    .dbInstanceIdentifier(toggleId)
+                    .enableIAMDatabaseAuthentication(false)
+                    .applyImmediately(true)
+                    .build());
+
+            String token3 = rds.utilities().generateAuthenticationToken(GenerateAuthenticationTokenRequest.builder()
+                    .hostname(TestFixtures.proxyHost())
+                    .port(togglePort)
+                    .username(USERNAME)
+                    .region(REGION)
+                    .credentialsProvider(CREDENTIALS)
+                    .build());
+
+            assertThatThrownBy(() -> openPostgresConnection(USERNAME, token3, togglePort))
+                    .isInstanceOf(SQLException.class);
         } finally {
             try {
                 rds.deleteDBInstance(DeleteDbInstanceRequest.builder()
@@ -262,7 +295,7 @@ class RdsJdbcCompatTest {
     }
 
     @Test
-    @Order(6)
+    @Order(7)
     @DisplayName("Modify password keeps proxy reachable and delete releases port")
     void modifyKeepsProxyReachableAndDeleteReleasesPort() throws Exception {
         assumeInstanceCreated();

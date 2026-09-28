@@ -1,6 +1,8 @@
 package io.github.hectorvent.floci.services.dynamodb;
 
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.dynamodb.model.DynamoDbStreamRecord;
@@ -32,15 +34,18 @@ public class DynamoDbStreamService {
 
     private static final Logger LOG = Logger.getLogger(DynamoDbStreamService.class);
 
-    public static final String SHARD_ID = "shardId-0000000001-00000000001";
+    static final String SHARD_ID = "shardId-0000000001-00000000001";
     static final int MAX_RECORDS = 1000;
+    private static final String ZERO_SEQUENCE_NUMBER = "000000000000000000000";
 
     private static final DateTimeFormatter STREAM_LABEL_FORMAT =
             DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS").withZone(ZoneOffset.UTC);
 
+    /** Keyed by table ARN, which is unique per partition, region, account and table. */
     private final ConcurrentHashMap<String, StreamDescription> streams = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, ConcurrentLinkedDeque<DynamoDbStreamRecord>> records =
             new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, AtomicLong> streamRecordCounts = new ConcurrentHashMap<>();
     private final AtomicLong sequenceCounter = new AtomicLong(0);
 
     private final ObjectMapper objectMapper;
@@ -59,13 +64,23 @@ public class DynamoDbStreamService {
 
 
     private void loadPersistedStreams(StorageBackend<String, TableDefinition> tableStore) {
-        if (tableStore == null) return;
-        for (String tableKey : tableStore.keys()){
-                String region = tableKey.split("::", 2)[0];
-                tableStore.get(tableKey).ifPresent(table -> {
-                        if (!table.isStreamEnabled()) return;
-                        this.enableStream(table.getTableName(), table.getTableArn(), table.getStreamViewType(), region, table.getStreamArn());
-                    });
+        if (tableStore == null) {
+            return;
+        }
+        // No request scope at startup, so keys() would only see the default account's tables.
+        if (tableStore instanceof AccountAwareStorageBackend<TableDefinition> aware) {
+            aware.scanAllAccountsRaw().values().forEach(this::loadPersistedStream);
+            return;
+        }
+        for (String tableKey : tableStore.keys()) {
+            tableStore.get(tableKey).ifPresent(this::loadPersistedStream);
+        }
+    }
+
+    private void loadPersistedStream(TableDefinition table) {
+        if (table.isStreamEnabled()) {
+            enableStream(table.getTableName(), table.getTableArn(), table.getStreamViewType(),
+                    AwsArnUtils.parse(table.getTableArn()).region(), table.getStreamArn());
         }
     }
 
@@ -74,8 +89,7 @@ public class DynamoDbStreamService {
     }
 
     public StreamDescription enableStream(String tableName, String tableArn, String viewType, String region, String streamArnInput) {
-        String key = streamKey(region, tableName);
-        StreamDescription existing = streams.get(key);
+        StreamDescription existing = streams.get(tableArn);
         if (existing != null && "ENABLED".equals(existing.getStreamStatus())) {
             // Re-enabling a live stream with a different view type retargets it. The records this
             // stream emits are built from the description's view type, so leaving it untouched
@@ -108,35 +122,40 @@ public class DynamoDbStreamService {
         sd.setCreationDateTime(now);
         sd.setStartingSequenceNumber(String.format("%021d", 1));
 
-        streams.put(key, sd);
+        streams.put(tableArn, sd);
         records.put(streamArn, new ConcurrentLinkedDeque<>());
+        streamRecordCounts.put(streamArn, new AtomicLong());
         LOG.infov("Enabled stream for table {0} in region {1}: {2}", tableName, region, streamArn);
         return sd;
     }
 
-    public void disableStream(String tableName, String region) {
-        String key = streamKey(region, tableName);
-        StreamDescription sd = streams.get(key);
+    public void disableStream(String tableArn) {
+        StreamDescription sd = streams.get(tableArn);
         if (sd != null) {
             sd.setStreamStatus("DISABLED");
-            LOG.infov("Disabled stream for table {0} in region {1}", tableName, region);
+            LOG.infov("Disabled stream for table {0}", tableArn);
         }
     }
 
-    public void deleteStream(String tableName, String region) {
-        String key = streamKey(region, tableName);
-        StreamDescription sd = streams.remove(key);
+    public void deleteStream(String tableArn) {
+        StreamDescription sd = streams.remove(tableArn);
         if (sd != null) {
             records.remove(sd.getStreamArn());
-            LOG.infov("Deleted stream for table {0} in region {1}", tableName, region);
+            streamRecordCounts.remove(sd.getStreamArn());
+            LOG.infov("Deleted stream for table {0}", tableArn);
         }
     }
 
-    public void captureEvent(String tableName, String eventName,
-                             JsonNode oldItem, JsonNode newItem,
+    /** Emulator reset: drops every stream and its records. Sequence numbers stay monotonic. */
+    public void clear() {
+        streams.clear();
+        records.clear();
+        streamRecordCounts.clear();
+    }
+
+    public void captureEvent(String eventName, JsonNode oldItem, JsonNode newItem,
                              TableDefinition table, String region) {
-        String key = streamKey(region, tableName);
-        StreamDescription sd = streams.get(key);
+        StreamDescription sd = streams.get(table.getTableArn());
         if (sd == null || !"ENABLED".equals(sd.getStreamStatus())) {
             return;
         }
@@ -166,9 +185,13 @@ public class DynamoDbStreamService {
 
         ConcurrentLinkedDeque<DynamoDbStreamRecord> deque = records.get(sd.getStreamArn());
         if (deque != null) {
-            deque.addLast(record);
-            while (deque.size() > MAX_RECORDS) {
-                deque.pollFirst();
+            synchronized (deque) {
+                streamRecordCounts.computeIfAbsent(sd.getStreamArn(), ignored -> new AtomicLong())
+                        .incrementAndGet();
+                deque.addLast(record);
+                while (deque.size() > MAX_RECORDS) {
+                    deque.pollFirst();
+                }
             }
         }
     }
@@ -200,13 +223,14 @@ public class DynamoDbStreamService {
         };
     }
 
-    public List<StreamDescription> listStreams(String tableNameFilter, String region) {
+    public List<StreamDescription> listStreams(String tableNameFilter, String accountId, String region) {
         List<StreamDescription> result = new ArrayList<>();
         for (StreamDescription sd : streams.values()) {
             if (tableNameFilter != null && !tableNameFilter.equals(sd.getTableName())) {
                 continue;
             }
-            if (region != null && !sd.getStreamArn().contains(":" + region + ":")) {
+            AwsArnUtils.Arn streamArn = AwsArnUtils.parse(sd.getStreamArn());
+            if (!accountId.equals(streamArn.accountId()) || !region.equals(streamArn.region())) {
                 continue;
             }
             result.add(sd);
@@ -214,7 +238,7 @@ public class DynamoDbStreamService {
         return result;
     }
 
-    public StreamDescription describeStream(String streamArn) {
+    StreamDescription describeStream(String streamArn) {
         for (StreamDescription sd : streams.values()) {
             if (streamArn.equals(sd.getStreamArn())) {
                 return sd;
@@ -224,8 +248,8 @@ public class DynamoDbStreamService {
                 "Stream not found: " + streamArn, 400);
     }
 
-    public String getShardIterator(String streamArn, String shardId,
-                                   String iteratorType, String sequenceNumber) {
+    String getShardIterator(String streamArn, String shardId,
+                            String iteratorType, String sequenceNumber) {
         StreamDescription sd = describeStream(streamArn);
         if (!"ENABLED".equals(sd.getStreamStatus()) && !"DISABLED".equals(sd.getStreamStatus())) {
             throw new AwsException("ResourceNotFoundException",
@@ -233,73 +257,138 @@ public class DynamoDbStreamService {
         }
 
         ConcurrentLinkedDeque<DynamoDbStreamRecord> deque = records.get(streamArn);
-        List<DynamoDbStreamRecord> snapshot = deque != null ? new ArrayList<>(deque) : List.of();
+        List<DynamoDbStreamRecord> snapshot;
+        long recordCount;
+        if (deque == null) {
+            snapshot = List.of();
+            recordCount = 0;
+        } else {
+            synchronized (deque) {
+                snapshot = new ArrayList<>(deque);
+                recordCount = streamRecordCounts.getOrDefault(streamArn, new AtomicLong()).get();
+            }
+        }
 
-        int position = switch (iteratorType) {
-            case "TRIM_HORIZON" -> 0;
-            case "LATEST" -> snapshot.size();
-            case "AT_SEQUENCE_NUMBER" -> findSequencePosition(snapshot, sequenceNumber, false);
-            case "AFTER_SEQUENCE_NUMBER" -> findSequencePosition(snapshot, sequenceNumber, true);
+        String cursorSequence = switch (iteratorType) {
+            case "TRIM_HORIZON" -> snapshot.isEmpty() ? zeroSequence() : snapshot.get(0).getSequenceNumber();
+            case "LATEST" -> snapshot.isEmpty() ? zeroSequence() : snapshot.get(snapshot.size() - 1).getSequenceNumber();
+            case "AT_SEQUENCE_NUMBER", "AFTER_SEQUENCE_NUMBER" -> {
+                if (sequenceNumber == null || sequenceNumber.isBlank()) {
+                    throw new AwsException("ValidationException",
+                            "Sequence number is required for this iterator type", 400);
+                }
+                yield sequenceNumber;
+            }
             default -> throw new AwsException("ValidationException",
                     "Unknown iterator type: " + iteratorType, 400);
         };
 
-        return encodeIterator(streamArn, position);
+        boolean inclusive = "TRIM_HORIZON".equals(iteratorType) || "AT_SEQUENCE_NUMBER".equals(iteratorType);
+        long cursorRecordCount = zeroSequence().equals(cursorSequence) ? recordCount : -1;
+        return encodeIterator(streamArn, cursorSequence, inclusive, cursorRecordCount);
     }
 
-    private int findSequencePosition(List<DynamoDbStreamRecord> records, String targetSeq, boolean after) {
+    private int findSequencePosition(List<DynamoDbStreamRecord> records, String targetSeq, boolean inclusive) {
         for (int i = 0; i < records.size(); i++) {
             String seq = records.get(i).getSequenceNumber();
             int cmp = seq.compareTo(targetSeq);
-            if (after ? cmp > 0 : cmp >= 0) {
+            if (inclusive ? cmp >= 0 : cmp > 0) {
                 return i;
             }
         }
         return records.size();
     }
 
-    public record GetRecordsResult(List<DynamoDbStreamRecord> records, String nextShardIterator) {}
+    record GetRecordsResult(List<DynamoDbStreamRecord> records, String nextShardIterator) {}
 
-    public GetRecordsResult getRecords(String shardIterator, Integer limit) {
+    GetRecordsResult getRecords(String shardIterator, Integer limit) {
         String[] parts = decodeIterator(shardIterator);
         String streamArn = parts[0];
-        int position;
-        try {
-            position = Integer.parseInt(parts[1]);
-        } catch (NumberFormatException e) {
-            throw new AwsException("ValidationException", "Invalid shard iterator", 400);
-        }
+        String cursorSequence = parts[1];
+        boolean inclusive = Boolean.parseBoolean(parts[2]);
+        long cursorRecordCount = parseRecordCount(parts[3]);
 
         ConcurrentLinkedDeque<DynamoDbStreamRecord> deque = records.get(streamArn);
-        List<DynamoDbStreamRecord> snapshot = deque != null ? new ArrayList<>(deque) : List.of();
+        List<DynamoDbStreamRecord> snapshot;
+        long currentRecordCount;
+        if (deque == null) {
+            snapshot = List.of();
+            currentRecordCount = 0;
+        } else {
+            synchronized (deque) {
+                snapshot = new ArrayList<>(deque);
+                currentRecordCount = streamRecordCounts.getOrDefault(streamArn, new AtomicLong()).get();
+            }
+        }
+        int position = findSequencePosition(snapshot, cursorSequence, inclusive);
+        if (zeroSequence().equals(cursorSequence) && cursorRecordCount >= 0
+                && currentRecordCount - cursorRecordCount > MAX_RECORDS) {
+            throw new AwsException("TrimmedDataAccessException",
+                    "The requested sequence number has been trimmed", 400);
+        }
+        if (!snapshot.isEmpty() && !zeroSequence().equals(cursorSequence)
+                && cursorSequence.compareTo(snapshot.get(0).getSequenceNumber()) < 0) {
+            throw new AwsException("TrimmedDataAccessException",
+                    "The requested sequence number has been trimmed", 400);
+        }
 
         int effectiveLimit = limit != null ? limit : 100;
         int end = Math.min(position + effectiveLimit, snapshot.size());
         List<DynamoDbStreamRecord> page = snapshot.subList(position, end);
 
-        String nextIterator = encodeIterator(streamArn, end);
+        String nextSequence = page.isEmpty()
+                ? cursorSequence
+                : page.get(page.size() - 1).getSequenceNumber();
+        long nextRecordCount = zeroSequence().equals(nextSequence) ? cursorRecordCount : -1;
+        String nextIterator = encodeIterator(streamArn, nextSequence, page.isEmpty() && inclusive, nextRecordCount);
         return new GetRecordsResult(new ArrayList<>(page), nextIterator);
     }
 
-    private String encodeIterator(String streamArn, int position) {
-        String raw = streamArn + "|" + position;
+    private String encodeIterator(String streamArn, String sequenceNumber, boolean inclusive, long recordCount) {
+        String raw = streamArn + "|" + sequenceNumber + "|" + inclusive + "|" + recordCount;
         return Base64.getEncoder().encodeToString(raw.getBytes());
+    }
+
+    /** The stream an iterator reads, rejecting a malformed iterator as GetRecords does. */
+    String streamArnOf(String shardIterator) {
+        return decodeIterator(shardIterator)[0];
     }
 
     private String[] decodeIterator(String iterator) {
         try {
             String raw = new String(Base64.getDecoder().decode(iterator));
             int lastPipe = raw.lastIndexOf('|');
-            if (lastPipe < 0) {
+            int sequencePipe = raw.lastIndexOf('|', lastPipe - 1);
+            int inclusivePipe = raw.lastIndexOf('|', sequencePipe - 1);
+            if (inclusivePipe < 0 || sequencePipe < 0 || lastPipe < 0 || lastPipe == raw.length() - 1) {
                 throw new AwsException("ValidationException", "Invalid shard iterator", 400);
             }
-            return new String[]{raw.substring(0, lastPipe), raw.substring(lastPipe + 1)};
+            String inclusive = raw.substring(sequencePipe + 1, lastPipe);
+            String recordCount = raw.substring(lastPipe + 1);
+            if (!"true".equals(inclusive) && !"false".equals(inclusive)) {
+                throw new AwsException("ValidationException", "Invalid shard iterator", 400);
+            }
+            try {
+                Long.parseLong(recordCount);
+            } catch (NumberFormatException e) {
+                throw new AwsException("ValidationException", "Invalid shard iterator", 400);
+            }
+            return new String[]{raw.substring(0, inclusivePipe), raw.substring(inclusivePipe + 1, sequencePipe),
+                    inclusive, recordCount};
         } catch (IllegalArgumentException e) {
             throw new AwsException("ValidationException", "Invalid shard iterator", 400);
         }
     }
 
-    private String streamKey(String region, String tableName) {
-        return region + "::" + tableName;
+    private long parseRecordCount(String recordCount) {
+        try {
+            return Long.parseLong(recordCount);
+        } catch (NumberFormatException e) {
+            throw new AwsException("ValidationException", "Invalid shard iterator", 400);
+        }
+    }
+
+    private String zeroSequence() {
+        return ZERO_SEQUENCE_NUMBER;
     }
 }

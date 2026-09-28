@@ -2,8 +2,13 @@ package io.github.hectorvent.floci.core.common;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.NullAndEmptySource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.util.List;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -43,5 +48,80 @@ class AwsRegionsTest {
     @Test
     void nullIsNotARegionId() {
         assertFalse(AwsRegions.isRegionId(null));
+    }
+
+    /**
+     * One row per partition botocore defines, so a partition going missing is a failing test
+     * rather than a silently commercial ARN.
+     */
+    @ParameterizedTest
+    @CsvSource({
+            "us-east-1,       aws,        amazonaws.com",
+            "eu-west-1,       aws,        amazonaws.com",
+            "us-gov-west-1,   aws-us-gov, amazonaws.com",
+            "us-gov-east-1,   aws-us-gov, amazonaws.com",
+            "cn-north-1,      aws-cn,     amazonaws.com.cn",
+            "cn-northwest-1,  aws-cn,     amazonaws.com.cn",
+            "us-iso-east-1,   aws-iso,    c2s.ic.gov",
+            "us-isob-east-1,  aws-iso-b,  sc2s.sgov.gov",
+            "eu-isoe-west-1,  aws-iso-e,  cloud.adc-e.uk",
+            "us-isof-south-1, aws-iso-f,  csp.hci.ic.gov",
+            "eusc-de-east-1,  aws-eusc,   amazonaws.eu"})
+    void everyPartitionResolvesFromItsRegion(String region, String partition, String dnsSuffix) {
+        assertEquals(partition, AwsRegions.partitionFor(region));
+        assertEquals(dnsSuffix, AwsRegions.dnsSuffixFor(region));
+    }
+
+    /**
+     * The pair that would collide under a naive prefix check: {@code us-isob-east-1} is
+     * {@code aws-iso-b}, not {@code aws-iso}.
+     */
+    @Test
+    void isobIsNotIso() {
+        assertEquals("aws-iso", AwsRegions.partitionFor("us-iso-west-1"));
+        assertEquals("aws-iso-b", AwsRegions.partitionFor("us-isob-west-1"));
+    }
+
+    /**
+     * Blank is the common case, not an error: a global-service ARN carries no region and keeps
+     * the commercial partition.
+     */
+    @ParameterizedTest
+    @NullAndEmptySource
+    @ValueSource(strings = {"   ", "xx-nowhere-9", "not-a-region", "us-gov", "cn-north"})
+    void blankAndUnrecognisedRegionsFallBackToCommercial(String region) {
+        assertEquals("aws", AwsRegions.partitionFor(region));
+        assertEquals("amazonaws.com", AwsRegions.dnsSuffixFor(region));
+    }
+
+    @Test
+    void regionMatchingIsCaseInsensitive() {
+        assertEquals("aws-cn", AwsRegions.partitionFor("CN-NORTH-1"));
+    }
+
+    /** Every known id resolves to a partition whose published regions contain it. */
+    @Test
+    void everyKnownIdResolvesToThePartitionThatPublishesIt() {
+        for (String region : AwsRegions.KNOWN_IDS) {
+            String partition = AwsRegions.partitionFor(region);
+            assertTrue(AwsRegions.advertised(partition).contains(region),
+                    region + " resolves to " + partition + ", which does not publish it");
+        }
+    }
+
+    @Test
+    void advertisedListsArePerPartition() {
+        assertEquals(AwsRegions.ALL, AwsRegions.advertised("aws"));
+        assertEquals(34, AwsRegions.ALL.size());
+        assertEquals(List.of("cn-north-1", "cn-northwest-1"), AwsRegions.advertised("aws-cn"));
+        assertTrue(AwsRegions.KNOWN_IDS.contains("eusc-de-east-1"));
+        assertTrue(AwsRegions.KNOWN_IDS.contains("us-isof-south-1"));
+    }
+
+    @Test
+    void pseudoRegionsResolveToTheirPartition() {
+        assertEquals("aws-cn", AwsRegions.partitionFor("aws-cn-global"));
+        assertEquals("amazonaws.com.cn", AwsRegions.dnsSuffixFor("aws-cn-global"));
+        assertEquals("aws-us-gov", AwsRegions.partitionFor("aws-us-gov-global"));
     }
 }

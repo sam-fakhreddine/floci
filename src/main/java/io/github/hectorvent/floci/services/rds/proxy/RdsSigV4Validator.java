@@ -1,50 +1,55 @@
 package io.github.hectorvent.floci.services.rds.proxy;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.auth.SigV4RequestValidator;
+import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator;
 import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.iam.model.CallerContext;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
-import javax.crypto.Mac;
-import javax.crypto.spec.SecretKeySpec;
 import java.net.URI;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.time.Instant;
-import java.time.ZoneOffset;
-import java.time.format.DateTimeFormatter;
-import java.util.Arrays;
-import java.util.Optional;
-import java.util.stream.Collectors;
+import java.util.Map;
+import java.util.function.BooleanSupplier;
 
 /**
  * Validates RDS IAM auth tokens (SigV4 presigned URLs).
  * RDS tokens sign {@code host:port} in the canonical host header, unlike ElastiCache
  * which signs only the cluster hostname. The token format is:
  * {@code hostname:port/?Action=connect&DBUser=user&X-Amz-*=...}
+ * The SigV4 signature verification itself lives in {@link SigV4RequestValidator}, shared
+ * with {@code SigV4Validator} (ElastiCache); this class only handles the RDS-specific
+ * token shape. Reused as-is by Redshift, whose IAM auth works identically.
  */
 @ApplicationScoped
 public class RdsSigV4Validator {
 
     private static final Logger LOG = Logger.getLogger(RdsSigV4Validator.class);
-    private static final DateTimeFormatter DATETIME_FMT =
-            DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss'Z'").withZone(ZoneOffset.UTC);
 
-    /**
-     * Well-known local-dev credential pair used pervasively by default AWS SDK clients
-     * (AwsBasicCredentials.create("test", "test")) against this emulator, mirrored from the
-     * identical fallback in S3Service/PreSignedUrlFilter. Deliberately not a fallback for any
-     * other unregistered access key -- only this exact, already-public pair is honored.
-     */
-    private static final String LEGACY_ACCESS_KEY_ID = "test";
-    private static final String LEGACY_SECRET_KEY = "test";
+    private static final IamPolicyEvaluator POLICY_EVALUATOR = new IamPolicyEvaluator(new ObjectMapper());
 
     private final IamService iamService;
+    private final SigV4RequestValidator requestValidator;
+    private final BooleanSupplier enforcementEnabled;
 
     @Inject
+    public RdsSigV4Validator(IamService iamService, EmulatorConfig config) {
+        this(iamService, () -> config.services().iam().enforcementEnabled());
+    }
+
+    /** Signature-only validation, for callers that run without IAM enforcement. */
     public RdsSigV4Validator(IamService iamService) {
+        this(iamService, () -> false);
+    }
+
+    RdsSigV4Validator(IamService iamService, BooleanSupplier enforcementEnabled) {
         this.iamService = iamService;
+        this.requestValidator = new SigV4RequestValidator(iamService);
+        this.enforcementEnabled = enforcementEnabled;
     }
 
     /**
@@ -53,11 +58,19 @@ public class RdsSigV4Validator {
      * {@code hostname:port/?Action=connect&DBUser=admin&X-Amz-Signature=...}
      *
      * @param token the presigned URL token
-     * @param clientUsername the username from the PostgreSQL startup message;
+     * @param clientUsername the username from the client's startup or handshake message;
      *                       must match the {@code DBUser} in the token
-     * @return true if the token signature is valid, the DBUser matches, and the token is not expired
+     * @param binding what the proxy the token arrived at publishes; a token without one is
+     *                refused, since there is nothing to check it against
+     * @return true if the token signature is valid, the DBUser matches, the token is not expired,
+     *         it names the bound endpoint when the binding requires that, and with IAM
+     *         enforcement on its principal is allowed {@code rds-db:connect} on the DBUser
      */
-    public boolean validate(String token, String clientUsername) {
+    public boolean validate(String token, String clientUsername, RdsProxyBinding binding) {
+        if (binding == null) {
+            LOG.warn("Refusing an RDS IAM token that arrived without a proxy binding to validate it against");
+            return false;
+        }
         try {
             URI uri = URI.create("http://" + token);
             String host = uri.getHost();
@@ -72,144 +85,76 @@ public class RdsSigV4Validator {
             // RDS tokens sign host:port in the canonical host header
             String authority = (port > 0) ? host + ":" + port : host;
 
-            String[] rawPairs = rawQuery.split("&");
-            String action = findRawParam(rawPairs, "Action");
-            String dbUser = findRawParam(rawPairs, "DBUser");
-            String dateTime = findRawParam(rawPairs, "X-Amz-Date");
-            String expires = findRawParam(rawPairs, "X-Amz-Expires");
-            String credential = findRawParam(rawPairs, "X-Amz-Credential");
-            String signedHeaders = findRawParam(rawPairs, "X-Amz-SignedHeaders");
-            String signature = findRawParam(rawPairs, "X-Amz-Signature");
-
-            if (!"connect".equals(action) || dbUser == null || dateTime == null || expires == null
-                    || credential == null || signedHeaders == null || signature == null) {
-                LOG.debugv("RDS IAM token missing required SigV4 parameters");
+            String[] credential = credentialScope(rawQuery);
+            if (credential == null) {
+                LOG.debugv("RDS IAM token missing its credential scope");
+                return false;
+            }
+            if (binding.tokensBoundToEndpoint() && (!binding.acceptsHost(host)
+                    || binding.publishedPort() != port
+                    || !binding.region().equals(credential[2])
+                    || !"rds-db".equals(credential[3]))) {
                 return false;
             }
 
-            if (clientUsername != null && !clientUsername.equals(dbUser)) {
-                LOG.debugv("RDS IAM token DBUser mismatch: client={0}, token={1}",
-                        clientUsername, dbUser);
+            if (!requestValidator.validate(rawQuery, authority, "DBUser", true, clientUsername, "RDS IAM token")) {
                 return false;
             }
-
-            Instant tokenTime = Instant.from(DATETIME_FMT.parse(dateTime));
-            int expirySeconds = Integer.parseInt(expires);
-            if (Instant.now().isAfter(tokenTime.plusSeconds(expirySeconds))) {
-                LOG.debugv("RDS IAM token expired");
-                return false;
-            }
-
-            String decodedCredential = urlDecode(credential);
-            String[] credParts = decodedCredential.split("/");
-            if (credParts.length < 5) {
-                return false;
-            }
-            String accessKeyId = credParts[0];
-            String date = credParts[1];
-            String region = credParts[2];
-            String service = credParts[3];
-            String credentialScope = date + "/" + region + "/" + service + "/aws4_request";
-
-            String secretKey;
-            if (LEGACY_ACCESS_KEY_ID.equals(accessKeyId)) {
-                secretKey = LEGACY_SECRET_KEY;
-            } else {
-                Optional<String> registeredSecretKey = iamService.findSecretKey(accessKeyId);
-                if (registeredSecretKey.isEmpty()) {
-                    LOG.debugv("RDS IAM token references unregistered access key={0}", sanitizeForLog(accessKeyId));
-                    return false;
-                }
-                secretKey = registeredSecretKey.get();
-            }
-
-            // Canonical query string: sorted pairs, excluding X-Amz-Signature
-            String canonicalQueryString = Arrays.stream(rawPairs)
-                    .filter(p -> !rawParamName(p).equals("X-Amz-Signature"))
-                    .sorted((a, b) -> rawParamName(a).compareTo(rawParamName(b)))
-                    .collect(Collectors.joining("&"));
-
-            // Canonical request: RDS uses host:port as the host header value
-            String canonicalRequest = "GET\n/\n"
-                    + canonicalQueryString + "\n"
-                    + "host:" + authority + "\n\n"
-                    + "host\n"
-                    + "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"; // sha256("")
-
-            String stringToSign = "AWS4-HMAC-SHA256\n"
-                    + dateTime + "\n"
-                    + credentialScope + "\n"
-                    + sha256Hex(canonicalRequest);
-
-            byte[] signingKey = deriveSigningKey(secretKey, date, region, service);
-            String expectedSignature = hexEncode(hmacSha256(signingKey, stringToSign));
-
-            boolean valid = MessageDigest.isEqual(
-                    expectedSignature.getBytes(StandardCharsets.UTF_8),
-                    signature.getBytes(StandardCharsets.UTF_8));
-            if (!valid) {
-                LOG.debugv("RDS IAM token signature mismatch for accessKey={0}", sanitizeForLog(accessKeyId));
-            }
-            return valid;
-
+            return !enforcementEnabled.getAsBoolean()
+                    || isAllowedToConnect(credential[0], clientUsername, binding);
         } catch (Exception e) {
             LOG.debugv("RDS IAM token validation error: {0}", e.getMessage());
             return false;
         }
     }
 
-    private static String rawParamName(String rawPair) {
-        int eq = rawPair.indexOf('=');
-        return eq >= 0 ? rawPair.substring(0, eq) : rawPair;
+    /**
+     * The {@code rds-db:connect} check AWS runs after the token signature is verified: the
+     * token's principal must be allowed to connect as {@code dbUser} to the bound database.
+     * An access key that IAM does not know is bypassed, as {@code IamEnforcementFilter} does.
+     */
+    private boolean isAllowedToConnect(String accessKeyId, String dbUser, RdsProxyBinding binding) {
+        CallerContext caller = iamService.resolveCallerContext(accessKeyId);
+        if (caller == null) {
+            return true;
+        }
+        String resource = "arn:aws:rds-db:" + binding.region() + ":" + binding.accountId()
+                + ":dbuser:" + binding.resourceId() + "/" + dbUser;
+        IamPolicyEvaluator.SimulationDecision decision =
+                POLICY_EVALUATOR.simulatePrincipalPolicy(caller, "rds-db:connect", resource, Map.of());
+        if (decision != IamPolicyEvaluator.SimulationDecision.ALLOWED) {
+            LOG.warnv("Failed to authorize the connection request for user {0} because the IAM policy "
+                            + "assumed by the caller ''{1}'' is not authorized to perform rds-db:connect on {2}",
+                    sanitizeForLog(dbUser),
+                    iamService.resolveCallerArn(accessKeyId).orElse(sanitizeForLog(accessKeyId)),
+                    sanitizeForLog(resource));
+            return false;
+        }
+        return true;
     }
 
-    private static String findRawParam(String[] rawPairs, String name) {
-        for (String pair : rawPairs) {
+    /**
+     * The {@code X-Amz-Credential} scope split into its parts
+     * ({@code accessKeyId/date/region/service/aws4_request}), or {@code null} if absent or malformed.
+     */
+    private static String[] credentialScope(String rawQuery) {
+        for (String pair : rawQuery.split("&")) {
             int eq = pair.indexOf('=');
-            if (eq >= 0 && name.equals(pair.substring(0, eq))) {
-                return urlDecode(pair.substring(eq + 1));
+            if (eq >= 0 && "X-Amz-Credential".equals(pair.substring(0, eq))) {
+                String[] parts = URLDecoder.decode(pair.substring(eq + 1), StandardCharsets.UTF_8)
+                        .split("/");
+                return parts.length >= 5 ? parts : null;
             }
         }
         return null;
     }
 
-    private static String urlDecode(String value) {
-        return URLDecoder.decode(value, StandardCharsets.UTF_8);
-    }
-
     /**
-     * Strips control characters (CR, LF, etc.) from an attacker-controlled value before it is
-     * interpolated into a log line, preventing log injection / forged multi-line log entries.
+     * Kept here, not only in SigV4RequestValidator, because RdsSigV4ValidatorTest reflects
+     * on this exact declared method to verify log-injection protection at this class's own
+     * entry point.
      */
     private static String sanitizeForLog(String value) {
         return value == null ? null : value.replaceAll("\\p{Cntrl}", "");
-    }
-
-    private static byte[] deriveSigningKey(String secretKey, String date, String region,
-                                           String service) throws Exception {
-        byte[] kSecret = ("AWS4" + secretKey).getBytes(StandardCharsets.UTF_8);
-        byte[] kDate = hmacSha256(kSecret, date);
-        byte[] kRegion = hmacSha256(kDate, region);
-        byte[] kService = hmacSha256(kRegion, service);
-        return hmacSha256(kService, "aws4_request");
-    }
-
-    private static byte[] hmacSha256(byte[] key, String data) throws Exception {
-        Mac mac = Mac.getInstance("HmacSHA256");
-        mac.init(new SecretKeySpec(key, "HmacSHA256"));
-        return mac.doFinal(data.getBytes(StandardCharsets.UTF_8));
-    }
-
-    private static String sha256Hex(String input) throws Exception {
-        MessageDigest digest = MessageDigest.getInstance("SHA-256");
-        return hexEncode(digest.digest(input.getBytes(StandardCharsets.UTF_8)));
-    }
-
-    private static String hexEncode(byte[] bytes) {
-        StringBuilder sb = new StringBuilder(bytes.length * 2);
-        for (byte b : bytes) {
-            sb.append(String.format("%02x", b));
-        }
-        return sb.toString();
     }
 }

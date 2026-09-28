@@ -1,9 +1,12 @@
 package io.github.hectorvent.floci.services.redshift.proxy;
 
-import io.github.hectorvent.floci.services.rds.proxy.RdsAuthProxy;
+import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.rds.proxy.PasswordValidator;
 import io.github.hectorvent.floci.services.rds.proxy.RdsProxyTlsCertificates;
 import io.github.hectorvent.floci.services.rds.proxy.RdsSigV4Validator;
 import io.github.hectorvent.floci.services.s3.S3Service;
+import io.github.hectorvent.floci.services.redshift.spectrum.SpectrumInterceptor;
 import io.quarkus.runtime.ShutdownEvent;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
@@ -11,6 +14,7 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.io.IOException;
+import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -26,6 +30,9 @@ public class RedshiftProxyManager {
     private final RdsSigV4Validator sigV4Validator;
     private final RdsProxyTlsCertificates tlsCertificates;
     private final S3Service s3Service;
+    private final IamService iamService;
+    private final SpectrumInterceptor spectrumInterceptor;
+    private final EmulatorConfig config;
     private final ConcurrentHashMap<String, RedshiftAuthProxy> proxies = new ConcurrentHashMap<>();
     /**
      * Proxies whose listener could not be closed during a failed start or replace. The
@@ -35,26 +42,49 @@ public class RedshiftProxyManager {
      */
     private final ConcurrentHashMap<String, RedshiftAuthProxy> unclosableProxies = new ConcurrentHashMap<>();
 
+    public RedshiftProxyManager(RdsSigV4Validator sigV4Validator, RdsProxyTlsCertificates tlsCertificates,
+                                S3Service s3Service, IamService iamService, EmulatorConfig config) {
+        this(sigV4Validator, tlsCertificates, s3Service, iamService, config, null);
+    }
+
     @Inject
     public RedshiftProxyManager(RdsSigV4Validator sigV4Validator, RdsProxyTlsCertificates tlsCertificates,
-                                S3Service s3Service) {
+                                S3Service s3Service, IamService iamService, EmulatorConfig config,
+                                SpectrumInterceptor spectrumInterceptor) {
         this.sigV4Validator = sigV4Validator;
         this.tlsCertificates = tlsCertificates;
         this.s3Service = s3Service;
+        this.iamService = iamService;
+        this.spectrumInterceptor = spectrumInterceptor;
+        this.config = config;
     }
 
     public synchronized void startProxy(String relayKey, int proxyPort,
                                         String backendHost, int backendPort, String advertisedHost,
                                         String masterUsername, String masterPassword, String dbName,
-                                        RdsAuthProxy.PasswordValidator passwordValidator) {
+                                        PasswordValidator passwordValidator) {
+        startProxy(relayKey, proxyPort, backendHost, backendPort, advertisedHost, masterUsername,
+                masterPassword, dbName, passwordValidator, List.of());
+    }
+
+    public synchronized void startProxy(String relayKey, int proxyPort,
+                                        String backendHost, int backendPort, String advertisedHost,
+                                        String masterUsername, String masterPassword, String dbName,
+                                        PasswordValidator passwordValidator, List<String> iamRoleArns) {
         // A prior unclosable entry for this key is left in place: its listener may still
         // be bound, and only a successful stop (never a fresh start) may drop it.
         // Make sure the self-signed proxy certificate covers the host clients will connect to,
         // so sslmode=prefer/require handshakes succeed.
         tlsCertificates.ensureHost(advertisedHost);
+        EmulatorConfig.RedshiftServiceConfig redshiftConfig = config.services().redshift();
+        String clusterAccountId = relayKey.substring(0, relayKey.indexOf(':'));
         RedshiftAuthProxy proxy = new RedshiftAuthProxy(
                 relayKey, backendHost, backendPort, masterUsername, masterPassword, dbName,
-                sigV4Validator, tlsCertificates, passwordValidator, s3Service);
+                sigV4Validator, tlsCertificates, passwordValidator, s3Service, iamService,
+                clusterAccountId,
+                iamRoleArns,
+                redshiftConfig.proxyHandshakeTimeoutMillis(), redshiftConfig.proxyBackendConnectTimeoutMillis(),
+                redshiftConfig.proxyMaxConnections(), spectrumInterceptor);
         try {
             proxy.start(proxyPort);
         } catch (IOException | RuntimeException e) {
@@ -82,6 +112,14 @@ public class RedshiftProxyManager {
         if (proxy != null) {
             proxy.updateMasterPassword(newPassword);
             LOG.infov("Updated Redshift proxy master password for cluster {0}", relayKey);
+        }
+    }
+
+    public synchronized void updateIamRoles(String relayKey, List<String> iamRoleArns) {
+        RedshiftAuthProxy proxy = proxies.get(relayKey);
+        if (proxy != null) {
+            proxy.updateIamRoles(iamRoleArns);
+            LOG.infov("Updated Redshift proxy IAM roles for cluster {0}", relayKey);
         }
     }
 

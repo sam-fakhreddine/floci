@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.cloudtrail;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.core.common.XmlParser;
 import io.github.hectorvent.floci.services.cloudtrail.model.Trail;
 import io.quarkus.test.junit.QuarkusMock;
 import io.quarkus.test.junit.QuarkusTest;
@@ -68,12 +69,14 @@ class CloudTrailLogWriterRequeueTest {
         CloudTrailService mockService = mock(CloudTrailService.class);
         when(mockService.trailsWithPendingRecords())
                 .thenAnswer(inv -> pending.isEmpty() ? List.of() : List.of(key));
+        when(mockService.pendingRecordCount(eq(key))).thenAnswer(inv -> pending.size());
         when(mockService.getTrail(region, trailName)).thenReturn(trail);
-        when(mockService.drainPendingRecords(key)).thenAnswer(inv -> {
-            List<ObjectNode> drained = new ArrayList<>(pending);
-            pending.clear();
-            return drained;
-        });
+        when(mockService.drainPendingRecords(eq(key), eq(CloudTrailLogWriter.MAX_RECORDS_PER_LOG_FILE)))
+                .thenAnswer(inv -> {
+                    List<ObjectNode> drained = new ArrayList<>(pending);
+                    pending.clear();
+                    return drained;
+                });
         doAnswer(inv -> {
             List<ObjectNode> records = inv.getArgument(1);
             pending.addAll(records);
@@ -115,15 +118,6 @@ class CloudTrailLogWriterRequeueTest {
     private static List<String> listKeys(String bucket) {
         String xml = given().when().get("/" + bucket + "?list-type=2")
                 .then().statusCode(200).extract().asString();
-        List<String> keys = new ArrayList<>();
-        int from = 0;
-        while (true) {
-            int open = xml.indexOf("<Key>", from);
-            if (open < 0) break;
-            int close = xml.indexOf("</Key>", open);
-            keys.add(xml.substring(open + 5, close));
-            from = close + 6;
-        }
-        return keys;
+        return XmlParser.extractAll(xml, "Key");
     }
 }

@@ -16,6 +16,8 @@ import org.jboss.logging.Logger;
 
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -44,6 +46,14 @@ public class KinesisService implements ResourceProvider {
     private static final int MAX_RECORD_SIZE_KIB = 10240;
     private static final int MAX_RECORDS_PER_REQUEST = 500;
     private static final int MAX_REQUEST_SIZE_BYTES = 10 * 1024 * 1024;
+    /**
+     * UpdateShardCount's documented default limits: the per-account/region shard-per-stream
+     * ceiling, and how many scaling calls a stream may take in a rolling 24-hour window.
+     */
+    private static final int MAX_SHARDS_PER_STREAM = 10000;
+    private static final int MAX_SHARD_COUNT_UPDATES_PER_DAY = 10;
+    private static final Duration SHARD_COUNT_UPDATE_WINDOW = Duration.ofHours(24);
+    private static final String UNIFORM_SCALING = "UNIFORM_SCALING";
     private static final String MIN_HASH_KEY_VALUE = "0";
     private static final String INITIAL_SEQUENCE_NUMBER = "0";
     private static final BigInteger MIN_HASH_KEY = BigInteger.ZERO;
@@ -54,6 +64,7 @@ public class KinesisService implements ResourceProvider {
     private final StorageBackend<String, KinesisStream> store;
     private final StorageBackend<String, KinesisConsumer> consumerStore;
     private final RegionResolver regionResolver;
+    private final Clock clock;
     private final AtomicLong sequenceGenerator = new AtomicLong(System.currentTimeMillis());
     // One monitor per stream key, handed out by lockFor. Serializes sequence allocation + shard
     // append + persist so the in-memory log, the assigned sequence order and the WAL write order
@@ -80,9 +91,21 @@ public class KinesisService implements ResourceProvider {
     KinesisService(StorageBackend<String, KinesisStream> store,
                    StorageBackend<String, KinesisConsumer> consumerStore,
                    RegionResolver regionResolver) {
+        this(store, consumerStore, regionResolver, Clock.systemUTC());
+    }
+
+    /**
+     * Test seam: lets retention-period expiry be exercised deterministically instead
+     * of depending on wall-clock time. Production code always goes through the public/{@code @Inject}
+     * constructors, which pin the system clock.
+     */
+    KinesisService(StorageBackend<String, KinesisStream> store,
+                   StorageBackend<String, KinesisConsumer> consumerStore,
+                   RegionResolver regionResolver, Clock clock) {
         this.store = store;
         this.consumerStore = consumerStore;
         this.regionResolver = regionResolver;
+        this.clock = clock;
     }
 
     public KinesisStream createStream(String streamName, int shardCount, String region) {
@@ -177,6 +200,10 @@ public class KinesisService implements ResourceProvider {
 
     public KinesisStream describeStream(String streamName, String region) {
         return resolveStream(streamName, region);
+    }
+
+    public KinesisStream describeStreamForAccount(String accountId, String streamName, String region) {
+        return resolveStreamForAccount(accountId, streamName, region);
     }
 
     public KinesisConsumer registerStreamConsumer(String streamArn, String consumerName, String region) {
@@ -463,6 +490,166 @@ public class KinesisService implements ResourceProvider {
         return new BigInteger(val).subtract(BigInteger.ONE).toString();
     }
 
+    public record UpdateShardCountResult(String streamName, String streamArn,
+                                          int currentShardCount, int targetShardCount) {}
+
+    /**
+     * Reshards a stream to {@code targetShardCount} open shards using uniform scaling: the only
+     * scaling type AWS documents. Internally this is expressed purely as a sequence of
+     * {@link #splitShard} and {@link #mergeShards} calls, exactly as real Kinesis performs
+     * UpdateShardCount as splits or merges on individual shards, so shard lineage
+     * (parent/adjacent-parent) comes out identical to calling those APIs by hand.
+     */
+    public UpdateShardCountResult updateShardCount(String streamName, int targetShardCount, String scalingType, String region) {
+        if (!UNIFORM_SCALING.equals(scalingType)) {
+            throw new AwsException("InvalidArgumentException",
+                    "ScalingType must be UNIFORM_SCALING, got: " + scalingType, 400);
+        }
+        if (targetShardCount < 1) {
+            throw new AwsException("InvalidArgumentException",
+                    "TargetShardCount must be at least 1, got: " + targetShardCount, 400);
+        }
+
+        String key = regionKey(region, streamName);
+        int currentOpenShardCount;
+        synchronized (lockFor(key)) {
+            KinesisStream stream = resolveStream(streamName, region);
+
+            if ("ON_DEMAND".equals(stream.getStreamMode())) {
+                throw new AwsException("ValidationException",
+                        "UpdateShardCount is only supported for data streams with the provisioned capacity mode.",
+                        400);
+            }
+            if (!"ACTIVE".equals(stream.getStreamStatus())) {
+                throw new AwsException("ResourceInUseException",
+                        "Stream " + streamName + " is not ACTIVE (current state: " + stream.getStreamStatus() + ")", 400);
+            }
+
+            currentOpenShardCount = (int) stream.getShards().stream().filter(s -> !s.isClosed()).count();
+            validateTargetShardCount(streamName, currentOpenShardCount, targetShardCount);
+            recordShardCountUpdate(stream, key);
+
+            applyUniformScaling(streamName, stream, currentOpenShardCount, targetShardCount, region);
+
+            return new UpdateShardCountResult(streamName, stream.getStreamArn(), currentOpenShardCount, targetShardCount);
+        }
+    }
+
+    /**
+     * Enforces UpdateShardCount's documented default limits. The minimum bound rounds up for an
+     * odd current shard count ({@code (n + 1) / 2}), so current=5 accepts target=3 but rejects
+     * target=2; AWS documents only "below half" with no stated rounding, so the rounding direction
+     * here is Floci's own call, chosen as the more conservative reading. AWS's separate 10 TPS
+     * call-rate limit on this action is not enforced: Floci does not simulate real-time request
+     * throttling for any action.
+     */
+    private void validateTargetShardCount(String streamName, int currentOpenShardCount, int targetShardCount) {
+        int maxAllowed = currentOpenShardCount * 2;
+        int minAllowed = (currentOpenShardCount + 1) / 2;
+        if (targetShardCount > maxAllowed) {
+            throw new AwsException("LimitExceededException",
+                    "TargetShardCount of " + targetShardCount + " for stream " + streamName
+                            + " exceeds double the current open shard count of " + currentOpenShardCount + ".", 400);
+        }
+        if (targetShardCount < minAllowed) {
+            throw new AwsException("LimitExceededException",
+                    "TargetShardCount of " + targetShardCount + " for stream " + streamName
+                            + " is below half the current open shard count of " + currentOpenShardCount + ".", 400);
+        }
+        if (targetShardCount > MAX_SHARDS_PER_STREAM) {
+            throw new AwsException("LimitExceededException",
+                    "TargetShardCount of " + targetShardCount + " exceeds the shard limit of "
+                            + MAX_SHARDS_PER_STREAM + " shards per stream.", 400);
+        }
+        if (currentOpenShardCount > MAX_SHARDS_PER_STREAM && targetShardCount >= MAX_SHARDS_PER_STREAM) {
+            throw new AwsException("LimitExceededException",
+                    "Stream " + streamName + " already has more than " + MAX_SHARDS_PER_STREAM
+                            + " shards; it can only be scaled down below that limit.", 400);
+        }
+    }
+
+    /** Enforces the "no more than ten UpdateShardCount calls per rolling 24 hours" default limit. */
+    private void recordShardCountUpdate(KinesisStream stream, String storageKey) {
+        Instant now = Instant.now();
+        Instant windowStart = now.minus(SHARD_COUNT_UPDATE_WINDOW);
+        List<Instant> recent = new ArrayList<>(stream.getShardCountUpdateTimestamps().stream()
+                .filter(t -> t.isAfter(windowStart))
+                .toList());
+        if (recent.size() >= MAX_SHARD_COUNT_UPDATES_PER_DAY) {
+            throw new AwsException("LimitExceededException",
+                    "Stream " + stream.getStreamName() + " has already been scaled "
+                            + MAX_SHARD_COUNT_UPDATES_PER_DAY + " times in the past 24 hours.", 400);
+        }
+        recent.add(now);
+        stream.setShardCountUpdateTimestamps(recent);
+        store.put(storageKey, stream);
+    }
+
+    /**
+     * Reaches {@code targetShardCount} open shards by splitting the widest open shards (scale up)
+     * or merging the narrowest disjoint adjacent pairs (scale down), so the resulting topology
+     * stays as close to equal-width as the existing shard layout allows.
+     */
+    private void applyUniformScaling(String streamName, KinesisStream stream,
+                                      int currentOpenShardCount, int targetShardCount, String region) {
+        if (targetShardCount > currentOpenShardCount) {
+            int splitsNeeded = targetShardCount - currentOpenShardCount;
+            List<KinesisShard> splitCandidates = stream.getShards().stream()
+                    .filter(s -> !s.isClosed())
+                    .sorted(Comparator.comparing(KinesisService::hashRangeWidth).reversed()
+                            .thenComparing(KinesisShard::getShardId))
+                    .limit(splitsNeeded)
+                    .toList();
+            for (KinesisShard parent : splitCandidates) {
+                splitShard(streamName, parent.getShardId(), midpointHashKey(parent.getHashKeyRange()), region);
+            }
+        } else if (targetShardCount < currentOpenShardCount) {
+            int mergesNeeded = currentOpenShardCount - targetShardCount;
+            List<KinesisShard> openByHashKey = stream.getShards().stream()
+                    .filter(s -> !s.isClosed())
+                    .sorted(Comparator.comparing(s -> new BigInteger(s.getHashKeyRange().startingHashKey())))
+                    .toList();
+
+            List<int[]> narrowestFirstDisjointPairs = narrowestFirstDisjointAdjacentPairs(openByHashKey);
+            for (int i = 0; i < mergesNeeded; i++) {
+                int[] pair = narrowestFirstDisjointPairs.get(i);
+                KinesisShard shard1 = openByHashKey.get(pair[0]);
+                KinesisShard shard2 = openByHashKey.get(pair[1]);
+                mergeShards(streamName, shard1.getShardId(), shard2.getShardId(), region);
+            }
+        }
+    }
+
+    /**
+     * Every disjoint adjacent-pair merge candidate among {@code openByHashKey}, narrowest
+     * combined hash-range width first. Only the fixed (0,1), (2,3), ... parity pairing is
+     * considered: those pairs never share a shard, so merging any prefix of this list is always
+     * valid regardless of how many merges are actually needed, and picking the narrowest pairs
+     * first keeps the resulting topology as close to equal-width as the existing layout allows.
+     */
+    private static List<int[]> narrowestFirstDisjointAdjacentPairs(List<KinesisShard> openByHashKey) {
+        List<int[]> pairs = new ArrayList<>();
+        for (int i = 0; i + 1 < openByHashKey.size(); i += 2) {
+            pairs.add(new int[]{i, i + 1});
+        }
+        pairs.sort(Comparator.comparing(pair ->
+                hashRangeWidth(openByHashKey.get(pair[0])).add(hashRangeWidth(openByHashKey.get(pair[1])))));
+        return pairs;
+    }
+
+    private static BigInteger hashRangeWidth(KinesisShard shard) {
+        BigInteger start = new BigInteger(shard.getHashKeyRange().startingHashKey());
+        BigInteger end = new BigInteger(shard.getHashKeyRange().endingHashKey());
+        return end.subtract(start).add(BigInteger.ONE);
+    }
+
+    private static String midpointHashKey(KinesisShard.HashKeyRange range) {
+        BigInteger start = new BigInteger(range.startingHashKey());
+        BigInteger end = new BigInteger(range.endingHashKey());
+        BigInteger width = end.subtract(start).add(BigInteger.ONE);
+        return start.add(width.divide(BigInteger.TWO)).toString();
+    }
+
     public record PutRecordResult(String sequenceNumber, String shardId) {}
 
     public String putRecord(String streamName, byte[] data, String partitionKey, String region) {
@@ -599,9 +786,10 @@ public class KinesisService implements ResourceProvider {
             validateExplicitHashKey(explicitHashKey);
             validateRecordSize(current, data, partitionKey);
             KinesisShard shard = selectShard(current, partitionKey, explicitHashKey);
+            pruneExpiredRecords(current, shard);
             String sequenceNumber = String.valueOf(sequenceGenerator.incrementAndGet());
             putRecordAppendHook.run();
-            KinesisRecord record = new KinesisRecord(data, partitionKey, sequenceNumber, Instant.now());
+            KinesisRecord record = new KinesisRecord(data, partitionKey, sequenceNumber, clock.instant());
             shard.addRecord(record);
             persistStream(accountId, key, current);
             return new PutRecordResult(sequenceNumber, shard.getShardId());
@@ -626,12 +814,14 @@ public class KinesisService implements ResourceProvider {
         // Format: streamName|shardId|type|sequenceNumber|index|timestampMillis
         // The 6th slot was added for AT_TIMESTAMP; empty for other iterator types.
         // Old 5-part iterators still decode via split(-1) compatibility in getRecords.
-        // For LATEST the index slot carries the shard tip at iterator creation time,
-        // so records written afterwards are visible to getRecords.
+        // For LATEST the sequenceNumber slot carries the shard tip's sequence number at
+        // iterator creation time (see resolveIteratorSequenceNumber), so records written
+        // afterwards are visible to getRecords, and retention pruning of older records
+        // can never shift what this iterator resolves to.
         String raw = String.format("%s|%s|%s|%s|%d|%s",
                 streamName, shardId, type,
-                sequenceNumber != null ? sequenceNumber : "",
-                iteratorStartIndex(stream, shardId, type),
+                resolveIteratorSequenceNumber(stream, shardId, type, sequenceNumber),
+                0,
                 timestampMillis != null ? timestampMillis.toString() : "");
         return Base64.getEncoder().encodeToString(raw.getBytes(StandardCharsets.UTF_8));
     }
@@ -653,14 +843,29 @@ public class KinesisService implements ResourceProvider {
         return parts;
     }
 
-    private int iteratorStartIndex(KinesisStream stream, String shardId, String type) {
-        // AWS validates the shard at GetShardIterator time for every iterator type.
+    /**
+     * The sequence-number reference encoded into a freshly-minted shard iterator. For LATEST this
+     * is the shard's current tip record's sequence number (or {@code ""} if the shard has no
+     * records yet); getRecords resolves it with the same sequence-number lookup used for
+     * AFTER_SEQUENCE_NUMBER. A raw record-count/index snapshot would be invalidated by
+     * retention pruning removing earlier records and shifting every later record's index; a
+     * sequence number is stable under pruning since sequence numbers are never reused. Every other
+     * iterator type passes its caller-supplied sequence number (or {@code ""}) straight through.
+     *
+     * <p>AWS validates the shard at GetShardIterator time for every iterator type, which the shard
+     * lookup below still performs regardless of type.
+     */
+    private String resolveIteratorSequenceNumber(KinesisStream stream, String shardId, String type,
+                                                  String sequenceNumber) {
         KinesisShard shard = stream.getShards().stream()
                 .filter(s -> s.getShardId().equals(shardId))
                 .findFirst()
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Shard not found", 400));
-        // LATEST resumes from the tip snapshot taken now; other types resolve in getRecords.
-        return "LATEST".equals(type) ? shard.recordCount() : 0;
+        if (!"LATEST".equals(type)) {
+            return sequenceNumber != null ? sequenceNumber : "";
+        }
+        List<KinesisRecord> records = shard.getRecords();
+        return records.isEmpty() ? "" : records.get(records.size() - 1).getSequenceNumber();
     }
 
     private int parseIteratorIndex(String value) {
@@ -693,15 +898,23 @@ public class KinesisService implements ResourceProvider {
                 .filter(s -> s.getShardId().equals(shardId))
                 .findFirst()
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Shard not found", 400));
+        pruneExpiredRecords(stream, shard);
 
-        List<KinesisRecord> allRecords = shard.getRecords();
+        KinesisShard.RecordsSnapshot snapshot = shard.snapshotRecords();
+        List<KinesisRecord> allRecords = snapshot.records();
         int startIndex = 0;
 
         // Simple implementation of iterator types.
-        // LATEST resumes from the shard tip snapshot encoded at GetShardIterator time,
-        // so records appended after the iterator was obtained are returned.
-        if ("TRIM_HORIZON".equals(type) || "LATEST".equals(type)) {
-            startIndex = lastIndex;
+        // LATEST resolves the same way as AFTER_SEQUENCE_NUMBER: it was encoded (at
+        // GetShardIterator time) as the shard tip's sequence number, so records appended after the
+        // iterator was obtained are returned. Resolving by sequence number rather than the shard's
+        // raw index/count means retention pruning of earlier records (which shifts
+        // every later record's array index) can never invalidate this reference: if the
+        // referenced record has itself since been pruned, every record before it was necessarily
+        // pruned too (pruning only ever removes a contiguous prefix), so falling through to the
+        // startIndex=0 default below still correctly resumes at the oldest still-retained record.
+        if ("TRIM_HORIZON".equals(type)) {
+            startIndex = legacyResumeIndex(snapshot, lastIndex);
         } else if ("AT_SEQUENCE_NUMBER".equals(type)) {
             for (int i = 0; i < allRecords.size(); i++) {
                 if (allRecords.get(i).getSequenceNumber().equals(startSeq)) {
@@ -709,7 +922,7 @@ public class KinesisService implements ResourceProvider {
                     break;
                 }
             }
-        } else if ("AFTER_SEQUENCE_NUMBER".equals(type)) {
+        } else if ("AFTER_SEQUENCE_NUMBER".equals(type) || "LATEST".equals(type)) {
              for (int i = 0; i < allRecords.size(); i++) {
                 if (allRecords.get(i).getSequenceNumber().equals(startSeq)) {
                     startIndex = i + 1;
@@ -741,12 +954,7 @@ public class KinesisService implements ResourceProvider {
             nextIndex = i + 1;
         }
 
-        // Continuation iterator: type=TRIM_HORIZON + resume-at-nextIndex is the existing
-        // "resume by index" convention (the type label is misleading but preserved for compat).
-        // Timestamp slot empty on continuation.
-        String nextIterator = Base64.getEncoder().encodeToString(
-                String.format("%s|%s|%s|%s|%d|", streamName, shardId, "TRIM_HORIZON", "", nextIndex)
-                .getBytes(StandardCharsets.UTF_8));
+        String nextIterator = buildContinuationIterator(streamName, shardId, allRecords, nextIndex);
 
         Map<String, Object> response = new HashMap<>();
         response.put("Records", result);
@@ -785,12 +993,15 @@ public class KinesisService implements ResourceProvider {
         PriorityQueue<PeekedRecord> newest = new PriorityQueue<>(oldestFirst);
         stream.getShards().stream()
                 .filter(shard -> shardId == null || shardId.isBlank() || shard.getShardId().equals(shardId))
-                .forEach(shard -> shard.getRecords().forEach(record -> {
-                    newest.add(new PeekedRecord(shard.getShardId(), record));
-                    if (newest.size() > resolvedLimit) {
-                        newest.poll();
-                    }
-                }));
+                .forEach(shard -> {
+                    pruneExpiredRecords(stream, shard);
+                    shard.getRecords().forEach(record -> {
+                        newest.add(new PeekedRecord(shard.getShardId(), record));
+                        if (newest.size() > resolvedLimit) {
+                            newest.poll();
+                        }
+                    });
+                });
 
         return newest.stream()
                 .sorted(Comparator.comparing(peeked -> peeked.record().getApproximateArrivalTimestamp(),
@@ -824,6 +1035,51 @@ public class KinesisService implements ResourceProvider {
             return 0L;
         }
         return Math.max(0L, tip.toEpochMilli() - lastReturned.toEpochMilli());
+    }
+
+    /**
+     * Earlier versions encoded a continuation as TRIM_HORIZON plus a raw index into the shard's
+     * log, and Firehose persists such iterators as checkpoints. Pruning shifts that index, so
+     * subtract the records pruned since.
+     */
+    private static int legacyResumeIndex(KinesisShard.RecordsSnapshot snapshot, int index) {
+        long resumeIndex = Math.max(0, index - snapshot.prunedRecordCount());
+        return (int) Math.min(resumeIndex, snapshot.records().size());
+    }
+
+    /**
+     * Builds the {@code NextShardIterator} a GetRecords call returns, positioned just after the
+     * last record delivered (or at the log's start if none were). Encoded as
+     * AFTER_SEQUENCE_NUMBER against the sequence number of the last-returned record (or, if
+     * nothing has been returned yet, the original TRIM_HORIZON/index-0 convention) rather than a
+     * raw resume index: retention pruning removes a prefix of the shard's record
+     * list, which would silently shift a raw index, but never invalidates a sequence number.
+     */
+    private String buildContinuationIterator(String streamName, String shardId,
+                                              List<KinesisRecord> allRecords, int nextIndex) {
+        if (nextIndex <= 0) {
+            return Base64.getEncoder().encodeToString(
+                    String.format("%s|%s|%s|%s|%d|", streamName, shardId, "TRIM_HORIZON", "", 0)
+                            .getBytes(StandardCharsets.UTF_8));
+        }
+        String resumeAfterSequenceNumber = allRecords.get(nextIndex - 1).getSequenceNumber();
+        return Base64.getEncoder().encodeToString(
+                String.format("%s|%s|%s|%s|%d|", streamName, shardId, "AFTER_SEQUENCE_NUMBER",
+                                resumeAfterSequenceNumber, 0)
+                        .getBytes(StandardCharsets.UTF_8));
+    }
+
+    /**
+     * Lazily expires records older than {@code stream}'s current retention period from
+     * {@code shard}, per the documented Kinesis retention-period contract: records past the
+     * retention window become inaccessible, and decreasing the retention period makes
+     * newly-out-of-window records inaccessible almost immediately. There is no background sweep
+     * (YAGNI): every put and read touches only the shard(s) it actually visits, so pruning happens
+     * on that shard's next put or read after the record ages out.
+     */
+    private void pruneExpiredRecords(KinesisStream stream, KinesisShard shard) {
+        Instant cutoff = clock.instant().minus(Duration.ofHours(stream.getRetentionPeriodHours()));
+        shard.pruneRecordsBefore(cutoff);
     }
 
     private KinesisStream resolveStream(String streamName, String region) {
@@ -860,11 +1116,19 @@ public class KinesisService implements ResourceProvider {
 
     public String getShardIteratorForAccount(String accountId, String streamName, String shardId,
                                              String type, String sequenceNumber, String region) {
+        return getShardIteratorForAccount(accountId, streamName, shardId, type, sequenceNumber,
+                null, region);
+    }
+
+    public String getShardIteratorForAccount(String accountId, String streamName, String shardId,
+                                             String type, String sequenceNumber, Long timestampMillis,
+                                             String region) {
         KinesisStream stream = resolveStreamForAccount(accountId, streamName, region);
-        String raw = String.format("%s|%s|%s|%s|%d|",
+        String raw = String.format("%s|%s|%s|%s|%d|%s",
                 streamName, shardId, type,
-                sequenceNumber != null ? sequenceNumber : "",
-                iteratorStartIndex(stream, shardId, type));
+                resolveIteratorSequenceNumber(stream, shardId, type, sequenceNumber),
+                0,
+                timestampMillis != null ? timestampMillis.toString() : "");
         return Base64.getEncoder().encodeToString(raw.getBytes(StandardCharsets.UTF_8));
     }
 
@@ -876,22 +1140,47 @@ public class KinesisService implements ResourceProvider {
         String type = parts[2];
         String startSeq = parts[3];
         int lastIndex = parseIteratorIndex(parts[4]);
+        Long timestampMillis = null;
+        if (parts.length >= 6 && !parts[5].isEmpty()) {
+            try {
+                timestampMillis = Long.parseLong(parts[5]);
+            } catch (NumberFormatException e) {
+                throw new AwsException("InvalidArgumentException", "Invalid timestamp in shard iterator", 400);
+            }
+        }
 
         KinesisStream stream = resolveStreamForAccount(accountId, streamName, region);
         KinesisShard shard = stream.getShards().stream()
                 .filter(s -> s.getShardId().equals(shardId))
                 .findFirst()
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Shard not found", 400));
+        pruneExpiredRecords(stream, shard);
 
-        List<KinesisRecord> allRecords = shard.getRecords();
+        KinesisShard.RecordsSnapshot snapshot = shard.snapshotRecords();
+        List<KinesisRecord> allRecords = snapshot.records();
         int startIndex = 0;
-        // LATEST resumes from the shard tip snapshot encoded at GetShardIterator time.
-        if ("TRIM_HORIZON".equals(type) || "LATEST".equals(type)) {
-            startIndex = lastIndex;
-        } else if ("AFTER_SEQUENCE_NUMBER".equals(type)) {
+        // LATEST resolves the same way as AFTER_SEQUENCE_NUMBER (see the longer explanation in
+        // getRecords, above): it was encoded at GetShardIterator time as the shard tip's sequence
+        // number, which retention pruning of earlier records can never invalidate.
+        if ("TRIM_HORIZON".equals(type)) {
+            startIndex = legacyResumeIndex(snapshot, lastIndex);
+        } else if ("AFTER_SEQUENCE_NUMBER".equals(type) || "LATEST".equals(type)) {
             for (int i = 0; i < allRecords.size(); i++) {
                 if (allRecords.get(i).getSequenceNumber().equals(startSeq)) {
                     startIndex = i + 1;
+                    break;
+                }
+            }
+        } else if ("AT_TIMESTAMP".equals(type)) {
+            if (timestampMillis == null) {
+                throw new AwsException("InvalidArgumentException",
+                        "AT_TIMESTAMP iterator requires a Timestamp", 400);
+            }
+            startIndex = allRecords.size();
+            for (int i = 0; i < allRecords.size(); i++) {
+                Instant arrival = allRecords.get(i).getApproximateArrivalTimestamp();
+                if (arrival != null && arrival.toEpochMilli() >= timestampMillis) {
+                    startIndex = i;
                     break;
                 }
             }
@@ -905,9 +1194,7 @@ public class KinesisService implements ResourceProvider {
             nextIndex = i + 1;
         }
 
-        String nextIterator = Base64.getEncoder().encodeToString(
-                String.format("%s|%s|%s|%s|%d|", streamName, shardId, "TRIM_HORIZON", "", nextIndex)
-                        .getBytes(StandardCharsets.UTF_8));
+        String nextIterator = buildContinuationIterator(streamName, shardId, allRecords, nextIndex);
         Map<String, Object> response = new HashMap<>();
         response.put("Records", result);
         response.put("NextShardIterator", nextIterator);

@@ -267,6 +267,14 @@ class ExpressionEvaluatorTest {
             return mapper.readTree(json);
         }
 
+        @Test
+        void orderingAgainstAnotherTypeMatchesNothing() throws Exception {
+            JsonNode i = item("{\"a\": {\"S\": \"5\"}}");
+            JsonNode v = values("{\":low\": {\"N\": \"1\"}, \":high\": {\"N\": \"9\"}}");
+            assertFalse(ExpressionEvaluator.matches("a > :low", i, null, v));
+            assertFalse(ExpressionEvaluator.matches("a BETWEEN :low AND :high", i, null, v));
+        }
+
         // AND, OR, NOT logic
 
         @Test
@@ -658,6 +666,20 @@ class ExpressionEvaluatorTest {
                             "ConditionExpression", null, malformed));
             assertEquals("SerializationException", serialization.getErrorCode());
             assertEquals(400, serialization.getHttpStatus());
+        }
+
+        // Checked against real DynamoDB (ap-northeast-1, 2026-09-10): a FilterExpression
+        // comparing against a binary that is not base64 fails the request with a 400
+        // SerializationException, so the comparison itself must never decode blindly.
+        @Test
+        void binaryComparisonRejectsMalformedBase64() {
+            var valid = mapper.createObjectNode().put("B", "AQID");
+            var malformed = mapper.createObjectNode().put("B", "not base64!!");
+
+            var e = assertThrows(AwsException.class,
+                    () -> ExpressionEvaluator.compareAttributeValues(valid, malformed));
+            assertEquals("SerializationException", e.getErrorCode());
+            assertEquals(400, e.getHttpStatus());
         }
 
         // A FilterExpression carries the same text without the envelope on AWS.

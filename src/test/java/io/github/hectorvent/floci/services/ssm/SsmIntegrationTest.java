@@ -1307,6 +1307,24 @@ class SsmIntegrationTest {
             .body("Parameter.Version", equalTo(1))
             .body("Parameter.ARN", equalTo("arn:aws:ssm:us-east-1::parameter" + al2023));
 
+        String al2023Arm64 = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64";
+
+        given()
+            .header("X-Amz-Target", "AmazonSSM.GetParameter")
+            .contentType(SSM_CONTENT_TYPE)
+            .body("""
+                { "Name": "%s" }
+                """.formatted(al2023Arm64))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Parameter.Name", equalTo(al2023Arm64))
+            .body("Parameter.Value", equalTo("ami-amazonlinux2023-arm64"))
+            .body("Parameter.Type", equalTo("String"))
+            .body("Parameter.Version", equalTo(1))
+            .body("Parameter.ARN", equalTo("arn:aws:ssm:us-east-1::parameter" + al2023Arm64));
+
         given()
             .header("X-Amz-Target", "AmazonSSM.GetParameters")
             .contentType(SSM_CONTENT_TYPE)
@@ -1320,6 +1338,24 @@ class SsmIntegrationTest {
             .body("Parameters.Name", contains(al2023))
             .body("InvalidParameters", contains("/aws/service/ami-amazon-linux-latest/no-such-variant"));
 
+        String eksOptimizedAmi = "/aws/service/eks/optimized-ami/1.31/amazon-linux-2023/x86_64/standard/recommended/image_id";
+
+        given()
+            .header("X-Amz-Target", "AmazonSSM.GetParameter")
+            .contentType(SSM_CONTENT_TYPE)
+            .body("""
+                { "Name": "%s" }
+                """.formatted(eksOptimizedAmi))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Parameter.Name", equalTo(eksOptimizedAmi))
+            .body("Parameter.Value", equalTo("ami-0abcdef1234567891"))
+            .body("Parameter.Type", equalTo("String"))
+            .body("Parameter.Version", equalTo(1))
+            .body("Parameter.ARN", equalTo("arn:aws:ssm:us-east-1::parameter" + eksOptimizedAmi));
+
         given()
             .header("X-Amz-Target", "AmazonSSM.GetParametersByPath")
             .contentType(SSM_CONTENT_TYPE)
@@ -1330,7 +1366,7 @@ class SsmIntegrationTest {
             .post("/")
         .then()
             .statusCode(200)
-            .body("Parameters.Name", hasItems(al2023,
+            .body("Parameters.Name", hasItems(al2023, al2023Arm64,
                     "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2"));
 
         given()
@@ -1407,5 +1443,207 @@ class SsmIntegrationTest {
             .post("/")
         .then()
             .statusCode(200);
+    }
+
+    @Test
+    @Order(17)
+    void putParameterWithTagsAndListTagsForResource() {
+        given()
+            .header("X-Amz-Target", "AmazonSSM.PutParameter")
+            .contentType(SSM_CONTENT_TYPE)
+            .body("""
+                {
+                    "Name": "/demo/tagged-param",
+                    "Value": "hello",
+                    "Type": "String",
+                    "Tags": [
+                        {"Key": "Project", "Value": "demo"},
+                        {"Key": "Env", "Value": "test"}
+                    ]
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Version", equalTo(1));
+
+        given()
+            .header("X-Amz-Target", "AmazonSSM.ListTagsForResource")
+            .contentType(SSM_CONTENT_TYPE)
+            .body("""
+                {
+                    "ResourceType": "Parameter",
+                    "ResourceId": "/demo/tagged-param"
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("TagList", hasSize(2))
+            .body("TagList.find { it.Key == 'Project' }.Value", equalTo("demo"))
+            .body("TagList.find { it.Key == 'Env' }.Value", equalTo("test"));
+    }
+
+    @Test
+    @Order(18)
+    void putParameterOverwritePreservesExistingTags() {
+        given()
+            .header("X-Amz-Target", "AmazonSSM.PutParameter")
+            .contentType(SSM_CONTENT_TYPE)
+            .body("""
+                {
+                    "Name": "/demo/tagged-param",
+                    "Value": "world",
+                    "Type": "String",
+                    "Overwrite": true
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Version", equalTo(2));
+
+        given()
+            .header("X-Amz-Target", "AmazonSSM.ListTagsForResource")
+            .contentType(SSM_CONTENT_TYPE)
+            .body("""
+                {
+                    "ResourceType": "Parameter",
+                    "ResourceId": "/demo/tagged-param"
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("TagList", hasSize(2))
+            .body("TagList.find { it.Key == 'Project' }.Value", equalTo("demo"));
+    }
+
+    @Test
+    @Order(19)
+    void putParameterOverwriteWithTagsReturns400() {
+        given()
+            .header("X-Amz-Target", "AmazonSSM.PutParameter")
+            .contentType(SSM_CONTENT_TYPE)
+            .body("""
+                {
+                    "Name": "/demo/tagged-param",
+                    "Value": "updated",
+                    "Type": "String",
+                    "Overwrite": true,
+                    "Tags": [
+                        {"Key": "Project", "Value": "demo2"}
+                    ]
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("ValidationException"));
+    }
+
+    @Test
+    @Order(20)
+    void describeParametersAppliesParameterFilters() {
+        putFilterFixture("/dpf/prod/db", "String", "");
+        putFilterFixture("/dpf/prod/api/key", "SecureString", "");
+        putFilterFixture("/dpf/dev/db", "String", ", \"Tags\": [{\"Key\": \"Team\", \"Value\": \"core\"}]");
+
+        describeParameters("""
+                { "ParameterFilters": [{ "Key": "Path", "Values": ["/dpf/prod"] }] }
+                """)
+            .body("Parameters.Name", contains("/dpf/prod/db"));
+
+        describeParameters("""
+                { "ParameterFilters": [{ "Key": "Path", "Option": "Recursive", "Values": ["/dpf/prod"] }] }
+                """)
+            .body("Parameters.Name", containsInAnyOrder("/dpf/prod/db", "/dpf/prod/api/key"));
+
+        describeParameters("""
+                { "ParameterFilters": [
+                    { "Key": "Name", "Option": "BeginsWith", "Values": ["/dpf/"] },
+                    { "Key": "Type", "Values": ["SecureString"] }
+                ] }
+                """)
+            .body("Parameters.Name", contains("/dpf/prod/api/key"));
+
+        describeParameters("""
+                { "ParameterFilters": [{ "Key": "tag:Team", "Values": ["core"] }] }
+                """)
+            .body("Parameters.Name", contains("/dpf/dev/db"));
+
+        describeParameters("""
+                { "Filters": [{ "Key": "Name", "Values": ["/dpf/dev/db"] }] }
+                """)
+            .body("Parameters.Name", contains("/dpf/dev/db"));
+    }
+
+    @Test
+    @Order(21)
+    void describeParametersPagesWithMaxResultsAndNextToken() {
+        String filter = "\"ParameterFilters\": [{ \"Key\": \"Name\", \"Option\": \"BeginsWith\", \"Values\": [\"/dpf/\"] }]";
+
+        String token = describeParameters("{ " + filter + ", \"MaxResults\": 2 }")
+            .body("Parameters.Name", contains("/dpf/dev/db", "/dpf/prod/api/key"))
+            .body("NextToken", notNullValue())
+            .extract().path("NextToken");
+
+        describeParameters("{ " + filter + ", \"MaxResults\": 2, \"NextToken\": \"" + token + "\" }")
+            .body("Parameters.Name", contains("/dpf/prod/db"))
+            .body("NextToken", nullValue());
+    }
+
+    @Test
+    @Order(22)
+    void describeParametersRejectsUnsupportedFilters() {
+        describeParametersError("""
+                { "ParameterFilters": [{ "Key": "Label", "Values": ["prod"] }] }
+                """, "InvalidFilterKey");
+        describeParametersError("""
+                { "ParameterFilters": [{ "Key": "Type", "Option": "Contains", "Values": ["String"] }] }
+                """, "InvalidFilterOption");
+        describeParametersError("""
+                { "ParameterFilters": [{ "Key": "Path", "Values": ["dpf"] }] }
+                """, "InvalidFilterValue");
+        describeParametersError("{ \"MaxResults\": 51 }", "ValidationException");
+    }
+
+    private void putFilterFixture(String name, String type, String extra) {
+        given()
+            .header("X-Amz-Target", "AmazonSSM.PutParameter")
+            .contentType(SSM_CONTENT_TYPE)
+            .body("{ \"Name\": \"" + name + "\", \"Value\": \"v\", \"Type\": \"" + type + "\"" + extra + " }")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+    }
+
+    private io.restassured.response.ValidatableResponse describeParameters(String body) {
+        return given()
+            .header("X-Amz-Target", "AmazonSSM.DescribeParameters")
+            .contentType(SSM_CONTENT_TYPE)
+            .body(body)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+    }
+
+    private void describeParametersError(String body, String errorType) {
+        given()
+            .header("X-Amz-Target", "AmazonSSM.DescribeParameters")
+            .contentType(SSM_CONTENT_TYPE)
+            .body(body)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo(errorType));
     }
 }

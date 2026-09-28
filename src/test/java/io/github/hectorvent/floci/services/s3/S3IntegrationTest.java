@@ -13,6 +13,7 @@ import java.security.NoSuchAlgorithmException;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.List;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.*;
@@ -440,14 +441,30 @@ class S3IntegrationTest {
             .statusCode(204);
     }
 
+    /**
+     * A regional endpoint requires a LocationConstraint naming its region (moto's
+     * {@code aws_verified} matrix); only the us-east-1 endpoint accepts an empty body. The
+     * signing region alone never places a bucket.
+     */
     @Test
     @Order(21)
-    void createBucketUsesSigningRegionWhenBodyEmpty() {
+    void createBucketWithoutConstraintOnARegionalEndpointIsRejected() {
         String bucket = "signed-region-bucket";
+        String regionalAuth =
+                "AWS4-HMAC-SHA256 Credential=test/20260325/eu-west-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=test";
 
         given()
-            .header("Authorization",
-                    "AWS4-HMAC-SHA256 Credential=test/20260325/eu-west-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=test")
+            .header("Authorization", regionalAuth)
+        .when()
+            .put("/" + bucket)
+        .then()
+            .statusCode(400)
+            .body(containsString("<Code>IllegalLocationConstraintException</Code>"));
+
+        given()
+            .header("Authorization", regionalAuth)
+            .contentType("application/xml")
+            .body("<CreateBucketConfiguration><LocationConstraint>eu-west-1</LocationConstraint></CreateBucketConfiguration>")
         .when()
             .put("/" + bucket)
         .then()
@@ -456,10 +473,10 @@ class S3IntegrationTest {
 
         given()
         .when()
-            .head("/" + bucket)
+            .get("/" + bucket + "?location")
         .then()
             .statusCode(200)
-            .header("x-amz-bucket-region", equalTo("eu-west-1"));
+            .body(containsString(">eu-west-1</LocationConstraint>"));
 
         given()
         .when()
@@ -485,6 +502,237 @@ class S3IntegrationTest {
         .then()
             .statusCode(400)
             .body(containsString("InvalidLocationConstraint"));
+    }
+
+    @Test
+    void createBucketRejectsUnknownLocationConstraintWithoutCreatingBucket() {
+        for (String invalidRegion : List.of("polygondwanaland-west-1", "us-fake-9")) {
+            String bucket = "unknown-region-" + invalidRegion;
+            String createBucketConfiguration = """
+                    <CreateBucketConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                        <LocationConstraint>%s</LocationConstraint>
+                    </CreateBucketConfiguration>
+                    """.formatted(invalidRegion);
+
+            given()
+                .contentType("application/xml")
+                .body(createBucketConfiguration)
+            .when()
+                .put("/" + bucket)
+            .then()
+                .statusCode(400)
+                .body(containsString("InvalidLocationConstraint"));
+
+            given()
+            .when()
+                .head("/" + bucket)
+            .then()
+                .statusCode(404);
+        }
+    }
+
+    @Test
+    void createBucketAcceptsKnownRegionOutsideAdvertisedRegionList() {
+        String bucket = "ap-south-two-bucket";
+        String createBucketConfiguration = """
+                <CreateBucketConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                    <LocationConstraint>ap-south-2</LocationConstraint>
+                </CreateBucketConfiguration>
+                """;
+
+        given()
+            .contentType("application/xml")
+            .body(createBucketConfiguration)
+        .when()
+            .put("/" + bucket)
+        .then()
+            .statusCode(200);
+
+        given()
+        .when()
+            .head("/" + bucket)
+        .then()
+            .statusCode(200)
+            .header("x-amz-bucket-region", equalTo("ap-south-2"));
+
+        given()
+        .when()
+            .delete("/" + bucket)
+        .then()
+            .statusCode(204);
+    }
+
+    @Test
+    void createBucketRejectsOverlyLongBucketName() {
+        String longBucketName = "30388849b0eaef3dfba3aa83849d28987be6fb7920bdbf3233bdc8e966f73870.json";
+        given()
+        .when()
+            .put("/" + longBucketName)
+        .then()
+            .statusCode(400)
+            .body(containsString("InvalidBucketName"));
+    }
+
+    @Test
+    void createBucketRejectsNonXmlPayload() {
+        given()
+            .contentType("application/json")
+            .body("{\"key\":\"value\"}")
+        .when()
+            .put("/malformed-xml-bucket")
+        .then()
+            .statusCode(400)
+            .body(containsString("MalformedXML"));
+    }
+
+    @Test
+    @Order(208)
+    void createBucketRejectsMalformedCreateBucketConfigurationAndCreatesNoBucket() {
+        String bucket = "malformed-config-bucket";
+        given()
+            .contentType("application/xml")
+            .body("<CreateBucketConfiguration><LocationConstraint>eu-central-1</LocationConstraint>")
+        .when()
+            .put("/" + bucket)
+        .then()
+            .statusCode(400)
+            .body(containsString("MalformedXML"));
+
+        assertBucketDoesNotExist(bucket);
+    }
+
+    @Test
+    @Order(209)
+    void createBucketRejectsUnknownCreateBucketConfigurationFieldAndCreatesNoBucket() {
+        String bucket = "unknown-config-field-bucket";
+        given()
+            .contentType("application/xml")
+            .body("""
+                <CreateBucketConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                    <Foo>bar</Foo>
+                </CreateBucketConfiguration>
+                """)
+        .when()
+            .put("/" + bucket)
+        .then()
+            .statusCode(400)
+            .body(containsString("MalformedXML"));
+
+        assertBucketDoesNotExist(bucket);
+    }
+
+    @Test
+    @Order(210)
+    void createBucketRejectsWrongCreateBucketConfigurationRootAndCreatesNoBucket() {
+        String bucket = "wrong-config-root-bucket";
+        given()
+            .contentType("application/xml")
+            .body("""
+                <CreateBucketConfigurationFoo xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                    <LocationConstraint>eu-central-1</LocationConstraint>
+                </CreateBucketConfigurationFoo>
+                """)
+        .when()
+            .put("/" + bucket)
+        .then()
+            .statusCode(400)
+            .body(containsString("MalformedXML"));
+
+        assertBucketDoesNotExist(bucket);
+    }
+
+    @Test
+    @Order(211)
+    void createBucketRejectsInvalidLocationConstraintAndCreatesNoBucket() {
+        String bucket = "invalid-constraint-bucket";
+        given()
+            .contentType("application/xml")
+            .body("""
+                <CreateBucketConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                    <LocationConstraint>not-a-region</LocationConstraint>
+                </CreateBucketConfiguration>
+                """)
+        .when()
+            .put("/" + bucket)
+        .then()
+            .statusCode(400)
+            .body(containsString("InvalidLocationConstraint"));
+
+        assertBucketDoesNotExist(bucket);
+    }
+
+    @Test
+    @Order(212)
+    void createBucketAcceptsDirectoryBucketConfiguration() {
+        String bucket = "directory-config-bucket";
+        given()
+            .contentType("application/xml")
+            .body("""
+                <CreateBucketConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                    <Location>us-west-2</Location>
+                    <Bucket>
+                        <Type>Directory</Type>
+                    </Bucket>
+                </CreateBucketConfiguration>
+                """)
+        .when()
+            .put("/" + bucket)
+        .then()
+            .statusCode(200);
+
+        given()
+        .when()
+            .get("/" + bucket)
+        .then()
+            .statusCode(200);
+    }
+
+    private static void assertBucketDoesNotExist(String bucket) {
+        given()
+        .when()
+            .get("/" + bucket)
+        .then()
+            .statusCode(404)
+            .body(containsString("NoSuchBucket"));
+    }
+
+    @Test
+    void createBucketReroutesMisplacedVirtualHostedPutObject() {
+        String targetBucket = "reroute-target-bucket";
+        String objectKey = "misplaced-file.json";
+        String content = "{\"message\":\"hello from misplaced put\"}";
+
+        given().put("/" + targetBucket).then().statusCode(200);
+
+        // PutObject request arriving on single path segment with custom Host
+        given()
+            .header("Host", targetBucket + ".floci.apps.custom.com")
+            .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+            .contentType("application/json")
+            .body(content)
+        .when()
+            .put("/" + objectKey)
+        .then()
+            .statusCode(200);
+
+        // Verify stored in targetBucket
+        given()
+        .when()
+            .get("/" + targetBucket + "/" + objectKey)
+        .then()
+            .statusCode(200)
+            .body(equalTo(content));
+
+        // Verify objectKey was not created as bucket
+        given()
+        .when()
+            .head("/" + objectKey)
+        .then()
+            .statusCode(404);
+
+        // Clean up
+        given().delete("/" + targetBucket + "/" + objectKey).then().statusCode(204);
+        given().delete("/" + targetBucket).then().statusCode(204);
     }
 
     @Test
@@ -1581,6 +1829,31 @@ class S3IntegrationTest {
             .statusCode(200)
             .header("ETag", notNullValue())
             .header("x-amz-server-side-encryption", equalTo("AES256"));
+
+        String kmsKeyId = "arn:aws:kms:us-east-1:000000000000:key/test-key";
+        given()
+            .contentType("text/plain")
+            .header("x-amz-server-side-encryption", "aws:kms")
+            .header("x-amz-server-side-encryption-aws-kms-key-id", kmsKeyId)
+            .body("kms-encrypted-content")
+        .when()
+            .put("/sse-bucket/kms-encrypted.txt")
+        .then()
+            .statusCode(200)
+            .header("x-amz-server-side-encryption", equalTo("aws:kms"))
+            .header("x-amz-server-side-encryption-aws-kms-key-id", equalTo(kmsKeyId));
+
+        given()
+            .contentType("text/plain")
+            .header("x-amz-server-side-encryption", "AES256")
+            .header("x-amz-server-side-encryption-aws-kms-key-id", kmsKeyId)
+            .body("aes-content")
+        .when()
+            .put("/sse-bucket/aes-with-kms-id.txt")
+        .then()
+            .statusCode(200)
+            .header("x-amz-server-side-encryption", equalTo("AES256"))
+            .header("x-amz-server-side-encryption-aws-kms-key-id", nullValue());
     }
 
     @Test
@@ -1592,6 +1865,23 @@ class S3IntegrationTest {
         .then()
             .statusCode(200)
             .header("x-amz-server-side-encryption", equalTo("AES256"));
+
+        String kmsKeyId = "arn:aws:kms:us-east-1:000000000000:key/test-key";
+        given()
+        .when()
+            .get("/sse-bucket/kms-encrypted.txt")
+        .then()
+            .statusCode(200)
+            .header("x-amz-server-side-encryption", equalTo("aws:kms"))
+            .header("x-amz-server-side-encryption-aws-kms-key-id", equalTo(kmsKeyId));
+
+        given()
+        .when()
+            .get("/sse-bucket/aes-with-kms-id.txt")
+        .then()
+            .statusCode(200)
+            .header("x-amz-server-side-encryption", equalTo("AES256"))
+            .header("x-amz-server-side-encryption-aws-kms-key-id", nullValue());
     }
 
     @Test
@@ -1603,6 +1893,15 @@ class S3IntegrationTest {
         .then()
             .statusCode(200)
             .header("x-amz-server-side-encryption", equalTo("AES256"));
+
+        String kmsKeyId = "arn:aws:kms:us-east-1:000000000000:key/test-key";
+        given()
+        .when()
+            .head("/sse-bucket/kms-encrypted.txt")
+        .then()
+            .statusCode(200)
+            .header("x-amz-server-side-encryption", equalTo("aws:kms"))
+            .header("x-amz-server-side-encryption-aws-kms-key-id", equalTo(kmsKeyId));
     }
 
     @Test
@@ -1614,7 +1913,11 @@ class S3IntegrationTest {
             .put("/sse-bucket/encrypted-copy.txt")
         .then()
             .statusCode(200)
-            .body(containsString("CopyObjectResult"));
+            .body(containsString("CopyObjectResult"))
+            // Asserted directly on the CopyObjectResult response itself, not
+            // just via a follow-up HEAD — handleCopyObject previously never
+            // emitted x-amz-server-side-encryption at all.
+            .header("x-amz-server-side-encryption", equalTo("AES256"));
 
         given()
         .when()
@@ -1622,6 +1925,25 @@ class S3IntegrationTest {
         .then()
             .statusCode(200)
             .header("x-amz-server-side-encryption", equalTo("AES256"));
+
+        String kmsKeyId = "arn:aws:kms:us-east-1:000000000000:key/test-key";
+        given()
+            .header("x-amz-copy-source", "/sse-bucket/kms-encrypted.txt")
+        .when()
+            .put("/sse-bucket/kms-encrypted-copy.txt")
+        .then()
+            .statusCode(200)
+            .body(containsString("CopyObjectResult"))
+            .header("x-amz-server-side-encryption", equalTo("aws:kms"))
+            .header("x-amz-server-side-encryption-aws-kms-key-id", equalTo(kmsKeyId));
+
+        given()
+        .when()
+            .head("/sse-bucket/kms-encrypted-copy.txt")
+        .then()
+            .statusCode(200)
+            .header("x-amz-server-side-encryption", equalTo("aws:kms"))
+            .header("x-amz-server-side-encryption-aws-kms-key-id", equalTo(kmsKeyId));
     }
 
     @Test
@@ -1855,6 +2177,9 @@ class S3IntegrationTest {
     void cleanupSseBucket() {
         given().delete("/sse-bucket/encrypted.txt");
         given().delete("/sse-bucket/encrypted-copy.txt");
+        given().delete("/sse-bucket/aes-with-kms-id.txt");
+        given().delete("/sse-bucket/kms-encrypted.txt");
+        given().delete("/sse-bucket/kms-encrypted-copy.txt");
         given().delete("/sse-bucket/sse-c.txt");
         given().delete("/sse-bucket/sse-c-copy.txt");
         given().delete("/sse-bucket");
@@ -2167,6 +2492,51 @@ class S3IntegrationTest {
     }
 
     // --- ListObjectsV2 pagination ---
+
+    @Test
+    @Order(100)
+    void listObjectsValidatesMaxKeys() {
+        String bucket = "max-keys-test-bucket";
+        given().when().put("/" + bucket).then().statusCode(200);
+        given().body("a").when().put("/" + bucket + "/a.txt").then().statusCode(200);
+        try {
+            // max-keys=0 is a valid request for an empty page: no keys, and IsTruncated stays false
+            // even though the bucket has objects.
+            for (String query : List.of("?max-keys=0", "?list-type=2&max-keys=0")) {
+                given()
+                .when()
+                    .get("/" + bucket + query)
+                .then()
+                    .statusCode(200)
+                    .body(containsString("<MaxKeys>0</MaxKeys>"))
+                    .body(containsString("<IsTruncated>false</IsTruncated>"))
+                    .body(not(containsString("<Key>")))
+                    .body(not(containsString("<NextContinuationToken>")));
+            }
+            given()
+            .when()
+                .get("/" + bucket + "?versions&max-keys=0")
+            .then()
+                .statusCode(200)
+                .body(containsString("<MaxKeys>0</MaxKeys>"))
+                .body(containsString("<IsTruncated>false</IsTruncated>"))
+                .body(not(containsString("<Version>")));
+
+            for (String invalid : List.of("-1", "abc", "2147483648")) {
+                given()
+                .when()
+                    .get("/" + bucket + "?list-type=2&max-keys=" + invalid)
+                .then()
+                    .statusCode(400)
+                    .body(containsString("<Code>InvalidArgument</Code>"))
+                    .body(containsString("<ArgumentName>maxKeys</ArgumentName>"))
+                    .body(containsString("<ArgumentValue>" + invalid + "</ArgumentValue>"));
+            }
+        } finally {
+            given().when().delete("/" + bucket + "/a.txt");
+            given().when().delete("/" + bucket);
+        }
+    }
 
     @Test
     @Order(101)

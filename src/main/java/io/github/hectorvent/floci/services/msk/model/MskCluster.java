@@ -97,9 +97,20 @@ public class MskCluster {
     @JsonProperty("accountId")
     private String accountId;
 
+    // Region is persisted separately so records created before regional ARNs remain identifiable.
+    @JsonProperty("resourceRegion")
+    private String resourceRegion;
+
     // 6-char hex generated once at creation for stable, collision-free volume/container naming
     @JsonProperty("volumeId")
     private String volumeId;
+
+    /**
+     * The Docker volume name. Stamped at creation with the current prefix; null on records
+     * written before this field existed, which are backfilled with the frozen legacy name so
+     * their data stays reachable.
+     */
+    private String dockerVolumeName;
 
     public MskCluster() {}
 
@@ -180,6 +191,13 @@ public class MskCluster {
     public String getAccountId() { return accountId; }
     public void setAccountId(String accountId) { this.accountId = accountId; }
 
+    public String getResourceRegion() { return resourceRegion; }
+    public void setResourceRegion(String resourceRegion) { this.resourceRegion = resourceRegion; }
+
     public String getVolumeId() { return volumeId; }
     public void setVolumeId(String volumeId) { this.volumeId = volumeId; }
+
+    public String getDockerVolumeName() { return dockerVolumeName; }
+
+    public void setDockerVolumeName(String dockerVolumeName) { this.dockerVolumeName = dockerVolumeName; }
 }

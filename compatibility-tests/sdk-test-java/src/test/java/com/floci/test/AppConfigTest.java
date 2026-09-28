@@ -9,6 +9,7 @@ import software.amazon.awssdk.services.appconfigdata.model.BadRequestException;
 import software.amazon.awssdk.services.appconfigdata.model.GetLatestConfigurationRequest;
 import software.amazon.awssdk.services.appconfigdata.model.GetLatestConfigurationResponse;
 import software.amazon.awssdk.services.appconfigdata.model.StartConfigurationSessionRequest;
+import software.amazon.awssdk.services.appconfigdata.model.StartConfigurationSessionResponse;
 
 import java.nio.charset.StandardCharsets;
 
@@ -28,6 +29,7 @@ class AppConfigTest {
     private static String deploymentStrategyId;
     private static String configurationToken;
     private static String secondConfigurationToken;
+    private static String unchangedConfigurationToken;
     private static String intervalSessionToken;
     private static String emptyAppId;
     private static String emptyEnvId;
@@ -153,6 +155,7 @@ class AppConfigTest {
         assertThat(response.contentType()).startsWith("application/json");
         assertThat(response.versionLabel()).isEqualTo("1");
         assertThat(response.nextPollConfigurationToken()).isNotNull();
+        assertThat(response.nextPollConfigurationToken()).isNotEqualTo(configurationToken);
         secondConfigurationToken = response.nextPollConfigurationToken();
     }
 
@@ -176,6 +179,21 @@ class AppConfigTest {
 
     @Test
     @Order(11)
+    void repeatedPollWithSameVersionReturnsEmptyPayload() {
+        GetLatestConfigurationResponse response = appConfigData.getLatestConfiguration(GetLatestConfigurationRequest.builder()
+                .configurationToken(secondConfigurationToken)
+                .build());
+
+        assertThat(response.configuration().asByteArray()).isEmpty();
+        assertThat(response.contentType()).isEqualTo("application/octet-stream");
+        assertThat(response.versionLabel()).isNull();
+        assertThat(response.nextPollConfigurationToken()).isNotNull();
+        assertThat(response.nextPollConfigurationToken()).isNotEqualTo(secondConfigurationToken);
+        unchangedConfigurationToken = response.nextPollConfigurationToken();
+    }
+
+    @Test
+    @Order(12)
     void updatedDeploymentIsVisibleOnNextPollToken() {
         CreateHostedConfigurationVersionResponse versionResponse = appConfig.createHostedConfigurationVersion(
                 CreateHostedConfigurationVersionRequest.builder()
@@ -195,15 +213,17 @@ class AppConfigTest {
                 .build());
 
         GetLatestConfigurationResponse response = appConfigData.getLatestConfiguration(GetLatestConfigurationRequest.builder()
-                .configurationToken(secondConfigurationToken)
+                .configurationToken(unchangedConfigurationToken)
                 .build());
 
         assertThat(response.configuration().asString(StandardCharsets.UTF_8)).isEqualTo("{\"key\": \"value-2\"}");
         assertThat(response.versionLabel()).isEqualTo("2");
+        assertThat(response.nextPollConfigurationToken()).isNotNull();
+        assertThat(response.nextPollConfigurationToken()).isNotEqualTo(unchangedConfigurationToken);
     }
 
     @Test
-    @Order(12)
+    @Order(13)
     @DisplayName("Poll interval: requested minimum is returned to the client")
     void requiredMinimumPollIntervalIsReturned() {
         var sessionResponse = appConfigData.startConfigurationSession(StartConfigurationSessionRequest.builder()
@@ -230,7 +250,7 @@ class AppConfigTest {
     }
 
     @Test
-    @Order(13)
+    @Order(14)
     void emptyConfigurationReturnsEmptyPayload() {
         emptyAppId = appConfig.createApplication(CreateApplicationRequest.builder()
                 .name(TestFixtures.uniqueName("empty-app"))
@@ -453,5 +473,74 @@ class AppConfigTest {
         assertThat(appConfig.getDeploymentStrategy(GetDeploymentStrategyRequest.builder()
                 .deploymentStrategyId("AppConfig.AllAtOnce").build()).id())
                 .isEqualTo("AppConfig.AllAtOnce");
+    }
+
+    @Test
+    @Order(55)
+    @DisplayName("GetLatestConfiguration resolves basic Feature Flags to retrieval-time format")
+    void getLatestConfigurationReturnsFeatureFlagsRetrievalFormat() {
+        String featureFlagsAppId = appConfig.createApplication(CreateApplicationRequest.builder()
+                .name(TestFixtures.uniqueName("feature-flags-app"))
+                .build()).id();
+        String featureFlagsEnvId = appConfig.createEnvironment(CreateEnvironmentRequest.builder()
+                .applicationId(featureFlagsAppId)
+                .name("test")
+                .build()).id();
+        String featureFlagsProfileId = appConfig.createConfigurationProfile(
+                CreateConfigurationProfileRequest.builder()
+                        .applicationId(featureFlagsAppId)
+                        .name("flags")
+                        .locationUri("hosted")
+                        .type("AWS.AppConfig.FeatureFlags")
+                        .build()).id();
+        String deploymentContent = "{\"flags\":{\"enabled\":{\"name\":\"enabled\"},"
+                + "\"disabled\":{\"name\":\"disabled\"}},\"values\":{"
+                + "\"enabled\":{\"enabled\":true,\"number\":0,\"beta\":false,"
+                + "\"_createdAt\":\"created\",\"_updatedAt\":\"updated\"},"
+                + "\"disabled\":{\"enabled\":false,\"secret\":\"must-not-leak\"}},"
+                + "\"version\":\"1\"}";
+
+        CreateHostedConfigurationVersionResponse version = appConfig.createHostedConfigurationVersion(
+                CreateHostedConfigurationVersionRequest.builder()
+                        .applicationId(featureFlagsAppId)
+                        .configurationProfileId(featureFlagsProfileId)
+                        .content(SdkBytes.fromString(deploymentContent, StandardCharsets.UTF_8))
+                        .contentType("application/json")
+                        .build());
+        assertThat(version.versionNumber()).isEqualTo(1);
+
+        GetHostedConfigurationVersionResponse stored = appConfig.getHostedConfigurationVersion(
+                GetHostedConfigurationVersionRequest.builder()
+                        .applicationId(featureFlagsAppId)
+                        .configurationProfileId(featureFlagsProfileId)
+                        .versionNumber(1)
+                        .build());
+        assertThat(stored.content().asString(StandardCharsets.UTF_8)).isEqualTo(deploymentContent);
+
+        appConfig.startDeployment(StartDeploymentRequest.builder()
+                .applicationId(featureFlagsAppId)
+                .environmentId(featureFlagsEnvId)
+                .configurationProfileId(featureFlagsProfileId)
+                .configurationVersion("1")
+                .deploymentStrategyId("AppConfig.AllAtOnce")
+                .build());
+
+        StartConfigurationSessionResponse session = appConfigData.startConfigurationSession(
+                StartConfigurationSessionRequest.builder()
+                        .applicationIdentifier(featureFlagsAppId)
+                        .environmentIdentifier(featureFlagsEnvId)
+                        .configurationProfileIdentifier(featureFlagsProfileId)
+                        .build());
+        GetLatestConfigurationResponse response = appConfigData.getLatestConfiguration(
+                GetLatestConfigurationRequest.builder()
+                        .configurationToken(session.initialConfigurationToken())
+                        .build());
+
+        assertThat(response.configuration().asString(StandardCharsets.UTF_8))
+                .isEqualTo("{\"enabled\":{\"enabled\":true,\"number\":0,\"beta\":false},"
+                        + "\"disabled\":{\"enabled\":false}}");
+        assertThat(response.contentType()).startsWith("application/json");
+        assertThat(response.versionLabel()).isEqualTo("1");
+        assertThat(response.nextPollConfigurationToken()).isNotBlank();
     }
 }

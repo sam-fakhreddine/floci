@@ -3,11 +3,9 @@ package io.github.hectorvent.floci.services.cloudformation.provisioners;
 import org.jboss.logging.Logger;
 
 /**
- * Rollback bookkeeping shared by every resource handler, on both sides of the ongoing
- * decomposition: the remaining {@code CloudFormationResourceProvisioner} switch arms and the
- * extracted {@link CfnResourceProvisioner} implementations. It lives here instead of in either
- * half so the ownership marker and the cleanup logging stay single-sourced while types migrate
- * out one service at a time.
+ * Rollback bookkeeping shared by every {@link CfnResourceProvisioner} and read by
+ * {@code CloudFormationService}. It lives here so the ownership marker and the cleanup logging
+ * stay single-sourced across the per-service provisioners.
  */
 public final class CfnRollback {
 
@@ -23,8 +21,7 @@ public final class CfnRollback {
      * Marks a resource whose prior physical entity is still intact after a failed update, so the
      * rollback must not try to restore it. Set by a provisioner that creates the replacement before
      * deleting the original; read by {@code CloudFormationService} when deciding what a rollback
-     * owes. Lives here rather than on {@code CloudFormationResourceProvisioner} so extracted
-     * provisioners in this package can set it.
+     * owes. Lives here so every provisioner in this package can set it.
      */
     public static final String UPDATE_ROLLBACK_RESTORED_ATTR = "__FlociUpdateRollbackRestored";
 
@@ -45,12 +42,49 @@ public final class CfnRollback {
     public static final String PIPE_UPDATE_SNAPSHOT_ATTR = "__FlociPipeUpdateSnapshot";
 
     /**
+     * Holds the targets an EventBridge rule carried before the update in flight reconciled them,
+     * with the rule name, bus and region needed to address them again, so a failed stack update can
+     * put them back. Written by {@code EventsCfnProvisioner} before its first target call and spent
+     * by its {@code rollbackUpdate}. The rule name alone does not address a target: a rule on a
+     * custom bus is keyed by that bus, and the rollback hook is handed the stack resource alone.
+     */
+    public static final String RULE_TARGETS_SNAPSHOT_ATTR = "__FlociRuleTargetsSnapshot";
+
+    /**
+     * Holds the configuration a Batch entity carried before the in-place update in flight changed
+     * it, in the request shape its update call takes, so a failed stack update can put it back.
+     * Written by {@code BatchCfnProvisioner} before its update call and spent by its
+     * {@code rollbackUpdate}. Carries the resource type because one provisioner serves three, and
+     * the rollback hook is handed the stack resource alone: a compute environment is restored
+     * through UpdateComputeEnvironment and a job queue through UpdateJobQueue, and a job
+     * definition instead names the revision the failed update registered so it can be
+     * deregistered.
+     */
+    public static final String BATCH_UPDATE_SNAPSHOT_ATTR = "__FlociBatchUpdateSnapshot";
+
+    /**
      * Holds the settings an event invoke configuration carried before an in-place update changed
      * them, in the request shape a put takes, so a failed stack update can put them back. Written
      * by {@code LambdaEventInvokeConfigCfnProvisioner} before its update call and spent by its
      * {@code rollbackUpdate}.
      */
     public static final String EVENT_INVOKE_CONFIG_SNAPSHOT_ATTR = "__FlociEventInvokeConfigSnapshot";
+
+    /**
+     * Holds the body and tags a dashboard carried before an in-place update changed them, or the
+     * fact that it did not exist, so a failed stack update can put it back. Written by
+     * {@code CloudWatchDashboardCfnProvisioner} before its first mutating call and spent by its
+     * {@code rollbackUpdate}.
+     */
+    public static final String DASHBOARD_UPDATE_SNAPSHOT_ATTR = "__FlociDashboardUpdateSnapshot";
+
+    /**
+     * Holds the complete prior metric filter, identity, name mode and per-address mutation outcomes
+     * and ownership states.
+     * Written before either an in-place put or a delete-then-create replacement; retained across
+     * failed restoration attempts and spent only after rollback or commit succeeds.
+     */
+    public static final String METRIC_FILTER_UPDATE_SNAPSHOT_ATTR = "__FlociMetricFilterUpdateSnapshot";
 
     /**
      * Holds the pipe a rename displaced: the name it still lives under, the region that addresses

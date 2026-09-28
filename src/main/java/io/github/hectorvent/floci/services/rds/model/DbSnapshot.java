@@ -3,13 +3,18 @@ package io.github.hectorvent.floci.services.rds.model;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 @RegisterForReflection
 public class DbSnapshot {
 
     private String dbSnapshotIdentifier;
+    private String dbSnapshotArn;
+    private String snapshotType;
+    private String sourceDbSnapshotIdentifier;
     private String dbInstanceIdentifier;
     private Instant snapshotCreateTime;
     private DatabaseEngine engine;
@@ -26,7 +31,12 @@ public class DbSnapshot {
     private String dbiResourceId;
     private String dbName;
     private String dbInstanceClass;
+    private String optionGroupName;
+    private Boolean storageEncrypted;
+    private String kmsKeyId;
     private Map<String, String> tags = new LinkedHashMap<>();
+    /** Account IDs authorized to copy/restore this snapshot; the "restore" DBSnapshotAttribute. */
+    private List<String> restoreAccountIds = new ArrayList<>();
 
     public DbSnapshot() {}
 
@@ -54,6 +64,17 @@ public class DbSnapshot {
 
     public String getDbSnapshotIdentifier() { return dbSnapshotIdentifier; }
     public void setDbSnapshotIdentifier(String dbSnapshotIdentifier) { this.dbSnapshotIdentifier = dbSnapshotIdentifier; }
+
+    public String getDbSnapshotArn() { return dbSnapshotArn; }
+    public void setDbSnapshotArn(String dbSnapshotArn) { this.dbSnapshotArn = dbSnapshotArn; }
+
+    public String getSnapshotType() { return snapshotType; }
+    public void setSnapshotType(String snapshotType) { this.snapshotType = snapshotType; }
+
+    public String getSourceDbSnapshotIdentifier() { return sourceDbSnapshotIdentifier; }
+    public void setSourceDbSnapshotIdentifier(String sourceDbSnapshotIdentifier) {
+        this.sourceDbSnapshotIdentifier = sourceDbSnapshotIdentifier;
+    }
 
     public String getDbInstanceIdentifier() { return dbInstanceIdentifier; }
     public void setDbInstanceIdentifier(String dbInstanceIdentifier) { this.dbInstanceIdentifier = dbInstanceIdentifier; }
@@ -100,9 +121,28 @@ public class DbSnapshot {
     public Map<String, String> getTags() { return tags; }
     public void setTags(Map<String, String> tags) { this.tags = tags; }
 
+    public List<String> getRestoreAccountIds() { return restoreAccountIds; }
+    public void setRestoreAccountIds(List<String> restoreAccountIds) {
+        this.restoreAccountIds = restoreAccountIds != null ? restoreAccountIds : new ArrayList<>();
+    }
+
     public String getDbName() { return dbName; }
     public void setDbName(String dbName) { this.dbName = dbName; }
     
     public String getDbInstanceClass() { return dbInstanceClass; }
     public void setDbInstanceClass(String dbInstanceClass) { this.dbInstanceClass = dbInstanceClass; }
+
+    public String getOptionGroupName() { return optionGroupName; }
+    public void setOptionGroupName(String optionGroupName) { this.optionGroupName = optionGroupName; }
+
+    public boolean isStorageEncrypted() {
+        if (storageEncrypted != null) {
+            return storageEncrypted;
+        }
+        return kmsKeyId != null && !kmsKeyId.isBlank();
+    }
+    public void setStorageEncrypted(boolean storageEncrypted) { this.storageEncrypted = storageEncrypted; }
+
+    public String getKmsKeyId() { return kmsKeyId; }
+    public void setKmsKeyId(String kmsKeyId) { this.kmsKeyId = kmsKeyId; }
 }

@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.acm;
 
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.path.json.JsonPath;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
@@ -117,7 +118,7 @@ class AcmEdgeCaseTest {
             .body("CertificateArn", startsWith("arn:aws:acm:"))
             .extract().jsonPath().getString("CertificateArn");
 
-        var validationOptions = given()
+        JsonPath validationOptions = given()
             .header("X-Amz-Target", "CertificateManager.DescribeCertificate")
             .contentType(ACM_CONTENT_TYPE)
             .body("""
@@ -318,6 +319,49 @@ class AcmEdgeCaseTest {
         .then()
             .statusCode(400)
             .body("__type", equalTo("ValidationException"));
+    }
+
+    @Test
+    void emailValidationReportsValidationEmailsInsteadOfAResourceRecord() {
+        // Issue #3252
+        String certificateArn = given()
+            .header("X-Amz-Target", "CertificateManager.RequestCertificate")
+            .contentType(ACM_CONTENT_TYPE)
+            .body("""
+                {
+                    "DomainName": "probe.email.example.com",
+                    "ValidationMethod": "EMAIL",
+                    "DomainValidationOptions": [
+                        {"DomainName": "probe.email.example.com", "ValidationDomain": "email.example.com"}
+                    ]
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().jsonPath().getString("CertificateArn");
+
+        given()
+            .header("X-Amz-Target", "CertificateManager.DescribeCertificate")
+            .contentType(ACM_CONTENT_TYPE)
+            .body("""
+                {
+                    "CertificateArn": "%s"
+                }
+                """.formatted(certificateArn))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Certificate.DomainValidationOptions", hasSize(1))
+            .body("Certificate.DomainValidationOptions[0].DomainName", equalTo("probe.email.example.com"))
+            .body("Certificate.DomainValidationOptions[0].ValidationDomain", equalTo("email.example.com"))
+            .body("Certificate.DomainValidationOptions[0].ValidationMethod", equalTo("EMAIL"))
+            .body("Certificate.DomainValidationOptions[0].ValidationEmails", contains(
+                "admin@email.example.com", "administrator@email.example.com", "hostmaster@email.example.com",
+                "postmaster@email.example.com", "webmaster@email.example.com"))
+            .body("Certificate.DomainValidationOptions[0]", not(hasKey("ResourceRecord")));
     }
 
     // ==================== Domain Name Validation Tests ====================

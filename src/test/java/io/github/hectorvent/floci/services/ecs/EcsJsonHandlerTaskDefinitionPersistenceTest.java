@@ -10,6 +10,8 @@ import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.PersistentStorage;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ecs.container.EcsContainerManager;
+import io.github.hectorvent.floci.services.ecs.container.HostVolumePolicy;
+import io.github.hectorvent.floci.services.ecs.model.FirelensConfiguration;
 import io.github.hectorvent.floci.services.ecs.model.LaunchType;
 import io.github.hectorvent.floci.services.ecs.model.TaskDefinition;
 import jakarta.ws.rs.core.Response;
@@ -47,7 +49,13 @@ class EcsJsonHandlerTaskDefinitionPersistenceTest {
         FileStorageFactory storage = new FileStorageFactory(dataDir);
         ObjectMapper objectMapper = new ObjectMapper();
 
-        EcsJsonHandler handler = new EcsJsonHandler(serviceWithStorage(storage), objectMapper);
+        // This test exercises persistence round-tripping, not host-volume safety, so the fixed
+        // literal sourcePath "/host/data" below needs an explicit opt-in under the new
+        // fail-closed default: allow any host path for this handler instance.
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().ecs().allowUnsafeHostVolumes()).thenReturn(true);
+        EcsJsonHandler handler = new EcsJsonHandler(serviceWithStorage(storage), objectMapper,
+                new HostVolumePolicy(config));
         JsonNode request = objectMapper.readTree("""
                 {
                   "family": "restart-family",
@@ -60,6 +68,10 @@ class EcsJsonHandlerTaskDefinitionPersistenceTest {
                       "logConfiguration": {
                         "logDriver": "awslogs",
                         "options": {"awslogs-group": "/ecs/restart-family"}
+                      },
+                      "firelensConfiguration": {
+                        "type": "fluentbit",
+                        "options": {"enable-ecs-log-metadata": "true"}
                       }
                     }
                   ],
@@ -82,6 +94,11 @@ class EcsJsonHandlerTaskDefinitionPersistenceTest {
         assertEquals("awslogs", logConfiguration.logDriver());
         assertEquals("/ecs/restart-family", logConfiguration.options().get("awslogs-group"));
 
+        FirelensConfiguration firelens = td.getContainerDefinitions().getFirst().getFirelensConfiguration();
+        assertNotNull(firelens, "firelensConfiguration must survive a restart");
+        assertEquals("fluentbit", firelens.type());
+        assertEquals("true", firelens.options().get("enable-ecs-log-metadata"));
+
         assertEquals(1, td.getVolumes().size(), "task-level volumes must survive a restart");
         assertEquals("/host/data", td.getVolumes().getFirst().hostSourcePath());
     }
@@ -91,7 +108,8 @@ class EcsJsonHandlerTaskDefinitionPersistenceTest {
         FileStorageFactory storage = new FileStorageFactory(dataDir);
         ObjectMapper objectMapper = new ObjectMapper();
         EcsService service = serviceWithStorage(storage);
-        EcsJsonHandler handler = new EcsJsonHandler(service, objectMapper);
+        EcsJsonHandler handler = new EcsJsonHandler(service, objectMapper,
+                new HostVolumePolicy(mock(EmulatorConfig.class, RETURNS_DEEP_STUBS)));
 
         JsonNode registerReq = objectMapper.readTree("""
                 {

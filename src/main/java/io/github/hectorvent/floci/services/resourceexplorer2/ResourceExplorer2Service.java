@@ -174,7 +174,7 @@ public class ResourceExplorer2Service {
         String viewArn = regionResolver.buildArn("resource-explorer-2", region,
                 "view/default-view/" + viewId);
         View view = new View(viewArn, "default-view", accountId,
-                "arn:aws:iam::" + accountId + ":root",
+                regionResolver.buildGlobalArn("iam", accountId, "root"),
                 null,
                 List.of(new IncludedProperty("tags")),
                 new HashMap<>(), Instant.now());
@@ -318,7 +318,7 @@ public class ResourceExplorer2Service {
         String accountId = regionResolver.getAccountId();
         String viewArn = regionResolver.buildArn("resource-explorer-2", region,
                 "view/" + viewName + "/" + UUID.randomUUID());
-        String effectiveScope = (scope != null) ? scope : "arn:aws:iam::" + accountId + ":root";
+        String effectiveScope = (scope != null) ? scope : regionResolver.buildGlobalArn("iam", accountId, "root");
         View view = new View(viewArn, viewName, accountId,
                 effectiveScope,
                 filters, includedProperties,
@@ -999,10 +999,14 @@ public class ResourceExplorer2Service {
             return 0;
         }
         try {
-            return Integer.parseInt(new String(Base64.getDecoder().decode(token)));
+            int offset = Integer.parseInt(new String(Base64.getDecoder().decode(token)));
+            if (offset < 0) {
+                throw new IllegalArgumentException("negative offset");
+            }
+            return offset;
         } catch (Exception e) {
-            LOG.debugf("Invalid NextToken '%s', restarting from offset 0: %s", token, e.getMessage());
-            return 0;
+            throw new AwsException("ValidationException",
+                    "NextToken is invalid or has expired.", 400);
         }
     }
 

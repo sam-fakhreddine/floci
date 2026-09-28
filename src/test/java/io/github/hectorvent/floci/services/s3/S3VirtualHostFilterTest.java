@@ -1,6 +1,9 @@
 package io.github.hectorvent.floci.services.s3;
 
+import jakarta.enterprise.inject.Instance;
 import jakarta.ws.rs.container.ContainerRequestContext;
+import jakarta.ws.rs.core.MultivaluedHashMap;
+import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.UriInfo;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -18,7 +21,9 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -62,6 +67,12 @@ class S3VirtualHostFilterTest {
             "my-bucket.s3.amazonaws.com:443,            localhost, my-bucket",
             "my-bucket.s3.us-east-1.amazonaws.com,      localhost, my-bucket",
             "my-bucket.s3.eu-west-1.amazonaws.com:443,  localhost, my-bucket",
+            // The same in every other partition: the longest published suffix wins, so .cn survives
+            "my-bucket.s3.cn-north-1.amazonaws.com.cn,  localhost, my-bucket",
+            "my-bucket.s3.amazonaws.com.cn,             localhost, my-bucket",
+            "my-bucket.s3.us-gov-west-1.amazonaws.com,  localhost, my-bucket",
+            "my-bucket.s3.us-iso-east-1.c2s.ic.gov,     localhost, my-bucket",
+            "my-bucket.s3.eusc-de-east-1.amazonaws.eu,  localhost, my-bucket",
             // LocalStack-compatible domains (*.localhost.localstack.cloud resolves to 127.0.0.1 via public DNS)
             "my-bucket.s3.localhost.localstack.cloud,           localhost, my-bucket",
             "my-bucket.s3.localhost.localstack.cloud:4566,      localhost, my-bucket",
@@ -253,25 +264,6 @@ class S3VirtualHostFilterTest {
     // --- Host resolution: HTTP/1.1 Host header vs HTTP/2 :authority fallback ---
 
     @Test
-    void resolveHostPrefersHostHeaderOverUriAuthority() {
-        URI uri = URI.create("https://my-bucket.s3.us-east-1.localhost:4566/key.txt");
-        assertEquals("my-bucket.localhost:4566", S3VirtualHostFilter.resolveHost("my-bucket.localhost:4566", uri));
-    }
-
-    @Test
-    void resolveHostFallsBackToUriAuthorityWhenHostHeaderAbsent() {
-        // HTTP/2 request: no Host header, authority carried by the URI (:authority).
-        URI uri = URI.create("https://my-bucket.s3.us-east-1.localhost:4566/key.txt");
-        assertEquals("my-bucket.s3.us-east-1.localhost:4566", S3VirtualHostFilter.resolveHost(null, uri));
-    }
-
-    @Test
-    void resolveHostReturnsNullWhenNeitherAvailable() {
-        assertNull(S3VirtualHostFilter.resolveHost(null, null));
-        assertNull(S3VirtualHostFilter.resolveHost(null, URI.create("/relative/path")));
-    }
-
-    @Test
     void http2VirtualHostedRequestResolvesBucketWithoutHostHeader() {
         // Regression for #1866: over HTTP/2 the Host header is null, so the bucket must
         // be recovered from the URI authority instead of falling through to path-style.
@@ -293,6 +285,7 @@ class S3VirtualHostFilterTest {
 
         UriInfo uriInfo = mock(UriInfo.class);
         when(uriInfo.getRequestUri()).thenReturn(requestUri);
+        when(uriInfo.getQueryParameters()).thenReturn(new MultivaluedHashMap<>());
         ContainerRequestContext ctx = mock(ContainerRequestContext.class);
         when(ctx.getUriInfo()).thenReturn(uriInfo);
         when(ctx.getHeaderString("Host")).thenReturn(null); // HTTP/2: no Host header
@@ -429,6 +422,7 @@ class S3VirtualHostFilterTest {
         URI requestUri = URI.create("http://www.example.com.localhost:4566/index.html");
         UriInfo uriInfo = mock(UriInfo.class);
         when(uriInfo.getRequestUri()).thenReturn(requestUri);
+        when(uriInfo.getQueryParameters()).thenReturn(new MultivaluedHashMap<>());
         ContainerRequestContext ctx = mock(ContainerRequestContext.class);
         when(ctx.getUriInfo()).thenReturn(uriInfo);
         when(ctx.getHeaderString("Host")).thenReturn("www.example.com.localhost:4566");
@@ -438,6 +432,64 @@ class S3VirtualHostFilterTest {
         ArgumentCaptor<URI> rewritten = ArgumentCaptor.forClass(URI.class);
         verify(ctx).setRequestUri(rewritten.capture());
         assertEquals("/www.example.com/index.html", rewritten.getValue().getRawPath());
+    }
+
+    @Test
+    void filterRewritesFormRequestExplicitlySignedForS3() {
+        URI requestUri = URI.create("http://vhost-bucket.localhost:4566/archive.zip?uploads=");
+        UriInfo uriInfo = mock(UriInfo.class);
+        when(uriInfo.getRequestUri()).thenReturn(requestUri);
+        when(uriInfo.getQueryParameters()).thenReturn(new MultivaluedHashMap<>());
+        ContainerRequestContext ctx = mock(ContainerRequestContext.class);
+        when(ctx.getUriInfo()).thenReturn(uriInfo);
+        when(ctx.getHeaderString("Host")).thenReturn("vhost-bucket.localhost:4566");
+        when(ctx.getHeaderString("Authorization")).thenReturn(
+                "AWS4-HMAC-SHA256 Credential=test/20260912/us-east-1/s3/aws4_request, Signature=fake");
+        when(ctx.getHeaderString("Content-Type")).thenReturn("application/x-www-form-urlencoded; charset=UTF-8");
+
+        new S3VirtualHostFilter().filter(ctx);
+
+        ArgumentCaptor<URI> rewritten = ArgumentCaptor.forClass(URI.class);
+        verify(ctx).setRequestUri(rewritten.capture());
+        assertEquals("/vhost-bucket/archive.zip", rewritten.getValue().getRawPath());
+        assertEquals("uploads=", rewritten.getValue().getRawQuery());
+    }
+
+    @Test
+    void filterRewritesFormRequestPresignedForS3() {
+        URI requestUri = URI.create("http://vhost-bucket.localhost:4566/archive.zip?uploads=");
+        MultivaluedMap<String, String> queryParameters = new MultivaluedHashMap<>();
+        queryParameters.add("X-Amz-Credential", "test/20260913/us-east-1/s3/aws4_request");
+        UriInfo uriInfo = mock(UriInfo.class);
+        when(uriInfo.getRequestUri()).thenReturn(requestUri);
+        when(uriInfo.getQueryParameters()).thenReturn(queryParameters);
+        ContainerRequestContext ctx = mock(ContainerRequestContext.class);
+        when(ctx.getUriInfo()).thenReturn(uriInfo);
+        when(ctx.getHeaderString("Host")).thenReturn("vhost-bucket.localhost:4566");
+        when(ctx.getHeaderString("Content-Type")).thenReturn("application/x-www-form-urlencoded");
+
+        new S3VirtualHostFilter().filter(ctx);
+
+        ArgumentCaptor<URI> rewritten = ArgumentCaptor.forClass(URI.class);
+        verify(ctx).setRequestUri(rewritten.capture());
+        assertEquals("/vhost-bucket/archive.zip", rewritten.getValue().getRawPath());
+        assertEquals("uploads=", rewritten.getValue().getRawQuery());
+    }
+
+    @Test
+    void filterStillIgnoresUnsignedFormRequests() {
+        URI requestUri = URI.create("http://vhost-bucket.localhost:4566/archive.zip?uploads=");
+        UriInfo uriInfo = mock(UriInfo.class);
+        when(uriInfo.getRequestUri()).thenReturn(requestUri);
+        when(uriInfo.getQueryParameters()).thenReturn(new MultivaluedHashMap<>());
+        ContainerRequestContext ctx = mock(ContainerRequestContext.class);
+        when(ctx.getUriInfo()).thenReturn(uriInfo);
+        when(ctx.getHeaderString("Host")).thenReturn("vhost-bucket.localhost:4566");
+        when(ctx.getHeaderString("Content-Type")).thenReturn("application/x-www-form-urlencoded");
+
+        new S3VirtualHostFilter().filter(ctx);
+
+        verify(ctx, never()).setRequestUri(any(URI.class));
     }
 
     // --- Other services' virtual-host schemes must not be swallowed as dotted buckets ---
@@ -485,7 +537,7 @@ class S3VirtualHostFilterTest {
     @CsvSource({
             // ECR registry, as EcrRegistryManager emits it
             "123456789012.dkr.ecr.us-east-1.localhost,           localhost",
-            "123456789012.dkr.ecr.us-east-1.localhost:5100,      localhost",
+            "123456789012.dkr.ecr.us-east-1.localhost:4566,      localhost",
             "123456789012.dkr.ecr.eu-central-1.localhost.floci.io, localhost",
             // OpenSearch / Elasticsearch domain endpoints
             "search-mydomain-abc.us-east-1.es.localhost,         localhost",
@@ -693,5 +745,103 @@ class S3VirtualHostFilterTest {
                 "data.us-east-1.localhost", "localhost", DEFAULT_SUFFIXES));
         assertEquals("data.us-east-1", S3VirtualHostFilter.extractBucket(
                 "data.us-east-1.s3.localhost", "localhost", DEFAULT_SUFFIXES));
+    }
+
+    // --- Reverse Proxy & Custom Domain Resolution Tests ---
+
+    @Test
+    void resolveHostPrefersXForwardedHost() {
+        URI uri = URI.create("http://floci:4566/key");
+        assertEquals("my-bucket.localhost:4566",
+                S3VirtualHostFilter.resolveHost("floci:4566", "my-bucket.localhost:4566", uri));
+    }
+
+    @Test
+    void resolveHostExtractsFirstHostFromCommaSeparatedXForwardedHost() {
+        URI uri = URI.create("http://floci:4566/key");
+        assertEquals("client-bucket.localhost:4566",
+                S3VirtualHostFilter.resolveHost("floci:4566", "client-bucket.localhost:4566, proxy1:4566, proxy2", uri));
+    }
+
+    @Test
+    void resolveHostFallsBackToHostWhenXForwardedHostBlankOrNull() {
+        URI uri = URI.create("http://localhost:4566/key");
+        assertEquals("my-bucket.localhost:4566",
+                S3VirtualHostFilter.resolveHost("my-bucket.localhost:4566", null, uri));
+        assertEquals("my-bucket.localhost:4566",
+                S3VirtualHostFilter.resolveHost("my-bucket.localhost:4566", "   ", uri));
+    }
+
+    @Test
+    void bucketBeforeS3QualifierExtractsBucketOnCustomDomains() {
+        assertEquals("my-bucket",
+                S3VirtualHostFilter.bucketBeforeS3Qualifier("my-bucket.s3.us-east-1.floci.apps.mesirendon.com"));
+        assertEquals("my-bucket",
+                S3VirtualHostFilter.bucketBeforeS3Qualifier("my-bucket.s3-fips.dualstack.us-west-2.mycorp.internal"));
+        assertEquals("dotted.name.bucket",
+                S3VirtualHostFilter.bucketBeforeS3Qualifier("dotted.name.bucket.s3.eu-west-1.custom.org"));
+        assertNull(S3VirtualHostFilter.bucketBeforeS3Qualifier("s3.us-east-1.floci.apps.mesirendon.com"));
+    }
+
+    @Test
+    void filterRewritesVirtualHostWithXForwardedHost() {
+        URI requestUri = URI.create("http://floci:4566/30388849b0eaef3dfba3aa83849d28987be6fb7920bdbf3233bdc8e966f73870.json");
+        UriInfo uriInfo = mock(UriInfo.class);
+        when(uriInfo.getRequestUri()).thenReturn(requestUri);
+        when(uriInfo.getQueryParameters()).thenReturn(new MultivaluedHashMap<>());
+        ContainerRequestContext ctx = mock(ContainerRequestContext.class);
+        when(ctx.getUriInfo()).thenReturn(uriInfo);
+        when(ctx.getHeaderString("Host")).thenReturn("floci:4566");
+        when(ctx.getHeaderString("X-Forwarded-Host")).thenReturn("cdk-assets-bucket.localhost:4566");
+
+        new S3VirtualHostFilter().filter(ctx);
+
+        ArgumentCaptor<URI> rewritten = ArgumentCaptor.forClass(URI.class);
+        verify(ctx).setRequestUri(rewritten.capture());
+        assertEquals("/cdk-assets-bucket/30388849b0eaef3dfba3aa83849d28987be6fb7920bdbf3233bdc8e966f73870.json",
+                rewritten.getValue().getRawPath());
+    }
+
+    @Test
+    void filterRewritesVirtualHostWithCustomDomainS3Qualifier() {
+        URI requestUri = URI.create("http://floci:4566/archive.zip");
+        UriInfo uriInfo = mock(UriInfo.class);
+        when(uriInfo.getRequestUri()).thenReturn(requestUri);
+        when(uriInfo.getQueryParameters()).thenReturn(new MultivaluedHashMap<>());
+        ContainerRequestContext ctx = mock(ContainerRequestContext.class);
+        when(ctx.getUriInfo()).thenReturn(uriInfo);
+        when(ctx.getHeaderString("Host")).thenReturn("custom-bucket.s3.us-east-1.floci.apps.mesirendon.com");
+
+        new S3VirtualHostFilter().filter(ctx);
+
+        ArgumentCaptor<URI> rewritten = ArgumentCaptor.forClass(URI.class);
+        verify(ctx).setRequestUri(rewritten.capture());
+        assertEquals("/custom-bucket/archive.zip", rewritten.getValue().getRawPath());
+    }
+
+    @Test
+    void filterRewritesUsingExistingBucketFallbackWhenSignedForS3() {
+        S3Service s3Service = mock(S3Service.class);
+        when(s3Service.bucketExists("existing-cdk-bucket")).thenReturn(true);
+        @SuppressWarnings("unchecked")
+        Instance<S3Service> s3ServiceInstance = mock(Instance.class);
+        when(s3ServiceInstance.isResolvable()).thenReturn(true);
+        when(s3ServiceInstance.get()).thenReturn(s3Service);
+
+        URI requestUri = URI.create("http://floci:4566/template.json");
+        UriInfo uriInfo = mock(UriInfo.class);
+        when(uriInfo.getRequestUri()).thenReturn(requestUri);
+        when(uriInfo.getQueryParameters()).thenReturn(new MultivaluedHashMap<>());
+        ContainerRequestContext ctx = mock(ContainerRequestContext.class);
+        when(ctx.getUriInfo()).thenReturn(uriInfo);
+        when(ctx.getHeaderString("Host")).thenReturn("existing-cdk-bucket.floci.apps.mesirendon.com");
+        when(ctx.getHeaderString("Authorization")).thenReturn(
+                "AWS4-HMAC-SHA256 Credential=test/20260914/us-east-1/s3/aws4_request, Signature=fake");
+
+        new S3VirtualHostFilter(s3ServiceInstance).filter(ctx);
+
+        ArgumentCaptor<URI> rewritten = ArgumentCaptor.forClass(URI.class);
+        verify(ctx).setRequestUri(rewritten.capture());
+        assertEquals("/existing-cdk-bucket/template.json", rewritten.getValue().getRawPath());
     }
 }

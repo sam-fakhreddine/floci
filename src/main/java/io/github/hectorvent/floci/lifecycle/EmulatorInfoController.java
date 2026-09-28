@@ -3,6 +3,8 @@ package io.github.hectorvent.floci.lifecycle;
 import io.github.hectorvent.floci.config.ContainerCaBundle;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.FlociCertificateAuthority;
+import io.github.hectorvent.floci.core.common.ContainerTeardown;
+import io.github.hectorvent.floci.core.common.ContainerTeardowns;
 import io.github.hectorvent.floci.core.common.ServiceRegistry;
 import io.github.hectorvent.floci.lifecycle.inithook.InitializationHook;
 import jakarta.inject.Inject;
@@ -11,6 +13,7 @@ import jakarta.ws.rs.Path;
 import jakarta.ws.rs.Produces;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
+import org.jboss.logging.Logger;
 
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.core.common.Resettable;
@@ -20,7 +23,9 @@ import jakarta.ws.rs.POST;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.security.GeneralSecurityException;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -28,12 +33,15 @@ import java.util.Optional;
 @Produces(MediaType.APPLICATION_JSON)
 public class EmulatorInfoController {
 
+    private static final Logger LOG = Logger.getLogger(EmulatorInfoController.class);
+
     private final ServiceRegistry serviceRegistry;
     private final InitLifecycleState initLifecycleState;
     private final String version;
 
     private final StorageFactory storageFactory;
     private final Instance<Resettable> resettables;
+    private final Instance<ContainerTeardown> containerTeardowns;
     private final FlociCertificateAuthority certificateAuthority;
     private final EmulatorConfig config;
 
@@ -42,12 +50,14 @@ public class EmulatorInfoController {
                                   InitLifecycleState initLifecycleState,
                                   StorageFactory storageFactory,
                                   Instance<Resettable> resettables,
+                                  Instance<ContainerTeardown> containerTeardowns,
                                   FlociCertificateAuthority certificateAuthority,
                                   EmulatorConfig config) {
         this.serviceRegistry = serviceRegistry;
         this.initLifecycleState = initLifecycleState;
         this.storageFactory = storageFactory;
         this.resettables = resettables;
+        this.containerTeardowns = containerTeardowns;
         this.certificateAuthority = certificateAuthority;
         this.config = config;
         this.version = resolveVersion();
@@ -145,11 +155,53 @@ public class EmulatorInfoController {
         return reset();
     }
 
-    private void performReset() {
-        for (Resettable r : resettables) {
-            r.clear();
+    private synchronized void performReset() {
+        // Resolve live instances before taking any storage locks. Serialize resets so one reset
+        // cannot resume a publisher while another is still wiping its storage.
+        List<Resettable> services = new ArrayList<>();
+        for (Resettable service : resettables) {
+            services.add(service);
         }
-        storageFactory.clearAll();
+        // Every service may refuse before the first destructive step, so a refusal changes nothing.
+        for (Resettable service : services) {
+            service.checkReset();
+        }
+        // Containers next: they are tracked independently of StorageBackend, so this can run
+        // in any order relative to the storage wipe below, but stopping them here means a
+        // client's reset actually reflects a clean slate instead of leaving Batch, CodeBuild,
+        // or SageMaker containers running with no record of them left in the store.
+        ContainerTeardowns.stopAll(containerTeardowns, LOG);
+        RuntimeException failure = null;
+        try {
+            for (Resettable service : services) {
+                service.beforeReset();
+            }
+            // Storage still precedes clear(): services recreate their bootstrap state there.
+            storageFactory.clearAll();
+            for (Resettable service : services) {
+                service.clear();
+            }
+        } catch (RuntimeException e) {
+            failure = e;
+        } finally {
+            // Every service, not only those whose beforeReset() ran: the teardowns above already
+            // shut down the pools that afterReset() restores, and a beforeReset() that throws
+            // would otherwise leave every later service with its pool terminated for good.
+            for (Resettable service : services.reversed()) {
+                try {
+                    service.afterReset();
+                } catch (RuntimeException e) {
+                    if (failure == null) {
+                        failure = e;
+                    } else {
+                        failure.addSuppressed(e);
+                    }
+                }
+            }
+        }
+        if (failure != null) {
+            throw failure;
+        }
     }
 
     static String resolveVersion() {

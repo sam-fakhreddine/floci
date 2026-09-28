@@ -2,14 +2,15 @@ package io.github.hectorvent.floci.services.stepfunctions;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationQueryHandler;
+import io.github.hectorvent.floci.services.dynamodb.DynamoDbFacade;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbJsonHandler;
-import io.github.hectorvent.floci.services.dynamodb.DynamoDbService;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ecs.EcsJsonHandler;
 import io.github.hectorvent.floci.services.ecs.EcsService;
 import io.github.hectorvent.floci.services.lambda.LambdaExecutorService;
 import io.github.hectorvent.floci.services.lambda.LambdaFunctionStore;
 import io.github.hectorvent.floci.services.s3.S3Service;
+import io.github.hectorvent.floci.services.sns.SnsJsonHandler;
 import io.github.hectorvent.floci.services.sqs.SqsJsonHandler;
 import io.github.hectorvent.floci.services.stepfunctions.model.Execution;
 import io.github.hectorvent.floci.services.stepfunctions.model.HistoryEvent;
@@ -45,9 +46,9 @@ class AslExecutorChoiceRuntimeTest {
         executor = new AslExecutor(
                 mock(LambdaExecutorService.class),
                 mock(LambdaFunctionStore.class),
-                mock(DynamoDbService.class),
+                mock(DynamoDbFacade.class),
                 mock(DynamoDbJsonHandler.class),
-                mock(SqsJsonHandler.class),
+                mock(SqsJsonHandler.class), mock(SnsJsonHandler.class),
                 mock(CloudFormationQueryHandler.class),
                 mock(Ec2Service.class),
                 mock(S3Service.class),
@@ -89,6 +90,54 @@ class AslExecutorChoiceRuntimeTest {
     void numericGreaterThanEqualsPath_routesToDefaultWhenFalse() {
         Execution exec = run(GTE_MACHINE, "{\"a\":2,\"b\":3}"); // 2 >= 3 is false -> Default -> FELL (Fail)
         assertEquals("FAILED", exec.getStatus());
+    }
+
+    @Test
+    void contextObjectVariableRoutesUsingOriginalExecutionInput() {
+        Execution exec = run("""
+                {
+                  "StartAt": "Pick",
+                  "States": {
+                    "Pick": {
+                      "Type": "Choice",
+                      "InputPath": "$.scoped",
+                      "Choices": [{
+                        "Variable": "$$.Execution.Input.token",
+                        "StringEquals": "keep",
+                        "Next": "TAKEN"
+                      }],
+                      "Default": "FELL"
+                    },
+                    "TAKEN": {"Type": "Pass", "End": true},
+                    "FELL": {"Type": "Fail", "Error": "FELL"}
+                  }
+                }
+                """, "{\"token\":\"keep\",\"scoped\":{\"token\":\"wrong\"}}");
+        assertEquals("SUCCEEDED", exec.getStatus());
+    }
+
+    @Test
+    void contextObjectPathOperandRoutesUsingOriginalExecutionInput() {
+        Execution exec = run("""
+                {
+                  "StartAt": "Pick",
+                  "States": {
+                    "Pick": {
+                      "Type": "Choice",
+                      "InputPath": "$.scoped",
+                      "Choices": [{
+                        "Variable": "$.district_id",
+                        "StringEqualsPath": "$$.Execution.Input.expected_district_id",
+                        "Next": "TAKEN"
+                      }],
+                      "Default": "FELL"
+                    },
+                    "TAKEN": {"Type": "Pass", "End": true},
+                    "FELL": {"Type": "Fail", "Error": "FELL"}
+                  }
+                }
+                """, "{\"expected_district_id\":\"42\",\"scoped\":{\"district_id\":\"42\"}}");
+        assertEquals("SUCCEEDED", exec.getStatus());
     }
 
     @Test

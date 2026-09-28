@@ -6,7 +6,13 @@ import com.fasterxml.jackson.databind.node.MissingNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.services.batch.BatchService;
+import io.github.hectorvent.floci.services.ecs.EcsJsonHandler;
+import io.github.hectorvent.floci.services.ecs.EcsService;
+import io.github.hectorvent.floci.services.ecs.model.ContainerOverride;
+import io.github.hectorvent.floci.services.ecs.model.LaunchType;
+import io.github.hectorvent.floci.services.eventbridge.model.EcsParameters;
 import io.github.hectorvent.floci.services.eventbridge.model.InputTransformer;
 import io.github.hectorvent.floci.services.eventbridge.model.Target;
 import io.github.hectorvent.floci.services.firehose.FirehoseService;
@@ -15,6 +21,7 @@ import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.sns.SnsService;
 import io.github.hectorvent.floci.services.sqs.SqsService;
+import io.github.hectorvent.floci.services.stepfunctions.StepFunctionsService;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -40,6 +47,9 @@ public class EventBridgeInvoker {
     private final BatchService batchService;
     private final FirehoseService firehoseService;
     private final EventBridgeService eventBridgeService;
+    private final EcsService ecsService;
+    private final EcsJsonHandler ecsJsonHandler;
+    private final StepFunctionsService stepFunctionsService;
     private final RegionResolver regionResolver;
     private final ObjectMapper objectMapper;
     private final String baseUrl;
@@ -51,6 +61,9 @@ public class EventBridgeInvoker {
                               BatchService batchService,
                               FirehoseService firehoseService,
                               EventBridgeService eventBridgeService,
+                              EcsService ecsService,
+                              EcsJsonHandler ecsJsonHandler,
+                              StepFunctionsService stepFunctionsService,
                               RegionResolver regionResolver,
                               ObjectMapper objectMapper,
                               EmulatorConfig config) {
@@ -60,6 +73,9 @@ public class EventBridgeInvoker {
         this.batchService = batchService;
         this.firehoseService = firehoseService;
         this.eventBridgeService = eventBridgeService;
+        this.ecsService = ecsService;
+        this.ecsJsonHandler = ecsJsonHandler;
+        this.stepFunctionsService = stepFunctionsService;
         this.regionResolver = regionResolver;
         this.objectMapper = objectMapper;
         this.baseUrl = config.baseUrl();
@@ -71,8 +87,8 @@ public class EventBridgeInvoker {
                        ObjectMapper objectMapper,
                        EmulatorConfig config) {
         this(lambdaService, sqsService, snsService,
-                null /* batch */, null /* firehose */, null /* eventBridge */, null /* regionResolver */,
-                objectMapper, config);
+                null /* batch */, null /* firehose */, null /* eventBridge */, null /* ecs */,
+                null /* ecsJsonHandler */, null /* stepFunctions */, null /* regionResolver */, objectMapper, config);
     }
 
     public void invokeTarget(Target target, String eventJson, String region) {
@@ -87,7 +103,7 @@ public class EventBridgeInvoker {
         } else {
             payload = eventJson;
         }
-        
+
         try {
             if (arn.contains(":lambda:") || arn.contains(":function:")) {
                 lambdaService.invokeArn(arn, payload.getBytes(), InvocationType.Event);
@@ -117,17 +133,40 @@ public class EventBridgeInvoker {
                         targetRegion
                 );
                 LOG.debugv("EventBridge delivered to Batch: {0}", arn);
+            } else if (arn.contains(":ecs:") && arn.contains(":cluster/")) {
+                if (ecsService == null || target.getEcsParameters() == null) {
+                    LOG.warnv("EventBridge ECS target missing ECS service or EcsParameters: {0}", arn);
+                    return;
+                }
+                String targetRegion = extractRegionFromArn(arn, region);
+                boolean inputOverridden = target.getInput() != null
+                        || target.getInputPath() != null
+                        || target.getInputTransformer() != null;
+                deliverToEcsRunTask(target, payload, inputOverridden, targetRegion);
+                LOG.debugv("EventBridge delivered to ECS RunTask: {0}", arn);
             } else if (arn.contains(":firehose:") && arn.contains(":deliverystream/")) {
                 if (firehoseService == null) {
                     LOG.warnv("EventBridge Firehose target missing Firehose service: {0}", arn);
                     return;
                 }
-                String streamName = arn.substring(
-                        arn.indexOf(":deliverystream/") + ":deliverystream/".length());
+                AwsArnUtils.Arn streamArn = AwsArnUtils.parse(arn);
+                String streamName = streamArn.resource().substring("deliverystream/".length());
                 // AWS puts the (input-transformed) event JSON as the record Data verbatim,
                 // without appending a newline; the delivery-side NDJSON flush handles separation.
-                firehoseService.putRecord(streamName, new Record(payload.getBytes(StandardCharsets.UTF_8)));
+                Record record = new Record(payload.getBytes(StandardCharsets.UTF_8));
+                if (regionResolver == null || regionResolver.getRegion() == null) {
+                    // Preserve the standalone/test mode where no request ownership context exists.
+                    firehoseService.putRecord(streamName, record);
+                } else {
+                    firehoseService.putRecord(streamArn.accountId(), streamArn.region(), streamName, record);
+                }
                 LOG.debugv("EventBridge delivered to Firehose: {0}", arn);
+            } else if (isStateMachineArn(arn)) {
+                String targetRegion = extractRegionFromArn(arn, region);
+                String targetAccount = AwsArnUtils.parse(arn).accountId();
+                RequestScopes.runAs(targetAccount,
+                        () -> stepFunctionsService.startExecution(arn, null, payload, targetRegion));
+                LOG.debugv("EventBridge started Step Functions execution: {0}", arn);
             } else if (arn.contains(":events:") && arn.contains(":event-bus/")) {
                 if (eventBridgeService == null) {
                     LOG.warnv("EventBridge event-bus target missing EventBridge service: {0}", arn);
@@ -210,6 +249,68 @@ public class EventBridgeInvoker {
         } catch (Exception e) {
             LOG.warnv("EventBridge failed to deliver to target {0}: {1}", arn, e.getMessage());
         }
+    }
+
+    /**
+     * AWS maps an ECS target's (input-transformed) payload 1-to-1 onto the RunTask
+     * {@code TaskOverride} structure. Floci's override model only carries
+     * {@code containerOverrides}, so that member is parsed out and passed through; a
+     * payload that isn't the input-transformed shape (no Input/InputPath/InputTransformer
+     * configured) or isn't parseable as JSON launches the task without overrides, matching
+     * the documented no-override case rather than failing the whole delivery.
+     */
+    private void deliverToEcsRunTask(Target target, String payload, boolean inputOverridden, String region) {
+        EcsParameters ecs = target.getEcsParameters();
+        List<ContainerOverride> containerOverrides = List.of();
+        if (inputOverridden) {
+            try {
+                containerOverrides = ecsJsonHandler.parseContainerOverrides(
+                        objectMapper.readTree(payload).path("containerOverrides"));
+            } catch (Exception e) {
+                LOG.warnv("EventBridge ECS target {0} InputTransformer output is not a valid TaskOverride, "
+                        + "launching without container overrides: {1}", target.getArn(), e.getMessage());
+            }
+        }
+        ecsService.runTask(
+                target.getArn(),
+                ecs.getTaskDefinitionArn(),
+                ecs.getTaskCount() != null ? ecs.getTaskCount() : 1,
+                parseLaunchType(ecs.getLaunchType()),
+                null,
+                ecs.getGroup() != null ? ecs.getGroup() : "eventbridge",
+                containerOverrides,
+                ecsNetworkConfiguration(ecs.getNetworkConfiguration()),
+                region);
+    }
+
+    private static LaunchType parseLaunchType(String launchType) {
+        if (launchType == null || launchType.isBlank()) {
+            return null;
+        }
+        try {
+            return LaunchType.valueOf(launchType);
+        } catch (IllegalArgumentException e) {
+            LOG.warnv("EventBridge: unsupported ECS LaunchType: {0}", launchType);
+            return null;
+        }
+    }
+
+    private static io.github.hectorvent.floci.services.ecs.model.NetworkConfiguration ecsNetworkConfiguration(
+            io.github.hectorvent.floci.services.eventbridge.model.NetworkConfiguration source) {
+        if (source == null || source.getAwsvpcConfiguration() == null) {
+            return null;
+        }
+        io.github.hectorvent.floci.services.eventbridge.model.AwsVpcConfiguration sourceVpc = source.getAwsvpcConfiguration();
+        io.github.hectorvent.floci.services.ecs.model.AwsVpcConfiguration targetVpc =
+                new io.github.hectorvent.floci.services.ecs.model.AwsVpcConfiguration();
+        targetVpc.setSubnets(sourceVpc.getSubnets());
+        targetVpc.setSecurityGroups(sourceVpc.getSecurityGroups());
+        targetVpc.setAssignPublicIp(sourceVpc.getAssignPublicIp());
+
+        io.github.hectorvent.floci.services.ecs.model.NetworkConfiguration target =
+                new io.github.hectorvent.floci.services.ecs.model.NetworkConfiguration();
+        target.setAwsvpcConfiguration(targetVpc);
+        return target;
     }
 
     String applyInputPath(String inputPath, String eventJson) {
@@ -333,5 +434,14 @@ public class EventBridgeInvoker {
 
     private static String extractRegionFromArn(String arn, String defaultRegion) {
         return AwsArnUtils.regionOrDefault(arn, defaultRegion);
+    }
+
+    private static boolean isStateMachineArn(String arn) {
+        if (!AwsArnUtils.isArnFor(arn, "states")) {
+            return false;
+        }
+        String resource = AwsArnUtils.parse(arn).resource();
+        String prefix = "stateMachine:";
+        return resource.startsWith(prefix) && resource.indexOf(':', prefix.length()) < 0;
     }
 }

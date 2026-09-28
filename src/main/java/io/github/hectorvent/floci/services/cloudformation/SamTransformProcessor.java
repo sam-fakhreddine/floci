@@ -148,7 +148,7 @@ class SamTransformProcessor {
         return template.path("Globals");
     }
 
-    private record ApiRoute(String functionLogicalId, String path, String httpMethod) {}
+    private record ApiRoute(String functionLogicalId, String path, String httpMethod, String authorizerName) {}
 
     private List<ApiRoute> collectApiRoutes(List<String> samLogicalIds, JsonNode resources) {
         List<ApiRoute> routes = new ArrayList<>();
@@ -178,7 +178,8 @@ class SamTransformProcessor {
                 }
                 JsonNode methodNode = p.path("Method");
                 String method = methodNode.isTextual() ? methodNode.asText() : "ANY";
-                routes.add(new ApiRoute(logicalId, pathNode.asText(), method));
+                String authorizerName = p.path("Auth").path("Authorizer").asText(null);
+                routes.add(new ApiRoute(logicalId, pathNode.asText(), method, authorizerName));
             }
         }
         return routes;
@@ -470,7 +471,7 @@ class SamTransformProcessor {
     /**
      * Resolves the SAM authorizer's {@code IdentitySource}, accepting either the documented array
      * form or a single scalar string — mirroring
-     * {@code CloudFormationResourceProvisioner.resolveIdentitySource}, since the raw
+     * the {@code AWS::ApiGatewayV2::Authorizer} provisioner's own IdentitySource parsing, since the raw
      * {@code AWS::ApiGatewayV2::Authorizer} resource this expands to accepts both. SAM itself
      * rejects a JWT authorizer with no {@code IdentitySource} ({@code _validate_jwt_authorizer} in
      * samtranslator/model/apigatewayv2.py), so an absent or empty value is a template error here
@@ -546,6 +547,150 @@ class SamTransformProcessor {
         resources.set(permissionLogicalId, perm);
     }
 
+    private Map<String, String> expandImplicitRestApiAuthorizers(String apiId, JsonNode auth,
+                                                                   ObjectNode resources) {
+        Map<String, String> logicalIds = new java.util.LinkedHashMap<>();
+        JsonNode authorizers = auth.path("Authorizers");
+        if (authorizers.isTextual()) {
+            if (!"AWS_IAM".equals(authorizers.asText())) {
+                throw new AwsException("ValidationError",
+                        "SAM Api Auth.Authorizers must be AWS_IAM or an authorizer map.", 400);
+            }
+            return logicalIds;
+        }
+        if (!authorizers.isObject()) {
+            return logicalIds;
+        }
+        Iterator<Map.Entry<String, JsonNode>> it = authorizers.fields();
+        while (it.hasNext()) {
+            Map.Entry<String, JsonNode> entry = it.next();
+            String name = entry.getKey();
+            JsonNode config = entry.getValue();
+            if (config.has("UserPoolArn")
+                    || "COGNITO_USER_POOLS".equals(config.path("AuthType").asText())) {
+                throw new AwsException("ValidationError",
+                        "SAM implicit REST API authorizer " + name
+                                + " configures a Cognito user pool authorizer, which Floci does not "
+                                + "support for SAM implicit REST APIs yet.", 400);
+            }
+            String payloadType = config.path("FunctionPayloadType").asText("TOKEN");
+            if (!"REQUEST".equals(payloadType)) {
+                throw new AwsException("ValidationError",
+                        "SAM implicit REST API authorizer " + name + " uses unsupported FunctionPayloadType "
+                                + payloadType + "; Floci currently supports REQUEST authorizers only.", 400);
+            }
+            JsonNode functionArn = config.get("FunctionArn");
+            if (functionArn == null || functionArn.isNull() || functionArn.isMissingNode()) {
+                throw new AwsException("ValidationError",
+                        "SAM REQUEST authorizer " + name + " must define FunctionArn.", 400);
+            }
+            JsonNode identity = config.path("Identity");
+            if (!identity.isObject()) {
+                throw new AwsException("ValidationError",
+                        "SAM REQUEST authorizer " + name + " must define Identity.", 400);
+            }
+            if (config.has("FunctionInvokeRole") && !config.path("FunctionInvokeRole").isNull()) {
+                throw new AwsException("ValidationError",
+                        "SAM REQUEST authorizer " + name + " uses FunctionInvokeRole, which Floci does not "
+                                + "model yet; refusing to drop authorizer credentials silently.", 400);
+            }
+
+            String logicalId = uniqueId(apiId + sanitize(name) + "Authorizer", resources);
+            ObjectNode def = objectMapper.createObjectNode();
+            def.put("Type", "AWS::ApiGateway::Authorizer");
+            ObjectNode props = objectMapper.createObjectNode();
+            props.set("RestApiId", ref(apiId));
+            props.put("Name", name);
+            props.put("Type", "REQUEST");
+            props.set("AuthorizerUri", authorizerInvokeUri(functionArn));
+
+            String identitySource = requestAuthorizerIdentitySource(identity);
+            if (identitySource != null) {
+                props.put("IdentitySource", identitySource);
+            }
+            JsonNode reauthorizeEvery = identity.path("ReauthorizeEvery");
+            if (!reauthorizeEvery.isMissingNode() && !reauthorizeEvery.isNull()) {
+                if (!reauthorizeEvery.isIntegralNumber()
+                        || reauthorizeEvery.asInt() < 0 || reauthorizeEvery.asInt() > 3600) {
+                    throw new AwsException("ValidationError",
+                            "SAM REQUEST authorizer " + name
+                                    + " Identity.ReauthorizeEvery must be an integer from 0 to 3600.", 400);
+                }
+                props.set("AuthorizerResultTtlInSeconds", reauthorizeEvery.deepCopy());
+            }
+            def.set("Properties", props);
+            resources.set(logicalId, def);
+            logicalIds.put(name, logicalId);
+
+            if (!config.path("DisableFunctionDefaultPermissions").asBoolean(false)) {
+                ObjectNode permission = objectMapper.createObjectNode();
+                permission.put("Type", "AWS::Lambda::Permission");
+                ObjectNode permissionProps = objectMapper.createObjectNode();
+                permissionProps.set("FunctionName", functionArn.deepCopy());
+                permissionProps.put("Action", "lambda:InvokeFunction");
+                permissionProps.put("Principal", "apigateway.amazonaws.com");
+                permission.set("Properties", permissionProps);
+                resources.set(uniqueId(logicalId + "Permission", resources), permission);
+            }
+        }
+        return logicalIds;
+    }
+
+    private String requestAuthorizerIdentitySource(JsonNode identity) {
+        if (!identity.isObject()) {
+            return null;
+        }
+        List<String> sources = new ArrayList<>();
+        appendIdentitySources(identity.path("Headers"), "method.request.header.", sources);
+        appendIdentitySources(identity.path("QueryStrings"), "method.request.querystring.", sources);
+        appendIdentitySources(identity.path("StageVariables"), "stageVariables.", sources);
+        appendIdentitySources(identity.path("Context"), "context.", sources);
+        return sources.isEmpty() ? null : String.join(",", sources);
+    }
+
+    private void appendIdentitySources(JsonNode values, String prefix, List<String> target) {
+        if (!values.isArray()) {
+            return;
+        }
+        for (JsonNode value : values) {
+            if (value.isTextual() && !value.asText().isBlank()) {
+                target.add(prefix + value.asText());
+            }
+        }
+    }
+
+    private ObjectNode authorizerInvokeUri(JsonNode functionArn) {
+        ObjectNode sub = objectMapper.createObjectNode();
+        ArrayNode args = objectMapper.createArrayNode();
+        args.add("arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthorizerArn}/invocations");
+        ObjectNode vars = objectMapper.createObjectNode();
+        vars.set("AuthorizerArn", functionArn.deepCopy());
+        args.add(vars);
+        sub.set("Fn::Sub", args);
+        return sub;
+    }
+
+    private void applyImplicitRestApiAuthorization(ObjectNode methodProperties, String requestedAuthorizer,
+                                                   String defaultAuthorizer,
+                                                   Map<String, String> authorizerLogicalIds) {
+        String effective = requestedAuthorizer != null ? requestedAuthorizer : defaultAuthorizer;
+        if (effective == null || "NONE".equals(effective)) {
+            methodProperties.put("AuthorizationType", "NONE");
+            return;
+        }
+        if ("AWS_IAM".equals(effective)) {
+            methodProperties.put("AuthorizationType", "AWS_IAM");
+            return;
+        }
+        String logicalId = authorizerLogicalIds.get(effective);
+        if (logicalId == null) {
+            throw new AwsException("ValidationError",
+                    "SAM Api authorizer '" + effective + "' is not defined in Auth.Authorizers.", 400);
+        }
+        methodProperties.put("AuthorizationType", "CUSTOM");
+        methodProperties.set("AuthorizerId", ref(logicalId));
+    }
+
     private void generateImplicitApi(List<ApiRoute> routes, JsonNode globals, ObjectNode resources) {
         // Collision-safe: reuse "ServerlessRestApi" when free, otherwise a suffixed id, so an existing
         // resource with that logical id is never silently overwritten.
@@ -563,6 +708,20 @@ class SamTransformProcessor {
         api.set("Properties", apiProps);
         resources.set(apiId, api);
 
+        JsonNode auth = globals.path("Api").path("Auth");
+        Map<String, String> authorizerLogicalIds = expandImplicitRestApiAuthorizers(apiId, auth, resources);
+        String defaultAuthorizer = auth.path("DefaultAuthorizer").asText(null);
+        if (defaultAuthorizer == null && auth.path("Authorizers").isTextual()
+                && "AWS_IAM".equals(auth.path("Authorizers").asText())) {
+            defaultAuthorizer = "AWS_IAM";
+        }
+        if (defaultAuthorizer != null && !"AWS_IAM".equals(defaultAuthorizer)
+                && !"NONE".equals(defaultAuthorizer)
+                && !authorizerLogicalIds.containsKey(defaultAuthorizer)) {
+            throw new AwsException("ValidationError",
+                    "SAM Api authorizer '" + defaultAuthorizer + "' is not defined in Auth.Authorizers.", 400);
+        }
+
         Map<String, String> pathToResource = new java.util.LinkedHashMap<>();
         List<String> methodIds = new ArrayList<>();
         java.util.Set<String> permissionFns = new java.util.LinkedHashSet<>();
@@ -575,14 +734,15 @@ class SamTransformProcessor {
             }
             String resourceId = ensureResourcePath(apiId, r.path(), pathToResource, resources);
 
-            String methodLogicalId = uniqueId(apiId + "Method" + sanitize(r.path()) + capitalize(method.toLowerCase()), resources);
+            String methodLogicalId = uniqueId(
+                    apiId + "Method" + sanitize(r.path()) + capitalize(method.toLowerCase()), resources);
             ObjectNode m = objectMapper.createObjectNode();
             m.put("Type", "AWS::ApiGateway::Method");
             ObjectNode mp = objectMapper.createObjectNode();
             mp.set("RestApiId", ref(apiId));
             mp.set("ResourceId", resourceId == null ? getAtt(apiId, "RootResourceId") : ref(resourceId));
             mp.put("HttpMethod", method);
-            mp.put("AuthorizationType", "NONE");
+            applyImplicitRestApiAuthorization(mp, r.authorizerName(), defaultAuthorizer, authorizerLogicalIds);
             ObjectNode integ = objectMapper.createObjectNode();
             integ.put("Type", "AWS_PROXY");
             integ.put("IntegrationHttpMethod", "POST");
@@ -678,7 +838,7 @@ class SamTransformProcessor {
     private ObjectNode lambdaInvokeUri(String functionLogicalId) {
         ObjectNode sub = objectMapper.createObjectNode();
         ArrayNode arr = objectMapper.createArrayNode();
-        arr.add("arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FnArn}/invocations");
+        arr.add("arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FnArn}/invocations");
         ObjectNode vars = objectMapper.createObjectNode();
         vars.set("FnArn", getAtt(functionLogicalId, "Arn"));
         arr.add(vars);
@@ -855,7 +1015,9 @@ class SamTransformProcessor {
         roleProps.set("AssumeRolePolicyDocument", assumePolicy);
 
         ArrayNode managedPolicies = objectMapper.createArrayNode();
-        managedPolicies.add("arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole");
+        ObjectNode basicExecutionRole = objectMapper.createObjectNode();
+        basicExecutionRole.put("Fn::Sub", "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole");
+        managedPolicies.add(basicExecutionRole);
 
         JsonNode userPolicies = properties.path("Policies");
         if (userPolicies.isArray()) {
@@ -1068,6 +1230,12 @@ class SamTransformProcessor {
     }
 
     private void expandServerlessApi(String logicalId, JsonNode properties, ObjectNode resources) {
+        JsonNode auth = properties.path("Auth");
+        if (auth.isObject() && !auth.isEmpty()) {
+            throw new AwsException("ValidationError",
+                    "SAM AWS::Serverless::Api Auth is not supported for explicit REST APIs yet; "
+                            + "Floci refuses to drop the authorization configuration silently.", 400);
+        }
         resources.remove(logicalId);
 
         ObjectNode apiDef = objectMapper.createObjectNode();
@@ -1205,7 +1373,7 @@ class SamTransformProcessor {
     /**
      * Converts SAM's string-to-string {@code Tags} map into the {@code {Key, Value}} list
      * {@code AWS::StepFunctions::StateMachine} reads (see {@code parseCfnTags} in
-     * {@code CloudFormationResourceProvisioner}, which returns an empty set for anything that is
+     * {@code StepFunctionsCfnProvisioner}, which returns an empty set for anything that is
      * not an array; a verbatim map copy would silently tag nothing). Emitted unconditionally,
      * even for an absent or empty {@code Tags} map: measured against real AWS, us-east-1, a
      * change set's Processed template for a state machine with no source {@code Tags} declared

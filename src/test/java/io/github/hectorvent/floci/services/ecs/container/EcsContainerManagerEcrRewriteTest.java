@@ -14,6 +14,7 @@ import io.github.hectorvent.floci.services.ecs.model.ContainerDefinition;
 import io.github.hectorvent.floci.services.ecs.model.EcsTask;
 import io.github.hectorvent.floci.services.ecs.model.TaskDefinition;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
+import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.ssm.SsmService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -48,7 +49,7 @@ import static org.mockito.Mockito.when;
 class EcsContainerManagerEcrRewriteTest {
 
     private static final String ECR_IMAGE = "123456789012.dkr.ecr.us-east-1.amazonaws.com/backend-user:1";
-    private static final String REWRITTEN_IMAGE = "123456789012.dkr.ecr.us-east-1.localhost:5100/backend-user:1";
+    private static final String REWRITTEN_IMAGE = "123456789012.dkr.ecr.us-east-1.localhost:4566/backend-user:1";
 
     private ContainerBuilder containerBuilder;
     private ContainerLifecycleManager lifecycleManager;
@@ -79,8 +80,8 @@ class EcsContainerManagerEcrRewriteTest {
         when(ecrRegistryManager.rewriteImageUri("sidecar:latest")).thenReturn("sidecar:latest");
 
         manager = new EcsContainerManager(containerBuilder, lifecycleManager, logStreamer,
-                containerDetector, config, regionResolver, awsEnv, ssmService, secretsManagerService,
-                ecrRegistryManager);
+                containerDetector, config, regionResolver, awsEnv, ssmService, secretsManagerService, mock(S3Service.class),
+                ecrRegistryManager, mock(HostVolumePolicy.class));
     }
 
     @Test

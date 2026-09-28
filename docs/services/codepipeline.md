@@ -22,6 +22,30 @@ state use Floci's configured storage backend.
 Stages execute in declaration order. Actions with the same `runOrder` execute in parallel.
 `SUPERSEDED`, `QUEUED`, and `PARALLEL` execution modes are recognized, with `QUEUED` and
 `PARALLEL` restricted to V2 pipelines.
+A `QUEUED` or `PARALLEL` pipeline holds at most 50 active executions, as on AWS;
+`StartPipelineExecution` beyond that returns `ConcurrentPipelineExecutionsLimitExceededException`.
+
+S3 source actions poll for source changes by default, matching AWS when `PollForSourceChanges` is
+omitted or set to `true`. Floci establishes a baseline for the configured object and starts one new
+execution when its version ID or ETag changes, recording `PollForSourceChanges` as the execution
+trigger. Set `PollForSourceChanges` to `false` to disable this polling path.
+
+`RetryStageExecution` resumes the same pipeline execution at a failed stage. `FAILED_ACTIONS`
+reruns failed or not-yet-started actions while preserving successful actions; `ALL_ACTIONS` reruns
+the complete stage. Runtime artifacts from failed executions are retained for the retry until a newer
+execution fails the same stage, and a successful retry continues with the stages that follow rather
+than restarting from the source.
+A retried execution counts toward the `QUEUED`/`PARALLEL` active-execution limit, and a second retry of
+the same execution while it is still running, including while sibling actions of a failed action
+finish, returns `ConflictException`.
+
+S3 source actions resolve `sourceRevisions` from the object actually consumed by the execution.
+Unversioned objects report their ETag as the revision ID; versioned objects report the version ID.
+`StartPipelineExecution.sourceRevisions` is treated as an override, including supported S3 object-key
+and version-ID overrides, rather than being copied directly into execution history.
+Resolved revisions appear in `ListPipelineExecutions` summaries, as on AWS. `RollbackStage` reruns
+with the object key and version ID the target execution consumed, so rolling back redeploys that
+version rather than the latest upload.
 
 The following providers execute against local Floci services:
 
@@ -54,6 +78,7 @@ as `Approved` or `Rejected`, limits `result.summary` to 512 characters, returns
 | `FLOCI_SERVICES_CODEPIPELINE_ENABLED` | `true` | Enables the CodePipeline API |
 | `FLOCI_STORAGE_SERVICES_CODEPIPELINE_MODE` | global mode | Overrides CodePipeline storage mode |
 | `FLOCI_STORAGE_SERVICES_CODEPIPELINE_FLUSH_INTERVAL_MS` | `5000` | Hybrid storage flush interval |
+| `FLOCI_SERVICES_CODEPIPELINE_SOURCE_POLL_INTERVAL_MS` | `500` | How often (ms) S3 sources are polled for a new object revision |
 
 ## Example
 

@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.iam;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.services.iam.model.CallerContext;
 import io.github.hectorvent.floci.services.iam.model.PolicyStatement;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -13,6 +14,9 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Evaluates IAM policy documents against a requested action and resource.
@@ -38,7 +42,23 @@ import java.util.Map;
 @ApplicationScoped
 public class IamPolicyEvaluator {
 
+    /** An account's root principal ({@code arn:<partition>:iam::<account>:root}) in any partition. */
+    private static final Pattern ROOT_PRINCIPAL_ARN =
+            Pattern.compile("arn:" + AwsArnUtils.PARTITION_REGEX + ":iam::\\d{12}:root");
+
     public enum Decision { ALLOW, DENY }
+
+    public enum ResourcePolicyDecision {
+        ALLOW,
+        ALLOW_DIRECT_IAM_USER,
+        EXPLICIT_DENY,
+        NEUTRAL
+    }
+
+    public enum ResourceAccountRelationship {
+        SAME_ACCOUNT,
+        CROSS_ACCOUNT
+    }
 
     public enum SimulationDecision {
         ALLOWED("allowed"),
@@ -58,7 +78,18 @@ public class IamPolicyEvaluator {
 
     private static final Logger LOG = Logger.getLogger(IamPolicyEvaluator.class);
 
+    // Parsing is a pure function of the document text, so entries never go stale. The bound
+    // only guards against growth from many distinct session policies.
+    static final int MAX_CACHED_DOCUMENTS = 2048;
+
+    // Matches an IAM policy variable such as ${aws:username} inside a Resource pattern or a
+    // Condition value. Stops at the first ',' or '}' so a default value (${key, 'default'}),
+    // whose default may itself contain '{{' / '}}' placeholder markers, doesn't get swept into
+    // the captured key name.
+    private static final Pattern POLICY_VARIABLE = Pattern.compile("\\$\\{\\s*([^,}]+?)\\s*[,}]");
+
     private final ObjectMapper objectMapper;
+    private final ConcurrentHashMap<String, CachedDocument> cachedDocuments = new ConcurrentHashMap<>();
 
     @Inject
     public IamPolicyEvaluator(ObjectMapper objectMapper) {
@@ -72,7 +103,7 @@ public class IamPolicyEvaluator {
      * @param resourcePolicies resource-based policy documents (Phase 2); may be null or empty
      * @param action        IAM action, e.g. "s3:GetObject"
      * @param resource      resource ARN, e.g. "arn:aws:s3:::my-bucket/key"
-     * @param conditionCtx  condition context key → values; may be null or empty
+     * @param conditionCtx  condition context key -> values; may be null or empty
      * @return {@link Decision#ALLOW} or {@link Decision#DENY}
      */
     public Decision evaluate(CallerContext caller,
@@ -80,14 +111,110 @@ public class IamPolicyEvaluator {
                              String action,
                              String resource,
                              Map<String, List<String>> conditionCtx) {
-        Map<String, List<String>> ctx = normalizeConditionContext(conditionCtx);
+        String principalArn = caller != null ? caller.principalArn() : null;
+        ResourcePolicyDecision resourceDecision = evaluateResourcePolicy(
+                resourcePolicies, principalArn, action, resource, conditionCtx);
+        return evaluateResolvedResourcePolicy(
+                caller, resourceDecision, ResourceAccountRelationship.SAME_ACCOUNT, action, resource, conditionCtx);
+    }
 
+    /**
+     * Evaluates an already principal-filtered resource-policy decision together with the
+     * caller's identity policies and permission ceilings.
+     */
+    public Decision evaluateResolvedResourcePolicy(
+            CallerContext caller,
+            ResourcePolicyDecision resourcePolicyDecision,
+            String action,
+            String resource,
+            Map<String, List<String>> conditionCtx) {
+        return evaluateResolvedResourcePolicy(
+                caller,
+                resourcePolicyDecision,
+                ResourceAccountRelationship.SAME_ACCOUNT,
+                action,
+                resource,
+                conditionCtx);
+    }
+
+    /**
+     * Evaluates a principal-filtered resource policy with the caller/resource account relationship.
+     * Cross-account access requires both identity and resource policy allows. A same-account resource
+     * policy that directly names an IAM user ARN is not limited by an implicit permissions-boundary
+     * deny, although every explicit deny still wins.
+     */
+    public Decision evaluateResolvedResourcePolicy(
+            CallerContext caller,
+            ResourcePolicyDecision resourcePolicyDecision,
+            ResourceAccountRelationship accountRelationship,
+            String action,
+            String resource,
+            Map<String, List<String>> conditionCtx) {
+        Map<String, List<String>> ctx = normalizeConditionContext(conditionCtx);
         List<PolicyStatement> identityStmts = parseAll(caller.identityPolicies());
-        List<PolicyStatement> resourceStmts = resourcePolicies == null ? List.of() : parseAll(resourcePolicies);
-        List<PolicyStatement> sessionStmts  = caller.sessionPolicyDocument() == null
+        List<PolicyStatement> sessionStmts = caller.sessionPolicyDocument() == null
                 ? null : parseAll(List.of(caller.sessionPolicyDocument()));
         List<PolicyStatement> boundaryStmts = caller.boundaryPolicyDocument() == null
                 ? null : parseAll(List.of(caller.boundaryPolicyDocument()));
+        ResourcePolicyDecision resolvedDecision = resourcePolicyDecision == null
+                ? ResourcePolicyDecision.NEUTRAL : resourcePolicyDecision;
+        return evaluateParsed(
+                caller, identityStmts, sessionStmts, boundaryStmts,
+                resolvedDecision == ResourcePolicyDecision.EXPLICIT_DENY,
+                resolvedDecision == ResourcePolicyDecision.ALLOW
+                        || resolvedDecision == ResourcePolicyDecision.ALLOW_DIRECT_IAM_USER,
+                resolvedDecision == ResourcePolicyDecision.ALLOW_DIRECT_IAM_USER,
+                accountRelationship == null
+                        ? ResourceAccountRelationship.CROSS_ACCOUNT : accountRelationship,
+                lowercase(action), resource, ctx);
+    }
+
+    /**
+     * Evaluates a resource-based policy standalone for a given caller principal, action,
+     * and resource.
+     */
+    public ResourcePolicyDecision evaluateResourcePolicy(
+            List<String> resourcePolicies,
+            String principalArn,
+            String action,
+            String resource,
+            Map<String, List<String>> conditionCtx) {
+        if (resourcePolicies == null || resourcePolicies.isEmpty()) {
+            return ResourcePolicyDecision.NEUTRAL;
+        }
+        Map<String, List<String>> ctx = normalizeConditionContext(conditionCtx);
+        if (principalArn == null && ctx.containsKey("aws:principalarn")) {
+            List<String> principalArns = ctx.get("aws:principalarn");
+            if (principalArns != null && !principalArns.isEmpty()) {
+                principalArn = principalArns.getFirst();
+            }
+        }
+        String loweredAction = lowercase(action);
+        List<PolicyStatement> stmts = parseAll(resourcePolicies);
+        if (anyResourceExplicitDeny(stmts, principalArn, loweredAction, resource, ctx)) {
+            return ResourcePolicyDecision.EXPLICIT_DENY;
+        }
+        if (anyResourceDirectIamUserAllow(stmts, principalArn, loweredAction, resource, ctx)) {
+            return ResourcePolicyDecision.ALLOW_DIRECT_IAM_USER;
+        }
+        if (anyResourceExplicitAllow(stmts, principalArn, loweredAction, resource, ctx)) {
+            return ResourcePolicyDecision.ALLOW;
+        }
+        return ResourcePolicyDecision.NEUTRAL;
+    }
+
+    private Decision evaluateParsed(
+            CallerContext caller,
+            List<PolicyStatement> identityStmts,
+            List<PolicyStatement> sessionStmts,
+            List<PolicyStatement> boundaryStmts,
+            boolean resourceExplicitDeny,
+            boolean resourceAllow,
+            boolean directIamUserResourceAllow,
+            ResourceAccountRelationship accountRelationship,
+            String action,
+            String resource,
+            Map<String, List<String>> ctx) {
 
         // 0. Service control policies gate everything: the action must be allowed at EVERY
         //    organization level and explicitly denied at none, before identity policies are
@@ -99,16 +226,20 @@ public class IamPolicyEvaluator {
 
         // 1. Explicit deny in ANY policy → DENY immediately
         if (anyExplicitDeny(identityStmts, action, resource, ctx)
-                || anyExplicitDeny(resourceStmts, action, resource, ctx)
+                || resourceExplicitDeny
                 || (sessionStmts  != null && anyExplicitDeny(sessionStmts,  action, resource, ctx))
                 || (boundaryStmts != null && anyExplicitDeny(boundaryStmts, action, resource, ctx))) {
             return Decision.DENY;
         }
 
-        // 2. Base grant: identity OR resource-based policy must allow
+        // 2. Base grant: same-account access needs either policy family; cross-account access
+        //    needs both the caller's identity policy and the resource owner's policy.
         boolean identityAllow = anyExplicitAllow(identityStmts, action, resource, ctx);
-        boolean resourceAllow = anyExplicitAllow(resourceStmts, action, resource, ctx);
-        if (!identityAllow && !resourceAllow) {
+        if (accountRelationship == ResourceAccountRelationship.CROSS_ACCOUNT) {
+            if (!identityAllow || !resourceAllow) {
+                return Decision.DENY;
+            }
+        } else if (!identityAllow && !resourceAllow) {
             return Decision.DENY;
         }
 
@@ -117,8 +248,13 @@ public class IamPolicyEvaluator {
             return Decision.DENY;
         }
 
-        // 4. Permission boundary (if present) must also allow (caps maximum permissions)
-        if (boundaryStmts != null && !anyExplicitAllow(boundaryStmts, action, resource, ctx)) {
+        // 4. A same-account resource policy that names an IAM user ARN grants directly to that
+        //    user. Its boundary's implicit deny does not cap the grant; explicit denies were
+        //    already handled above. Other grants remain limited by the boundary intersection.
+        boolean directSameAccountUserGrant = directIamUserResourceAllow
+                && accountRelationship == ResourceAccountRelationship.SAME_ACCOUNT;
+        if (!directSameAccountUserGrant && boundaryStmts != null
+                && !anyExplicitAllow(boundaryStmts, action, resource, ctx)) {
             return Decision.DENY;
         }
 
@@ -148,27 +284,193 @@ public class IamPolicyEvaluator {
                                                       String resource,
                                                       Map<String, List<String>> conditionCtx) {
         Map<String, List<String>> ctx = normalizeConditionContext(conditionCtx);
+        String loweredAction = lowercase(action);
         List<PolicyStatement> identityStmts = parseAll(caller.identityPolicies());
         List<PolicyStatement> sessionStmts = caller.sessionPolicyDocument() == null
                 ? null : parseAll(List.of(caller.sessionPolicyDocument()));
         List<PolicyStatement> boundaryStmts = caller.boundaryPolicyDocument() == null
                 ? null : parseAll(List.of(caller.boundaryPolicyDocument()));
 
-        if (anyExplicitDeny(identityStmts, action, resource, ctx)
-                || (sessionStmts != null && anyExplicitDeny(sessionStmts, action, resource, ctx))
-                || (boundaryStmts != null && anyExplicitDeny(boundaryStmts, action, resource, ctx))) {
+        if (anyExplicitDeny(identityStmts, loweredAction, resource, ctx)
+                || (sessionStmts != null && anyExplicitDeny(sessionStmts, loweredAction, resource, ctx))
+                || (boundaryStmts != null && anyExplicitDeny(boundaryStmts, loweredAction, resource, ctx))) {
             return SimulationDecision.EXPLICIT_DENY;
         }
-        if (!anyExplicitAllow(identityStmts, action, resource, ctx)) {
+        if (!anyExplicitAllow(identityStmts, loweredAction, resource, ctx)) {
             return SimulationDecision.IMPLICIT_DENY;
         }
-        if (sessionStmts != null && !anyExplicitAllow(sessionStmts, action, resource, ctx)) {
+        if (sessionStmts != null && !anyExplicitAllow(sessionStmts, loweredAction, resource, ctx)) {
             return SimulationDecision.IMPLICIT_DENY;
         }
-        if (boundaryStmts != null && !anyExplicitAllow(boundaryStmts, action, resource, ctx)) {
+        if (boundaryStmts != null && !anyExplicitAllow(boundaryStmts, loweredAction, resource, ctx)) {
             return SimulationDecision.IMPLICIT_DENY;
         }
         return SimulationDecision.ALLOWED;
+    }
+
+    /**
+     * Returns the context keys referenced across the given policy documents: every Condition
+     * operator's key names, every {@code ${...}} policy variable named in a Resource entry, and
+     * every one named in a Condition value (AWS documents policy variables as usable only in
+     * the Resource element and in Condition values, never in NotResource, Action or Principal).
+     * AWS's own primary example for this response is a Resource-embedded variable:
+     * {@code ${aws:username}} inside a Resource ARN.
+     *
+     * <p>The three single-character escapes ({@code ${*}}, {@code ${?}}, {@code ${$}}) are
+     * literal-character substitutions, not context-key references, and are excluded. A default
+     * value ({@code ${key, 'default'}}) is stripped so only {@code key} is reported.
+     *
+     * <p>Not sorted and not de-duplicated: AWS's own documented example response for
+     * GetContextKeysForPrincipalPolicy repeats a key that is referenced by more than one
+     * statement, so this returns them in statement order exactly as found, matching that
+     * observed behavior rather than imposing an artificial, AWS-inconsistent cleanup.
+     *
+     * <p>A document that fails to parse contributes no keys, matching {@link #parseAll}'s
+     * handling elsewhere in this class.
+     */
+    public List<String> contextKeysReferencedIn(List<String> policyDocuments) {
+        List<String> keys = new ArrayList<>();
+        for (PolicyStatement stmt : parseAll(policyDocuments)) {
+            Map<String, Map<String, List<String>>> conditions = stmt.getConditions();
+            if (conditions != null) {
+                for (Map<String, List<String>> byContextKey : conditions.values()) {
+                    for (Map.Entry<String, List<String>> entry : byContextKey.entrySet()) {
+                        keys.add(entry.getKey());
+                        collectPolicyVariableKeys(entry.getValue(), keys);
+                    }
+                }
+            }
+            collectPolicyVariableKeys(stmt.getResources(), keys);
+        }
+        return keys;
+    }
+
+    /**
+     * Whether {@code policyDocument} lets its holder reach any action in {@code serviceNamespace},
+     * backing {@code ListPoliciesGrantingServiceAccess}.
+     *
+     * <p>Only {@code Allow} statements grant, and only the permissions-policy logic is applied:
+     * AWS documents that this operation ignores resource-based policies, ACLs, Organizations
+     * policies, permissions boundaries and trust policies. Resources and conditions are not
+     * consulted either, because the question is which policies could grant the service at all,
+     * not whether a specific call would be authorized.
+     *
+     * <p>A document that fails to parse grants nothing, matching {@link #parseAll} elsewhere here.
+     */
+    public boolean grantsServiceAccess(String policyDocument, String serviceNamespace) {
+        if (policyDocument == null || serviceNamespace == null || serviceNamespace.isBlank()) {
+            return false;
+        }
+        for (PolicyStatement stmt : parseAll(List.of(policyDocument))) {
+            if (!"Allow".equalsIgnoreCase(stmt.getEffect())) {
+                continue;
+            }
+            if (stmt.getActions() != null) {
+                for (String pattern : stmt.getActions()) {
+                    if (actionPatternReaches(pattern, serviceNamespace)) {
+                        return true;
+                    }
+                }
+            } else if (stmt.getNotActions() != null && !excludesEntirely(stmt.getNotActions(), serviceNamespace)) {
+                // Allow + NotAction grants everything the list does not carve out, so the
+                // namespace is still reachable unless the list removes all of it.
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The service namespaces {@code policyDocuments} name explicitly in an {@code Allow}, backing
+     * the service list in {@code GetServiceLastAccessedDetails}.
+     *
+     * <p>AWS lists a service the entity could reach even when it was never used, so the list is
+     * derived from the same permissions-policy logic as {@link #grantsServiceAccess}. Only
+     * namespaces written out literally can be enumerated: {@code Action: "*"}, a globbed prefix
+     * like {@code s3*}, and {@code NotAction} all denote a set no policy document enumerates, so
+     * they are reported through {@code grantsAllServices} for the caller to expand against
+     * whatever universe of services it knows.
+     */
+    public GrantedServices servicesGrantedBy(List<String> policyDocuments) {
+        List<String> namespaces = new ArrayList<>();
+        boolean all = false;
+        for (PolicyStatement stmt : parseAll(policyDocuments)) {
+            if (!"Allow".equalsIgnoreCase(stmt.getEffect())) {
+                continue;
+            }
+            if (stmt.getNotActions() != null) {
+                all = true;
+                continue;
+            }
+            if (stmt.getActions() == null) {
+                continue;
+            }
+            for (String pattern : stmt.getActions()) {
+                int colon = pattern == null ? -1 : pattern.indexOf(':');
+                if (colon < 0) {
+                    // "*" grants every service; anything else without a colon is malformed.
+                    all = all || "*".equals(pattern);
+                    continue;
+                }
+                String namespace = pattern.substring(0, colon);
+                if (namespace.indexOf('*') >= 0 || namespace.indexOf('?') >= 0) {
+                    all = true;
+                } else if (!namespaces.contains(namespace)) {
+                    namespaces.add(namespace);
+                }
+            }
+        }
+        return new GrantedServices(namespaces, all);
+    }
+
+    /**
+     * Service namespaces an identity's policies grant: those named literally, plus whether some
+     * statement grants every service without naming any.
+     */
+    public record GrantedServices(List<String> namespaces, boolean grantsAllServices) {}
+
+    /** An action pattern reaches a namespace when its service part matches, whatever the verb is. */
+    private static boolean actionPatternReaches(String pattern, String serviceNamespace) {
+        if ("*".equals(pattern)) {
+            return true;
+        }
+        int colon = pattern == null ? -1 : pattern.indexOf(':');
+        if (colon < 0) {
+            // Not "service:Action" and not "*"; IAM would reject it, so it grants nothing here.
+            return false;
+        }
+        return globMatches(pattern.substring(0, colon), serviceNamespace);
+    }
+
+    /** True only if the NotAction list removes every action in the namespace, not merely some. */
+    private static boolean excludesEntirely(List<String> notActions, String serviceNamespace) {
+        for (String pattern : notActions) {
+            if ("*".equals(pattern)) {
+                return true;
+            }
+            int colon = pattern == null ? -1 : pattern.indexOf(':');
+            if (colon >= 0 && "*".equals(pattern.substring(colon + 1))
+                    && globMatches(pattern.substring(0, colon), serviceNamespace)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Appends the key name inside every {@code ${key}} policy variable found in {@code values}. */
+    private void collectPolicyVariableKeys(List<String> values, List<String> keys) {
+        if (values == null) {
+            return;
+        }
+        for (String value : values) {
+            Matcher matcher = POLICY_VARIABLE.matcher(value);
+            while (matcher.find()) {
+                String key = matcher.group(1).trim();
+                if (!key.equals("*") && !key.equals("?") && !key.equals("$")) {
+                    keys.add(key);
+                }
+            }
+        }
     }
 
     /**
@@ -251,6 +553,203 @@ public class IamPolicyEvaluator {
         return false;
     }
 
+    private boolean anyResourceExplicitDeny(List<PolicyStatement> stmts, String principalArn,
+                                            String action, String resource, Map<String, List<String>> ctx) {
+        for (PolicyStatement stmt : stmts) {
+            if (stmt.isDeny() && matchesResourceStatement(stmt, principalArn, action, resource, ctx)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean anyResourceExplicitAllow(List<PolicyStatement> stmts, String principalArn,
+                                             String action, String resource, Map<String, List<String>> ctx) {
+        for (PolicyStatement stmt : stmts) {
+            if (stmt.isAllow() && matchesResourceStatement(stmt, principalArn, action, resource, ctx)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean anyResourceDirectIamUserAllow(List<PolicyStatement> stmts, String principalArn,
+                                                 String action, String resource, Map<String, List<String>> ctx) {
+        for (PolicyStatement stmt : stmts) {
+            if (stmt.isAllow() && matchesDirectIamUserStatement(stmt, principalArn, action, resource, ctx)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean matchesDirectIamUserStatement(PolicyStatement stmt, String principalArn,
+                                                  String action, String resource, Map<String, List<String>> ctx) {
+        if (principalArn == null || !principalArn.contains(":user/")) {
+            return false;
+        }
+        if (stmt.getPrincipals() == null) {
+            return false;
+        }
+        boolean directMatch = false;
+        for (Map.Entry<String, List<String>> entry : stmt.getPrincipals().entrySet()) {
+            String type = entry.getKey();
+            List<String> patterns = entry.getValue();
+            if (patterns == null || patterns.isEmpty()) {
+                continue;
+            }
+            if ("AWS".equalsIgnoreCase(type) || "*".equals(type)) {
+                for (String pattern : patterns) {
+                    if (pattern.equals(principalArn)) {
+                        directMatch = true;
+                        break;
+                    }
+                    if ("*".equals(pattern) && conditionDirectlyMatchesPrincipalArn(stmt.getConditions(), principalArn)) {
+                        directMatch = true;
+                        break;
+                    }
+                }
+            }
+            if (directMatch) {
+                break;
+            }
+        }
+        if (!directMatch) {
+            return false;
+        }
+        return matchesAction(stmt, action)
+                && matchesResource(stmt, resource)
+                && matchesConditions(stmt.getConditions(), ctx);
+    }
+
+    private boolean conditionDirectlyMatchesPrincipalArn(Map<String, Map<String, List<String>>> conditions, String principalArn) {
+        if (conditions == null || conditions.isEmpty()) {
+            return false;
+        }
+        for (Map.Entry<String, Map<String, List<String>>> opEntry : conditions.entrySet()) {
+            String op = opEntry.getKey();
+            if ("StringEquals".equalsIgnoreCase(op) || "ArnEquals".equalsIgnoreCase(op)) {
+                Map<String, List<String>> fieldMap = opEntry.getValue();
+                if (fieldMap != null) {
+                    for (Map.Entry<String, List<String>> field : fieldMap.entrySet()) {
+                        if ("aws:PrincipalArn".equalsIgnoreCase(field.getKey())) {
+                            List<String> values = field.getValue();
+                            if (values != null && values.contains(principalArn)) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    private boolean matchesResourceStatement(PolicyStatement stmt, String principalArn,
+                                             String action, String resource, Map<String, List<String>> ctx) {
+        // A resource-policy statement with no Principal matches nothing (per AWS specification)
+        if (stmt.getPrincipals() == null && stmt.getNotPrincipals() == null) {
+            return false;
+        }
+        if (!matchesPrincipal(stmt, principalArn)) {
+            return false;
+        }
+        return matchesAction(stmt, action)
+                && matchesResource(stmt, resource)
+                && matchesConditions(stmt.getConditions(), ctx);
+    }
+
+    private boolean matchesPrincipal(PolicyStatement stmt, String principalArn) {
+        if (stmt.getPrincipals() != null) {
+            return matchesAnyPrincipal(stmt.getPrincipals(), principalArn);
+        }
+        if (stmt.getNotPrincipals() != null) {
+            return !matchesAnyPrincipal(stmt.getNotPrincipals(), principalArn);
+        }
+        return false;
+    }
+
+    private boolean matchesAnyPrincipal(Map<String, List<String>> principals, String principalArn) {
+        for (Map.Entry<String, List<String>> entry : principals.entrySet()) {
+            String type = entry.getKey();
+            List<String> patterns = entry.getValue();
+            if (patterns == null || patterns.isEmpty()) {
+                continue;
+            }
+            if ("*".equals(type)) {
+                for (String pattern : patterns) {
+                    if ("*".equals(pattern)) {
+                        return true;
+                    }
+                    if (principalArn != null && globMatches(pattern, principalArn)) {
+                        return true;
+                    }
+                }
+            } else if ("AWS".equalsIgnoreCase(type)) {
+                if (principalArn == null) {
+                    continue;
+                }
+                String accountId = extractAccountId(principalArn);
+                String roleArn = extractRoleArnFromAssumedRole(principalArn);
+                for (String pattern : patterns) {
+                    if ("*".equals(pattern)) {
+                        return true;
+                    }
+                    if (pattern.matches("\\d{12}")) {
+                        if (pattern.equals(accountId)) {
+                            return true;
+                        }
+                    } else if (ROOT_PRINCIPAL_ARN.matcher(pattern).matches()) {
+                        // An account id is scoped to its partition: arn:aws-cn:iam::123:root names
+                        // the China account 123, which is not the commercial account 123.
+                        AwsArnUtils.Arn root = AwsArnUtils.parse(pattern);
+                        if (root.accountId().equals(accountId)
+                                && root.partition().equals(AwsArnUtils.parse(principalArn).partition())) {
+                            return true;
+                        }
+                    } else if (globMatches(pattern, principalArn)) {
+                        return true;
+                    } else if (roleArn != null && globMatches(pattern, roleArn)) {
+                        return true;
+                    }
+                }
+            } else if (principalArn != null) {
+                for (String pattern : patterns) {
+                    if ("*".equals(pattern) || globMatches(pattern, principalArn)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    private static String extractAccountId(String arn) {
+        if (!AwsArnUtils.isArn(arn)) {
+            return null;
+        }
+        String account = AwsArnUtils.parse(arn).accountId();
+        return account.matches("\\d{12}") ? account : null;
+    }
+
+    /**
+     * The role an assumed-role session ARN was minted from, in the session's own partition:
+     * {@code arn:aws-cn:sts::1:assumed-role/r/s} names {@code arn:aws-cn:iam::1:role/r}.
+     */
+    private static String extractRoleArnFromAssumedRole(String arn) {
+        if (!AwsArnUtils.isArnFor(arn, "sts")) {
+            return null;
+        }
+        AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
+        if (parsed.resource().startsWith("assumed-role/")) {
+            String sessionPath = parsed.resource().substring("assumed-role/".length());
+            int nextSlash = sessionPath.indexOf('/');
+            String roleName = nextSlash > 0 ? sessionPath.substring(0, nextSlash) : sessionPath;
+            return AwsArnUtils.Arn.global(parsed.partition(), "iam", parsed.accountId(), "role/" + roleName).toString();
+        }
+        return null;
+    }
+
     private boolean matchesStatement(PolicyStatement stmt, String action, String resource,
                                       Map<String, List<String>> ctx) {
         return matchesAction(stmt, action)
@@ -280,16 +779,25 @@ public class IamPolicyEvaluator {
         return false;
     }
 
+    /**
+     * Case-sensitive glob over the given patterns. Action names are case-insensitive on AWS, so
+     * both sides arrive lowercased: the patterns at parse time and the request action once per
+     * evaluation. Resource ARNs are case-sensitive on AWS and are compared as written.
+     */
     private boolean matchesAny(List<String> patterns, String value) {
-        if (patterns == null) {
+        if (patterns == null || value == null) {
             return false;
         }
         for (String pattern : patterns) {
-            if (globMatches(pattern, value)) {
+            if (globMatchesHelper(pattern, value, 0, 0)) {
                 return true;
             }
         }
         return false;
+    }
+
+    private static String lowercase(String value) {
+        return value == null ? null : value.toLowerCase();
     }
 
     // -----------------------------------------------------------------------
@@ -577,17 +1085,42 @@ public class IamPolicyEvaluator {
         }
         boolean anyFailed = false;
         for (String doc : documents) {
-            try {
-                result.addAll(parseStatements(doc));
-            } catch (Exception e) {
-                anyFailed = true;
-                LOG.warnv("Failed to parse policy document: {0}", e.getMessage());
-            }
+            CachedDocument parsed = parseDocument(doc);
+            result.addAll(parsed.statements());
+            anyFailed |= parsed.failed();
         }
         return new ParsedDocuments(result, anyFailed);
     }
 
     private record ParsedDocuments(List<PolicyStatement> statements, boolean anyFailed) {
+    }
+
+    private CachedDocument parseDocument(String document) {
+        if (document == null) {
+            return parseUncached(null);
+        }
+        CachedDocument cached = cachedDocuments.get(document);
+        if (cached != null) {
+            return cached;
+        }
+        CachedDocument parsed = parseUncached(document);
+        if (cachedDocuments.size() >= MAX_CACHED_DOCUMENTS) {
+            cachedDocuments.clear();
+        }
+        cachedDocuments.put(document, parsed);
+        return parsed;
+    }
+
+    private CachedDocument parseUncached(String document) {
+        try {
+            return new CachedDocument(List.copyOf(parseStatements(document)), false);
+        } catch (Exception e) {
+            LOG.warnv("Failed to parse policy document: {0}", e.getMessage());
+            return new CachedDocument(List.of(), true);
+        }
+    }
+
+    private record CachedDocument(List<PolicyStatement> statements, boolean failed) {
     }
 
     private List<PolicyStatement> parseStatements(String document) throws Exception {
@@ -606,18 +1139,49 @@ public class IamPolicyEvaluator {
 
     private PolicyStatement parseStatement(JsonNode stmt) {
         String effect = stmt.path("Effect").asText("Allow");
-        List<String> actions     = nodeToList(stmt.get("Action"));
-        List<String> notActions  = nodeToList(stmt.get("NotAction"));
+        Map<String, List<String>> principals = parsePrincipals(stmt.get("Principal"));
+        Map<String, List<String>> notPrincipals = parsePrincipals(stmt.get("NotPrincipal"));
+        // Action names are case-insensitive on AWS, so they are lowercased once here instead of
+        // on every request. Resource ARNs are case-sensitive on AWS and are kept as written.
+        List<String> actions     = lowercaseAll(nodeToList(stmt.get("Action")));
+        List<String> notActions  = lowercaseAll(nodeToList(stmt.get("NotAction")));
         List<String> resources   = nodeToList(stmt.get("Resource"));
         List<String> notResources= nodeToList(stmt.get("NotResource"));
         Map<String, Map<String, List<String>>> conditions = parseConditions(stmt.get("Condition"));
         return new PolicyStatement(
                 effect,
+                principals,
+                notPrincipals,
                 actions.isEmpty()     ? null : actions,
                 notActions.isEmpty()  ? null : notActions,
                 resources.isEmpty()   ? null : resources,
                 notResources.isEmpty()? null : notResources,
                 conditions);
+    }
+
+    private Map<String, List<String>> parsePrincipals(JsonNode node) {
+        if (node == null || node.isNull() || node.isMissingNode()) {
+            return null;
+        }
+        Map<String, List<String>> result = new LinkedHashMap<>();
+        if (node.isTextual()) {
+            result.put("*", List.of(node.asText()));
+            return result;
+        }
+        if (node.isArray()) {
+            result.put("*", nodeToList(node));
+            return result;
+        }
+        if (node.isObject()) {
+            node.fields().forEachRemaining(entry -> {
+                List<String> values = nodeToList(entry.getValue());
+                if (!values.isEmpty()) {
+                    result.put(entry.getKey(), values);
+                }
+            });
+            return result.isEmpty() ? null : result;
+        }
+        return null;
     }
 
     private Map<String, Map<String, List<String>>> parseConditions(JsonNode condNode) {
@@ -632,6 +1196,14 @@ public class IamPolicyEvaluator {
             result.put(opEntry.getKey(), kvMap);
         });
         return result.isEmpty() ? null : result;
+    }
+
+    private static List<String> lowercaseAll(List<String> values) {
+        List<String> lowered = new ArrayList<>(values.size());
+        for (String value : values) {
+            lowered.add(value.toLowerCase());
+        }
+        return lowered;
     }
 
     private List<String> nodeToList(JsonNode node) {

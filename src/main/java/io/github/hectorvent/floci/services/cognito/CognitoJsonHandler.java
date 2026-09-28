@@ -104,6 +104,7 @@ public class CognitoJsonHandler {
             case "ConfirmForgotPassword" -> handleConfirmForgotPassword(request);
             case "GetUser" -> handleGetUser(request);
             case "GetUserAttributeVerificationCode" -> handleGetUserAttributeVerificationCode(request);
+            case "VerifyUserAttribute" -> handleVerifyUserAttribute(request);
             case "UpdateUserAttributes" -> handleUpdateUserAttributes(request);
             case "DeleteUserAttributes" -> handleDeleteUserAttributes(request);
             case "GlobalSignOut" -> handleGlobalSignOut(request);
@@ -269,7 +270,8 @@ public class CognitoJsonHandler {
                         : null,
                 request.has("EnableTokenRevocation")
                         ? request.path("EnableTokenRevocation").asBoolean()
-                        : null
+                        : null,
+                authSessionValidity(request)
         );
         ObjectNode response = objectMapper.createObjectNode();
         response.set("UserPoolClient", clientToNode(client));
@@ -333,7 +335,8 @@ public class CognitoJsonHandler {
                         ? objectMapper.convertValue(request.path("RefreshTokenRotation"),
                         new TypeReference<Map<String, Object>>() {})
                         : null,
-                request.has("EnableTokenRevocation") ? request.path("EnableTokenRevocation").asBoolean() : null
+                request.has("EnableTokenRevocation") ? request.path("EnableTokenRevocation").asBoolean() : null,
+                authSessionValidity(request)
         );
         ObjectNode response = objectMapper.createObjectNode();
         response.set("UserPoolClient", clientToNode(client));
@@ -1018,12 +1021,22 @@ public class CognitoJsonHandler {
         return Response.ok(response).build();
     }
 
+    private Response handleVerifyUserAttribute(JsonNode request) {
+        service.verifyUserAttribute(
+                request.path("AccessToken").asText(),
+                request.path("AttributeName").asText(),
+                request.path("Code").asText()
+        );
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
     private Response handleUpdateUserAttributes(JsonNode request) {
         Map<String, String> attrs = new HashMap<>();
         request.path("UserAttributes").forEach(a -> attrs.put(a.path("Name").asText(), a.path("Value").asText()));
-        service.updateUserAttributes(request.path("AccessToken").asText(), attrs);
+        List<Map<String, Object>> deliveryDetails = service.updateUserAttributes(
+                request.path("AccessToken").asText(), attrs);
         ObjectNode response = objectMapper.createObjectNode();
-        response.putArray("CodeDeliveryDetailsList");
+        response.set("CodeDeliveryDetailsList", objectMapper.valueToTree(deliveryDetails));
         return Response.ok(response).build();
     }
 
@@ -1101,6 +1114,11 @@ public class CognitoJsonHandler {
         }
         node.set("UsernameConfiguration", objectMapper.valueToTree(p.getUsernameConfiguration() != null ? p.getUsernameConfiguration() : new HashMap<>()));
         node.set("AccountRecoverySetting", objectMapper.valueToTree(p.getAccountRecoverySetting() != null ? p.getAccountRecoverySetting() : new HashMap<>()));
+        // Same reasoning as UserPoolAddOns above: an unconfigured pool omits this optional
+        // member entirely rather than returning an empty object.
+        if (p.getUserAttributeUpdateSettings() != null && !p.getUserAttributeUpdateSettings().isEmpty()) {
+            node.set("UserAttributeUpdateSettings", objectMapper.valueToTree(p.getUserAttributeUpdateSettings()));
+        }
         node.put("UserPoolTier", p.getUserPoolTier() != null ? p.getUserPoolTier() : "ESSENTIALS");
 
         return node;
@@ -1124,6 +1142,7 @@ public class CognitoJsonHandler {
         node.put("ClientId", c.getClientId());
         node.put("UserPoolId", c.getUserPoolId());
         node.put("ClientName", c.getClientName());
+        node.put("AuthSessionValidity", c.getAuthSessionValidity());
         if (c.getClientSecret() != null) {
             node.put("ClientSecret", c.getClientSecret());
         }
@@ -1172,6 +1191,17 @@ public class CognitoJsonHandler {
         node.put("CreationDate", c.getCreationDate());
         node.put("LastModifiedDate", c.getLastModifiedDate());
         return node;
+    }
+
+    private static Integer authSessionValidity(JsonNode request) {
+        JsonNode value = request.get("AuthSessionValidity");
+        if (value == null || value.isNull()) {
+            return null;
+        }
+        if (!value.isIntegralNumber() || !value.canConvertToInt()) {
+            throw new AwsException("SerializationException", "Expected integer or null", 400);
+        }
+        return value.intValue();
     }
 
     private ObjectNode resourceServerToNode(ResourceServer server) {

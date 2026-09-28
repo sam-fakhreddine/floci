@@ -6,6 +6,8 @@ import io.github.hectorvent.floci.core.common.XmlParser;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.cloudfront.model.CacheBehavior;
+import io.github.hectorvent.floci.services.cloudfront.model.CachePolicy;
+import io.github.hectorvent.floci.services.cloudfront.model.OriginRequestPolicy;
 import io.github.hectorvent.floci.services.cloudfront.model.CloudFrontFunction;
 import io.github.hectorvent.floci.services.cloudfront.model.CloudFrontOriginAccessIdentity;
 import io.github.hectorvent.floci.services.cloudfront.model.DefaultCacheBehavior;
@@ -27,7 +29,9 @@ import java.time.Instant;
 import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
@@ -124,10 +128,14 @@ class CloudFrontServiceTest {
                 .thenAnswer(invocation -> AccountAwareStorageBackend.inMemory("000000000000"));
 
         EmulatorConfig config = Mockito.mock(EmulatorConfig.class);
+        EmulatorConfig.DnsConfig dnsConfig = Mockito.mock(EmulatorConfig.DnsConfig.class);
         var servicesConfig = Mockito.mock(EmulatorConfig.ServicesConfig.class);
         var cloudFrontConfig = Mockito.mock(EmulatorConfig.CloudFrontServiceConfig.class);
 
         when(config.defaultAccountId()).thenReturn(ACCOUNT);
+        when(config.hostname()).thenReturn(Optional.empty());
+        when(config.dns()).thenReturn(dnsConfig);
+        when(dnsConfig.extraSuffixes()).thenReturn(Optional.empty());
         when(config.services()).thenReturn(servicesConfig);
         when(servicesConfig.cloudfront()).thenReturn(cloudFrontConfig);
         when(cloudFrontConfig.domainSuffix()).thenReturn(domainSuffix);
@@ -230,6 +238,29 @@ class CloudFrontServiceTest {
     }
 
     @Test
+    void createPublicKeyIssuesAnAwsShapedId() throws Exception {
+        CloudFrontService service = serviceWithDomainSuffix(DEFAULT_DOMAIN_SUFFIX);
+
+        PublicKey created = service.createPublicKey(validPublicKey("signer"));
+
+        // Verified on AWS us-east-1 2026-09-18: CreatePublicKey answers K + 13 characters
+        // (K2VKB3XV74876Q), the value a signed URL carries as Key-Pair-Id.
+        assertTrue(created.getId().matches("K[A-Z0-9]{13}"),
+                "Expected an AWS-shaped public key id, got: " + created.getId());
+    }
+
+    @Test
+    void createDistributionLowerCasesTheDomainNameId() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+
+        Distribution dist = service.createDistribution(new Distribution(), Map.of());
+
+        // A browser lower-cases the host it sends, so an upper-case id here would break every
+        // signed URL built from the domain name.
+        assertEquals(dist.getId().toLowerCase(Locale.ROOT) + ".cloudfront.net", dist.getDomainName());
+    }
+
+    @Test
     void createDistributionHonorsConfiguredDomainSuffix() {
         CloudFrontService service = serviceWithDomainSuffix("cloudfront.local");
 
@@ -269,6 +300,37 @@ class CloudFrontServiceTest {
         // No match for an unrelated host.
         assertNull(service.findByHost("unrelated.example.test"));
         assertNull(service.findByHost(null));
+    }
+
+    @Test
+    void findByHostMatchesLocalDeliveryHostnames() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+
+        Distribution dist = service.createDistribution(distribution(true, List.of()), Map.of());
+        String id = dist.getId();
+
+        assertEquals(id, service.findByHost(id + ".cloudfront.localhost.floci.io").getId());
+        assertEquals(id, service.findByHost(id + ".cloudfront.localhost:4566").getId());
+        // Clients are free to lower-case the hostname they send.
+        assertEquals(id, service.findByHost(
+                (id + ".cloudfront.localhost.floci.io").toLowerCase(Locale.ROOT)).getId());
+
+        // The id stands for one label, and an unknown id belongs to no distribution.
+        assertNull(service.findByHost("a." + id + ".cloudfront.localhost.floci.io"));
+        assertNull(service.findByHost("EABCDEFGHIJKLM.cloudfront.localhost.floci.io"));
+        assertNull(service.findByHost(".cloudfront.localhost"));
+    }
+
+    @Test
+    void findByHostPrefersExactAliasOverLocalDeliveryHostname() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+
+        Distribution generated = service.createDistribution(distribution(true, List.of()), Map.of());
+        String aliasOfAnother = generated.getId() + ".cloudfront.localhost";
+        Distribution aliasOwner = service.createDistribution(
+                distribution(true, List.of(aliasOfAnother)), Map.of());
+
+        assertEquals(aliasOwner.getId(), service.findByHost(aliasOfAnother).getId());
     }
 
     @Test
@@ -874,6 +936,133 @@ class CloudFrontServiceTest {
         assertDoesNotThrow(() -> service.updateDistribution(
                 existing.getId(), existing.getEtag(),
                 distributionWithPolicy(policy.getId())));
+    }
+
+    @Test
+    void preventsDeletingACachePolicyAttachedToTheDefaultCacheBehavior() {
+        // DeleteCachePolicy declares CachePolicyInUse and documents "You cannot delete a cache
+        // policy if it's attached to a cache behavior"; without the check the distribution was
+        // left pointing at a policy that no longer existed.
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+        CachePolicy policy = service.createCachePolicy(namedCachePolicy("in-use-cache-policy"));
+        Distribution distribution = service.createDistribution(
+                distributionWithCachePolicy(policy.getId(), null), Map.of());
+
+        assertAws("CachePolicyInUse", () -> service.deleteCachePolicy(policy.getId(), policy.getEtag()));
+
+        Distribution detached = distributionWithCachePolicy(null, null);
+        service.updateDistribution(distribution.getId(), distribution.getEtag(), detached);
+        service.deleteCachePolicy(policy.getId(), policy.getEtag());
+        assertAws("NoSuchCachePolicy", () -> service.getCachePolicy(policy.getId()));
+    }
+
+    @Test
+    void preventsDeletingACachePolicyAttachedToAnOrderedCacheBehavior() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+        CachePolicy policy = service.createCachePolicy(namedCachePolicy("ordered-cache-policy"));
+        service.createDistribution(distributionWithCachePolicy(null, policy.getId()), Map.of());
+
+        assertAws("CachePolicyInUse", () -> service.deleteCachePolicy(policy.getId(), policy.getEtag()));
+    }
+
+    @Test
+    void preventsDeletingAnOriginRequestPolicyInUse() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+        OriginRequestPolicy policy =
+                service.createOriginRequestPolicy(namedOriginRequestPolicy("in-use-orp"));
+        Distribution distribution = service.createDistribution(
+                distributionWithOriginRequestPolicy(policy.getId()), Map.of());
+
+        assertAws("OriginRequestPolicyInUse",
+                () -> service.deleteOriginRequestPolicy(policy.getId(), policy.getEtag()));
+
+        Distribution detached = distributionWithOriginRequestPolicy(null);
+        service.updateDistribution(distribution.getId(), distribution.getEtag(), detached);
+        service.deleteOriginRequestPolicy(policy.getId(), policy.getEtag());
+        assertAws("NoSuchOriginRequestPolicy", () -> service.getOriginRequestPolicy(policy.getId()));
+    }
+
+    @Test
+    void exposesTheAwsManagedOriginRequestPoliciesAsImmutable() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+
+        OriginRequestPolicy exceptHost = service.getOriginRequestPolicy(
+                CloudFrontService.MANAGED_ALL_VIEWER_EXCEPT_HOST_HEADER_ORIGIN_REQUEST_POLICY_ID);
+        assertEquals("Managed-AllViewerExceptHostHeader", exceptHost.getName());
+        assertEquals(Map.of("HeaderBehavior", "allExcept", "Headers", List.of("Host")),
+                exceptHost.getConfig().get("HeadersConfig"));
+        assertEquals(Map.of("CookieBehavior", "all"), exceptHost.getConfig().get("CookiesConfig"));
+        assertEquals(Map.of("QueryStringBehavior", "all"),
+                exceptHost.getConfig().get("QueryStringsConfig"));
+        assertEquals(Map.of("HeaderBehavior", "allViewer"), service.getOriginRequestPolicy(
+                CloudFrontService.MANAGED_ALL_VIEWER_ORIGIN_REQUEST_POLICY_ID)
+                .getConfig().get("HeadersConfig"));
+        assertEquals(Map.of("HeaderBehavior", "whitelist", "Headers", List.of("Host")),
+                service.getOriginRequestPolicy(
+                        CloudFrontService.MANAGED_HOST_HEADER_ONLY_ORIGIN_REQUEST_POLICY_ID)
+                        .getConfig().get("HeadersConfig"));
+
+        OriginRequestPolicy custom =
+                service.createOriginRequestPolicy(namedOriginRequestPolicy("custom-orp"));
+        assertEquals(8, service.listOriginRequestPolicies(null, 100, "managed").size());
+        assertEquals(List.of(custom.getId()), service.listOriginRequestPolicies(null, 100, "custom")
+                .stream().map(OriginRequestPolicy::getId).toList());
+        assertEquals(9, service.listOriginRequestPolicies(null, 100, null).size());
+        assertAws("InvalidArgument", () -> service.listOriginRequestPolicies(null, 100, "MANAGED"));
+
+        assertAws("IllegalUpdate", () -> service.updateOriginRequestPolicy(exceptHost.getId(),
+                exceptHost.getEtag(), namedOriginRequestPolicy("replacement")));
+        assertAws("IllegalDelete",
+                () -> service.deleteOriginRequestPolicy(exceptHost.getId(), exceptHost.getEtag()));
+    }
+
+    @Test
+    void deletesAnUnattachedCachePolicy() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+        CachePolicy policy = service.createCachePolicy(namedCachePolicy("free-cache-policy"));
+
+        service.deleteCachePolicy(policy.getId(), policy.getEtag());
+
+        assertAws("NoSuchCachePolicy", () -> service.getCachePolicy(policy.getId()));
+    }
+
+    private static CachePolicy namedCachePolicy(String name) {
+        CachePolicy policy = new CachePolicy();
+        policy.setName(name);
+        policy.setConfig(Map.of());
+        return policy;
+    }
+
+    private static OriginRequestPolicy namedOriginRequestPolicy(String name) {
+        OriginRequestPolicy policy = new OriginRequestPolicy();
+        policy.setName(name);
+        policy.setConfig(Map.of());
+        return policy;
+    }
+
+    private static Distribution distributionWithCachePolicy(String defaultPolicyId, String orderedPolicyId) {
+        DefaultCacheBehavior behavior = new DefaultCacheBehavior();
+        behavior.setCachePolicyId(defaultPolicyId);
+        DistributionConfig config = new DistributionConfig();
+        config.setDefaultCacheBehavior(behavior);
+        if (orderedPolicyId != null) {
+            CacheBehavior ordered = new CacheBehavior();
+            ordered.setCachePolicyId(orderedPolicyId);
+            config.setCacheBehaviors(List.of(ordered));
+        }
+        Distribution distribution = new Distribution();
+        distribution.setConfig(config);
+        return distribution;
+    }
+
+    private static Distribution distributionWithOriginRequestPolicy(String policyId) {
+        DefaultCacheBehavior behavior = new DefaultCacheBehavior();
+        behavior.setOriginRequestPolicyId(policyId);
+        DistributionConfig config = new DistributionConfig();
+        config.setDefaultCacheBehavior(behavior);
+        Distribution distribution = new Distribution();
+        distribution.setConfig(config);
+        return distribution;
     }
 
     private static Distribution distributionWithPolicy(String policyId) {

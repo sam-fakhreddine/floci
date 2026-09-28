@@ -38,6 +38,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
@@ -102,6 +104,7 @@ class RedpandaManagerTest {
         lenient().when(logStreamer.generateLogStreamName(any())).thenReturn("log-stream");
         lenient().when(regionResolver.getDefaultRegion()).thenReturn("us-east-1");
         lenient().when(regionResolver.getAccountId()).thenReturn("000000000000");
+        lenient().when(regionResolver.getDefaultAccountId()).thenReturn("000000000000");
     }
 
     @AfterEach
@@ -109,6 +112,51 @@ class RedpandaManagerTest {
         if (adminServer != null) {
             adminServer.stop(0);
         }
+    }
+
+    @Test
+    void aPersistedVolumeNameIsMountedVerbatim() {
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerInfo("container-1", Map.of(KAFKA_PORT, new EndpointInfo("h", KAFKA_PORT))));
+        when(config.storage().hostPersistentPath()).thenReturn("");
+        MskCluster cluster = newCluster();
+        cluster.setDockerVolumeName("floci-aws-msk-abc123");
+
+        manager.startContainer(cluster);
+
+        verify(lifecycleManager).ensureVolume("floci-aws-msk-abc123");
+        assertEquals("floci-aws-msk-abc123", cluster.getDockerVolumeName(),
+                "a persisted volume name must never be rewritten");
+    }
+
+    @Test
+    void aPreUpgradeClusterMountsItsLegacyVolumeAndKeepsThatName() {
+        // No persisted name means a record written before the field existed, so the cluster's
+        // data lives in the legacy-prefixed volume. Mounting the current name would silently
+        // start an empty broker and strand every topic.
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerInfo("container-2", Map.of(KAFKA_PORT, new EndpointInfo("h", KAFKA_PORT))));
+        when(config.storage().hostPersistentPath()).thenReturn("");
+        MskCluster cluster = newCluster();
+        cluster.setDockerVolumeName(null);
+
+        manager.startContainer(cluster);
+
+        verify(lifecycleManager).ensureVolume("floci-msk-abc123");
+        verify(lifecycleManager, never()).ensureVolume("floci-aws-msk-abc123");
+        assertEquals("floci-msk-abc123", cluster.getDockerVolumeName(),
+                "the legacy name must be backfilled onto the record, not recomputed each start");
+    }
+
+    @Test
+    void deletingAPreUpgradeClusterRemovesItsLegacyVolume() {
+        when(config.storage().mode()).thenReturn("memory");
+        MskCluster cluster = newCluster();
+        cluster.setDockerVolumeName(null);
+
+        manager.removeClusterStorage(cluster);
+
+        verify(lifecycleManager).removeVolume("floci-msk-abc123");
     }
 
     private MskCluster newCluster() {
@@ -197,7 +245,7 @@ class RedpandaManagerTest {
 
         int flagIndex = spec.cmd().indexOf("--advertise-kafka-addr");
         assertTrue(flagIndex >= 0, "cmd should contain --advertise-kafka-addr");
-        assertEquals("floci-msk-abc123:9092", spec.cmd().get(flagIndex + 1));
+        assertEquals("floci-aws-msk-abc123:9092", spec.cmd().get(flagIndex + 1));
 
         assertFalse(spec.portBindings().containsKey(KAFKA_PORT), "container mode should not publish ports to host");
         assertTrue(spec.exposedPorts().contains(KAFKA_PORT));
@@ -228,6 +276,69 @@ class RedpandaManagerTest {
                         "io.floci.account", "000000000000",
                         "io.floci.region", "us-east-1"),
                 specCaptor.getValue().labels());
+    }
+
+    @Test
+    void startContainerUsesAccountAwareLogsAndScopedHostPath() {
+        when(containerDetector.isRunningInContainer()).thenReturn(false);
+        when(portAllocator.allocate(9300, 9399)).thenReturn(54321);
+
+        ContainerInfo info = new ContainerInfo("container-789",
+                Map.of(KAFKA_PORT, new EndpointInfo("localhost", 54321)));
+        when(lifecycleManager.createAndStart(any())).thenReturn(info);
+
+        ArgumentCaptor<ContainerSpec> specCaptor = ArgumentCaptor.forClass(ContainerSpec.class);
+        manager.startContainer(newCluster());
+
+        verify(logStreamer).attachForAccount(eq("000000000000"), eq("container-789"),
+                eq("/aws/msk/cluster/test-cluster"), eq("log-stream"), eq("us-east-1"),
+                eq("msk:test-cluster"));
+        verify(lifecycleManager).createAndStart(specCaptor.capture());
+        String hostPath = specCaptor.getValue().binds().get(0).getPath().toString();
+        assertTrue(hostPath.contains("000000000000"));
+        assertTrue(hostPath.contains("us-east-1"));
+    }
+
+    @Test
+    void startContainerReusesLegacyHostPathWhenScopedPathIsMissing() throws Exception {
+        when(containerDetector.isRunningInContainer()).thenReturn(false);
+        when(portAllocator.allocate(9300, 9399)).thenReturn(54321);
+        Files.createDirectories(tempDir.resolve("msk").resolve("test-cluster"));
+
+        MskCluster cluster = newCluster();
+        cluster.setResourceRegion(null);
+        ContainerInfo info = new ContainerInfo("container-legacy",
+                Map.of(KAFKA_PORT, new EndpointInfo("localhost", 54321)));
+        when(lifecycleManager.createAndStart(any())).thenReturn(info);
+
+        ArgumentCaptor<ContainerSpec> specCaptor = ArgumentCaptor.forClass(ContainerSpec.class);
+        manager.startContainer(cluster);
+
+        verify(lifecycleManager).createAndStart(specCaptor.capture());
+        assertEquals(tempDir.resolve("msk").resolve("test-cluster").toAbsolutePath(),
+                Path.of(specCaptor.getValue().binds().get(0).getPath()).toAbsolutePath());
+    }
+
+    @Test
+    void startContainerDoesNotReuseLegacyPathForScopedCluster() throws Exception {
+        when(containerDetector.isRunningInContainer()).thenReturn(false);
+        when(portAllocator.allocate(9300, 9399)).thenReturn(54321);
+        Files.createDirectories(tempDir.resolve("msk").resolve("test-cluster"));
+
+        MskCluster cluster = newCluster();
+        cluster.setResourceRegion("us-east-1");
+        ContainerInfo info = new ContainerInfo("container-scoped",
+                Map.of(KAFKA_PORT, new EndpointInfo("localhost", 54321)));
+        when(lifecycleManager.createAndStart(any())).thenReturn(info);
+
+        ArgumentCaptor<ContainerSpec> specCaptor = ArgumentCaptor.forClass(ContainerSpec.class);
+        manager.startContainer(cluster);
+
+        verify(lifecycleManager).createAndStart(specCaptor.capture());
+        assertTrue(Path.of(specCaptor.getValue().binds().get(0).getPath()).toAbsolutePath()
+                .toString().contains("000000000000"));
+        assertTrue(Path.of(specCaptor.getValue().binds().get(0).getPath()).toAbsolutePath()
+                .toString().contains("us-east-1"));
     }
 
     @Test

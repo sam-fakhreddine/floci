@@ -50,14 +50,18 @@ Disabling verification (`--no-verify-ssl`, `verify=False`, `NODE_TLS_REJECT_UNAU
 | `FLOCI_TLS_KEY_PATH` | *(unset)* | Path to PEM private key file |
 | `FLOCI_TLS_SELF_SIGNED` | `true` | Auto-generate a server certificate signed by Floci's local CA when no cert/key paths provided |
 
+With TLS enabled, the proxy that accepts HTTP and HTTPS on Floci's ports listens on `QUARKUS_HTTP_HOST` (`127.0.0.1` by default). As without TLS, any address outside loopback also needs `FLOCI_SECURITY_ALLOW_UNSAFE_NETWORK_EXPOSURE=true`; see [Network Exposure](./environment-variables.md#network-exposure).
+
 ## Local CA and Server Certificate
 
 When `FLOCI_TLS_ENABLED=true` and no custom certificate is provided, Floci keeps a local root CA at `{persistent-path}/tls/floci-root-ca.crt` (key `floci-root-ca.key`, owner-only) and issues its server certificate `floci-server.crt` from it at startup. The server certificate:
 
 - Is persisted to `{persistent-path}/tls/` and reused across restarts
 - Includes `localhost`, `127.0.0.1`, `0.0.0.0`, `*.localhost`, `localhost.floci.io`,
-  `*.localhost.floci.io`, `*.execute-api.localhost.floci.io`, and
-  `*.execute-api.localhost.localstack.cloud` as Subject Alternative Names (SANs)
+  `*.localhost.floci.io`, `*.execute-api.localhost.floci.io`,
+  `*.execute-api.localhost.localstack.cloud`, `*.cloudfront.localhost.floci.io`,
+  `*.cloudfront.localhost`, and `*.dkr.ecr.<region>.localhost.floci.io` for every advertised
+  AWS region as Subject Alternative Names (SANs)
 - Automatically includes custom hostnames from `FLOCI_HOSTNAME`, `FLOCI_BASE_URL` and `FLOCI_SERVICES_IOT_ENDPOINT_ADDRESS` in the SANs
 - Is regenerated when hostname configuration changes between restarts, or when it was not issued by the current CA
 

@@ -9,9 +9,8 @@ import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
@@ -38,13 +37,13 @@ class TlsProxyServerReservedPortTest {
         // stage it directly on failedPorts.
         NetServer server = mock(NetServer.class);
         when(server.connectHandler(any())).thenReturn(server);
-        when(server.listen()).thenReturn(Promise.<NetServer>promise().future());
+        when(server.listen()).thenReturn(Future.succeededFuture(server), Promise.<NetServer>promise().future());
 
         Vertx vertx = mock(Vertx.class);
         when(vertx.createNetClient()).thenReturn(mock(NetClient.class));
         when(vertx.createNetServer(any())).thenReturn(server);
 
-        return new TlsProxyServer(vertx, config, 4510, 4511);
+        return new TlsProxyServer(vertx, config, "127.0.0.1", 4510, 4511);
     }
 
     /**
@@ -53,6 +52,14 @@ class TlsProxyServerReservedPortTest {
      */
     private static TlsProxyServer proxyWith(int flociPort, boolean tlsEnabled, int awsHttpsPort,
                                             Future<NetServer> outcome,
+                                            java.util.function.Consumer<TlsProxyServer> beforeStart) {
+        return proxyWith(flociPort, tlsEnabled, awsHttpsPort,
+                Future.succeededFuture(mock(NetServer.class)), outcome, beforeStart);
+    }
+
+    private static TlsProxyServer proxyWith(int flociPort, boolean tlsEnabled, int awsHttpsPort,
+                                            Future<NetServer> publicOutcome,
+                                            Future<NetServer> awsHttpsOutcome,
                                             java.util.function.Consumer<TlsProxyServer> beforeStart) {
         EmulatorConfig.TlsConfig tls = mock(EmulatorConfig.TlsConfig.class);
         when(tls.enabled()).thenReturn(tlsEnabled);
@@ -63,13 +70,13 @@ class TlsProxyServerReservedPortTest {
 
         NetServer server = mock(NetServer.class);
         when(server.connectHandler(any())).thenReturn(server);
-        when(server.listen()).thenReturn(outcome);
+        when(server.listen()).thenReturn(publicOutcome, awsHttpsOutcome);
 
         Vertx vertx = mock(Vertx.class);
         when(vertx.createNetClient()).thenReturn(mock(NetClient.class));
         when(vertx.createNetServer(any())).thenReturn(server);
 
-        TlsProxyServer proxy = new TlsProxyServer(vertx, config, 4510, 4511);
+        TlsProxyServer proxy = new TlsProxyServer(vertx, config, "127.0.0.1", 4510, 4511);
         beforeStart.accept(proxy);
         return proxy;
     }
@@ -112,6 +119,15 @@ class TlsProxyServerReservedPortTest {
         assertTrue(released.contains(443),
                 "a listener that yielded 443 has no other way to learn the bind failed");
         assertFalse(proxy.reservesPort(443));
+    }
+
+    @Test
+    void failsStartupWhenThePublicPortCannotBind() {
+        assertThrows(IllegalStateException.class, () -> proxyWith(4566, true, 443,
+                Future.failedFuture(new RuntimeException("address already in use")),
+                Future.succeededFuture(mock(NetServer.class)),
+                ignored -> {
+                }));
     }
 
     @Test

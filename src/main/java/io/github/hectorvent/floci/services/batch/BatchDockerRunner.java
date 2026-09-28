@@ -13,6 +13,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.services.batch.model.BatchJob;
 import io.github.hectorvent.floci.services.batch.model.BatchKeyValue;
+import io.github.hectorvent.floci.services.batch.model.BatchNodeExecution;
 import io.github.hectorvent.floci.services.batch.model.BatchResourceRequirement;
 import io.github.hectorvent.floci.services.batch.model.BatchRunResult;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -24,6 +25,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 @ApplicationScoped
@@ -35,6 +37,7 @@ public class BatchDockerRunner implements ContainerTeardown {
     // Containers of jobs currently inside run(); drained on emulator shutdown so a
     // SIGTERM mid-job does not orphan the container.
     private final ConcurrentHashMap<String, String> inFlightContainers = new ConcurrentHashMap<>();
+    private final Set<String> stopRequestedJobs = ConcurrentHashMap.newKeySet();
 
     private final ContainerBuilder containerBuilder;
     private final ContainerLifecycleManager lifecycleManager;
@@ -56,21 +59,47 @@ public class BatchDockerRunner implements ContainerTeardown {
     }
 
     public BatchRunResult run(BatchJob job, int attemptNumber) {
-        long startedAt = System.currentTimeMillis();
         String logStreamName = logStreamer.generateLogStreamName(
                 job.getJobDefinitionName() + "/default/" + job.getJobId());
-        String containerName = ContainerStorageHelper.dockerName(config, "floci-batch-" + job.getJobId() + "-" + attemptNumber);
+        String containerName = ContainerStorageHelper.dockerName(config, "batch-" + job.getJobId() + "-" + attemptNumber);
+        return runContainer(job, job.getJobId(), containerName, logStreamName,
+                "batch:" + job.getJobName() + ":" + job.getJobId(),
+                job.getContainerImage(), "Job definition container image is missing",
+                job.getResolvedCommand(), buildEnvironment(job, attemptNumber), job.getResourceRequirements());
+    }
+
+    // A distinct inFlightContainers key per node, since nodes of one job run concurrently.
+    public BatchRunResult run(BatchJob job, int attemptNumber, BatchNodeExecution node) {
+        String logStreamName = logStreamer.generateLogStreamName(
+                job.getJobDefinitionName() + "/default/" + job.getJobId() + "/" + node.getNodeIndex());
+        String containerName = ContainerStorageHelper.dockerName(config,
+                "batch-" + job.getJobId() + "-" + attemptNumber + "-node" + node.getNodeIndex());
+        String inFlightKey = job.getJobId() + "#node" + node.getNodeIndex();
+        return runContainer(job, inFlightKey, containerName, logStreamName,
+                "batch:" + job.getJobName() + ":" + job.getJobId() + ":node" + node.getNodeIndex(),
+                node.getContainerImage(), "Node " + node.getNodeIndex() + " container image is missing",
+                node.getResolvedCommand(), buildNodeEnvironment(job, attemptNumber, node), node.getResourceRequirements());
+    }
+
+    private BatchRunResult runContainer(BatchJob job, String inFlightKey, String containerName, String logStreamName,
+                                        String logSourceLabel, String image, String missingImageMessage,
+                                        List<String> command, List<String> env,
+                                        List<BatchResourceRequirement> resourceRequirements) {
+        long startedAt = System.currentTimeMillis();
         Closeable logHandle = null;
         String containerId = null;
 
         try {
-            if (job.getContainerImage() == null || job.getContainerImage().isBlank()) {
-                return failed(startedAt, logStreamName, "Job definition container image is missing");
+            if (stopRequestedJobs.contains(job.getJobId())) {
+                return stopped(startedAt, logStreamName);
+            }
+            if (image == null || image.isBlank()) {
+                return failed(startedAt, logStreamName, missingImageMessage);
             }
 
-            ContainerBuilder.Builder builder = containerBuilder.newContainer(job.getContainerImage())
+            ContainerBuilder.Builder builder = containerBuilder.newContainer(image)
                     .withName(containerName)
-                    .withEnv(buildEnvironment(job, attemptNumber))
+                    .withEnv(env)
                     .withDockerNetwork(config.services().batch().dockerNetwork())
                     .withHostDockerInternalOnLinux()
                     .withEmbeddedDns()
@@ -78,20 +107,27 @@ public class BatchDockerRunner implements ContainerTeardown {
                     .withLabels(ContainerStorageHelper.resourceIdentityLabels(
                             "batch", job.getJobId(), job.getAccountId(), job.getRegion()));
 
-            if (job.getResolvedCommand() != null && !job.getResolvedCommand().isEmpty()) {
-                builder.withCmd(job.getResolvedCommand());
+            if (command != null && !command.isEmpty()) {
+                builder.withCmd(command);
             }
-            applyResourceRequirements(builder, job);
+            applyResourceRequirements(builder, resourceRequirements, job.getJobId());
 
             ContainerSpec spec = builder.build();
             containerId = lifecycleManager.createAndStart(spec).containerId();
-            inFlightContainers.put(job.getJobId(), containerId);
-            logHandle = logStreamer.attach(containerId, LOG_GROUP, logStreamName, job.getRegion(),
-                    "batch:" + job.getJobName() + ":" + job.getJobId());
+            inFlightContainers.put(inFlightKey, containerId);
+            if (stopRequestedJobs.contains(job.getJobId())) {
+                releaseAndStop(inFlightKey, containerId, null);
+                return stopped(startedAt, logStreamName);
+            }
+            logHandle = logStreamer.attach(containerId, LOG_GROUP, logStreamName, job.getRegion(), logSourceLabel);
+            if (stopRequestedJobs.contains(job.getJobId())) {
+                releaseAndStop(inFlightKey, containerId, logHandle);
+                return stopped(startedAt, logStreamName);
+            }
 
             Integer exitCode = waitForExit(containerId, timeout(job));
             long stoppedAt = System.currentTimeMillis();
-            releaseAndStop(job.getJobId(), containerId, logHandle);
+            releaseAndStop(inFlightKey, containerId, logHandle);
             if (exitCode == null) {
                 return new BatchRunResult(137, "Job timed out", logStreamName, startedAt, stoppedAt, true);
             }
@@ -100,13 +136,36 @@ public class BatchDockerRunner implements ContainerTeardown {
         } catch (Exception e) {
             LOG.warnv("Batch Docker job {0} failed: {1}", job.getJobId(), e.getMessage());
             if (containerId != null) {
-                releaseAndStop(job.getJobId(), containerId, logHandle);
+                releaseAndStop(inFlightKey, containerId, logHandle);
             }
             return failed(startedAt, logStreamName, e.getMessage());
         }
     }
 
-    // Whoever wins the map removal owns the stop — stopManagedContainers() may have
+    public void requestStop(String jobId) {
+        stopRequestedJobs.add(jobId);
+    }
+
+    public void stopJob(String jobId) {
+        for (Map.Entry<String, String> entry : new ConcurrentHashMap<>(inFlightContainers).entrySet()) {
+            if (!entry.getKey().equals(jobId) && !entry.getKey().startsWith(jobId + "#node")) {
+                continue;
+            }
+            if (inFlightContainers.remove(entry.getKey(), entry.getValue())) {
+                try {
+                    lifecycleManager.stopAndRemove(entry.getValue(), null);
+                } catch (Exception e) {
+                    LOG.warnv("Failed to stop Batch container for job {0}: {1}", jobId, e.getMessage());
+                }
+            }
+        }
+    }
+
+    public void clearStopRequest(String jobId) {
+        stopRequestedJobs.remove(jobId);
+    }
+
+    // Whoever wins the map removal owns the stop. stopManagedContainers() may have
     // claimed the container first during shutdown, but the log stream is still ours.
     private void releaseAndStop(String jobId, String containerId, Closeable logHandle) {
         if (inFlightContainers.remove(jobId, containerId)) {
@@ -142,7 +201,31 @@ public class BatchDockerRunner implements ContainerTeardown {
         return new BatchRunResult(1, reason, logStreamName, startedAt, System.currentTimeMillis(), false);
     }
 
+    private BatchRunResult stopped(long startedAt, String logStreamName) {
+        return new BatchRunResult(137, "Job terminated", logStreamName,
+                startedAt, System.currentTimeMillis(), false);
+    }
+
     private List<String> buildEnvironment(BatchJob job, int attemptNumber) {
+        List<String> env = baseEnvironment(job, attemptNumber);
+        appendEnvironment(env, job.getResolvedEnvironment());
+        return env;
+    }
+
+    private List<String> buildNodeEnvironment(BatchJob job, int attemptNumber, BatchNodeExecution node) {
+        List<String> env = baseEnvironment(job, attemptNumber);
+        int numNodes = job.getNodeProperties() != null && job.getNodeProperties().getNumNodes() != null
+                ? job.getNodeProperties().getNumNodes() : 1;
+        int mainNode = job.getNodeProperties() != null && job.getNodeProperties().getMainNode() != null
+                ? job.getNodeProperties().getMainNode() : 0;
+        env.add("AWS_BATCH_JOB_NODE_INDEX=" + node.getNodeIndex());
+        env.add("AWS_BATCH_JOB_MAIN_NODE_INDEX=" + mainNode);
+        env.add("AWS_BATCH_JOB_NUM_NODES=" + numNodes);
+        appendEnvironment(env, node.getResolvedEnvironment());
+        return env;
+    }
+
+    private List<String> baseEnvironment(BatchJob job, int attemptNumber) {
         List<String> env = new ArrayList<>();
         env.add("AWS_REGION=" + job.getRegion());
         env.add("AWS_DEFAULT_REGION=" + job.getRegion());
@@ -158,12 +241,16 @@ public class BatchDockerRunner implements ContainerTeardown {
         env.add("AWS_BATCH_JOB_ATTEMPT=" + attemptNumber);
         env.add("AWS_BATCH_JQ_NAME=" + job.getJobQueueName());
         env.add("AWS_BATCH_CE_NAME=local");
-        if (job.getResolvedEnvironment() != null) {
-            for (BatchKeyValue kv : job.getResolvedEnvironment()) {
-                env.add(kv.getName() + "=" + (kv.getValue() != null ? kv.getValue() : ""));
-            }
-        }
         return env;
+    }
+
+    private void appendEnvironment(List<String> env, List<BatchKeyValue> resolvedEnvironment) {
+        if (resolvedEnvironment == null) {
+            return;
+        }
+        for (BatchKeyValue kv : resolvedEnvironment) {
+            env.add(kv.getName() + "=" + (kv.getValue() != null ? kv.getValue() : ""));
+        }
     }
 
     String resolveEndpointHostname() {
@@ -173,11 +260,12 @@ public class BatchDockerRunner implements ContainerTeardown {
         return "host.docker.internal";
     }
 
-    private void applyResourceRequirements(ContainerBuilder.Builder builder, BatchJob job) {
-        if (job.getResourceRequirements() == null) {
+    private void applyResourceRequirements(ContainerBuilder.Builder builder,
+                                           List<BatchResourceRequirement> resourceRequirements, String jobId) {
+        if (resourceRequirements == null) {
             return;
         }
-        for (BatchResourceRequirement requirement : job.getResourceRequirements()) {
+        for (BatchResourceRequirement requirement : resourceRequirements) {
             if (!"MEMORY".equalsIgnoreCase(requirement.getType()) || requirement.getValue() == null) {
                 continue;
             }
@@ -185,7 +273,7 @@ public class BatchDockerRunner implements ContainerTeardown {
                 builder.withMemoryMb(Integer.parseInt(requirement.getValue()));
             } catch (NumberFormatException e) {
                 LOG.warnv("Ignoring invalid Batch MEMORY resource value for job {0}: {1}",
-                        job.getJobId(), requirement.getValue());
+                        jobId, requirement.getValue());
             }
             return;
         }

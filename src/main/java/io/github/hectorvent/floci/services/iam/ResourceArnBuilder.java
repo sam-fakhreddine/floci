@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.iam;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.AwsRegions;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.container.ContainerRequestContext;
@@ -49,7 +50,7 @@ public class ResourceArnBuilder {
         }
         String path = ctx.getUriInfo().getPath();
         return switch (credentialScope) {
-            case "s3"             -> List.of(buildS3Arn(path));
+            case "s3"             -> List.of(buildS3Arn(path, region));
             case "lambda"         -> List.of(buildLambdaArn(path, region, accountId));
             case "sqs"            -> List.of(buildSqsArn(ctx, region, accountId));
             case "sns"            -> List.of(buildSnsArn(ctx, region, accountId));
@@ -63,17 +64,25 @@ public class ResourceArnBuilder {
     }
 
     // ── S3 ──────────────────────────────────────────────────────────────────────
-    private String buildS3Arn(String path) {
+    // Minted in the request's partition; IamEnforcementFilter re-mints an existing bucket's ARN
+    // in the bucket's own partition through S3ResourcePolicyProvider before any policy sees it.
+    private String buildS3Arn(String path, String region) {
         // path: /bucket or /bucket/key
+        String partition = AwsRegions.partitionFor(region);
         String stripped = path.startsWith("/") ? path.substring(1) : path;
         if (stripped.isEmpty()) {
-            return AwsArnUtils.Arn.of("s3", "", "", "*").toString();
+            return AwsArnUtils.Arn.global(partition, "s3", "", "*").toString();
         }
-        int slash = stripped.indexOf('/');
-        if (slash < 0) {
-            return AwsArnUtils.Arn.of("s3", "", "", stripped).toString();
+        // S3VirtualHostFilter rewrites a bucket-level virtual-hosted request (GET /) to
+        // /bucket/, and the empty key after that separator is not part of the resource.
+        // A policy names the bucket as arn:<partition>:s3:::bucket, so the trailing slash has to
+        // go or a bucket-level ARN never matches. A key that itself ends in a slash
+        // (a folder marker such as folder/) keeps it, because there the slash is key data.
+        int firstSlash = stripped.indexOf('/');
+        if (firstSlash == stripped.length() - 1) {
+            stripped = stripped.substring(0, firstSlash);
         }
-        return AwsArnUtils.Arn.of("s3", "", "", stripped).toString();
+        return AwsArnUtils.Arn.global(partition, "s3", "", stripped).toString();
     }
 
     // ── Lambda ──────────────────────────────────────────────────────────────────
@@ -263,7 +272,7 @@ public class ResourceArnBuilder {
     }
 
     private String toDynamoDbTableArn(String tableName, String region, String accountId) {
-        if (tableName.startsWith("arn:aws:dynamodb:")) {
+        if (AwsArnUtils.isArnFor(tableName, "dynamodb")) {
             return tableName;
         }
         return AwsArnUtils.Arn.of("dynamodb", region, accountId, "table/" + tableName).toString();
@@ -282,7 +291,7 @@ public class ResourceArnBuilder {
             if (json.hasNonNull("StreamName")) {
                 String streamName = json.get("StreamName").asText().trim();
                 if (!streamName.isEmpty()) {
-                    if (streamName.startsWith("arn:aws:kinesis:")) {
+                    if (AwsArnUtils.isArnFor(streamName, "kinesis")) {
                         return streamName;
                     }
                     return AwsArnUtils.Arn.of("kinesis", region, accountId, "stream/" + streamName).toString();
@@ -305,7 +314,7 @@ public class ResourceArnBuilder {
             if (json.hasNonNull("SecretId")) {
                 String secretId = json.get("SecretId").asText().trim();
                 if (!secretId.isEmpty()) {
-                    if (secretId.startsWith("arn:aws:secretsmanager:")) {
+                    if (AwsArnUtils.isArnFor(secretId, "secretsmanager")) {
                         return secretId;
                     }
                     return AwsArnUtils.Arn.of("secretsmanager", region, accountId, "secret:" + secretId).toString();
@@ -322,7 +331,7 @@ public class ResourceArnBuilder {
             if (json.hasNonNull("Name")) {
                 String name = json.get("Name").asText().trim();
                 if (!name.isEmpty()) {
-                    if (name.startsWith("arn:aws:ssm:")) {
+                    if (AwsArnUtils.isArnFor(name, "ssm")) {
                         return name;
                     }
                     String paramResource = name.startsWith("/") ? "parameter" + name : "parameter/" + name;

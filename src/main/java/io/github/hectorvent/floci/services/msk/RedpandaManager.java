@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.msk;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
@@ -19,6 +20,7 @@ import org.jboss.logging.Logger;
 import java.io.Closeable;
 import java.net.HttpURLConnection;
 import java.net.URI;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -112,7 +114,7 @@ public class RedpandaManager {
         String containerName = ContainerStorageHelper.resourceName(config, "msk", cluster.getVolumeId(), cluster.getClusterName());
 
         // Cleanup stale container
-        lifecycleManager.removeIfExists(containerName);
+        ContainerStorageHelper.removeStaleContainer(config, lifecycleManager, containerName);
 
         // Redpanda embeds broker addresses in Kafka protocol responses (Metadata,
         // FindCoordinator, ...) and clients reconnect directly to whatever address
@@ -149,8 +151,9 @@ public class RedpandaManager {
                 .withDockerNetwork(config.services().dockerNetwork())
                 .withLogRotation()
                 .withLabels(ContainerStorageHelper.resourceIdentityLabels(
-                        "msk", cluster.getClusterName(), regionResolver.getAccountId(),
-                        regionResolver.getDefaultRegion()));
+                        "msk", cluster.getClusterName(),
+                        AwsArnUtils.accountOrDefault(cluster.getClusterArn(), regionResolver.getAccountId()),
+                        AwsArnUtils.regionOrDefault(cluster.getClusterArn(), regionResolver.getDefaultRegion())));
 
         if (!containerDetector.isRunningInContainer()) {
             specBuilder.withPortBinding(KAFKA_PORT, kafkaHostPort).withDynamicPort(ADMIN_PORT);
@@ -160,13 +163,11 @@ public class RedpandaManager {
 
         // Handle persistence mounting
         if (ContainerStorageHelper.isNamedVolumeMode(config)) {
-            ContainerStorageHelper.applyStorage(specBuilder, lifecycleManager, config,
-                    "msk", cluster.getVolumeId(), cluster.getClusterName(),
-                    "/var/lib/redpanda/data");
+            ContainerStorageHelper.applyNamedVolume(specBuilder, lifecycleManager,
+                    resolveVolumeName(cluster), "/var/lib/redpanda/data");
         } else {
             // Legacy host-path mode: host-persistent-path is an absolute path
-            String hostDataPath = ContainerStorageHelper.hostResourcePath(config, "msk", cluster.getClusterName())
-                    .toAbsolutePath().toString();
+            String hostDataPath = legacyCompatibleHostPath(cluster).toAbsolutePath().toString();
             if (!containerDetector.isRunningInContainer()) {
                 ContainerStorageHelper.ensureHostDir(hostDataPath);
             }
@@ -200,12 +201,13 @@ public class RedpandaManager {
                 : info.containerId();
         String logGroup = "/aws/msk/cluster/" + cluster.getClusterName();
         String logStream = logStreamer.generateLogStreamName(shortId);
-        String region = regionResolver.getDefaultRegion();
+        String region = AwsArnUtils.regionOrDefault(cluster.getClusterArn(), regionResolver.getDefaultRegion());
 
-        Closeable logHandle = logStreamer.attach(
-                info.containerId(), logGroup, logStream, region, "msk:" + cluster.getClusterName());
+        String account = AwsArnUtils.accountOrDefault(cluster.getClusterArn(), regionResolver.getDefaultAccountId());
+        Closeable logHandle = logStreamer.attachForAccount(
+                account, info.containerId(), logGroup, logStream, region, "msk:" + cluster.getClusterName());
         if (logHandle != null) {
-            logStreams.put(cluster.getClusterName(), logHandle);
+            logStreams.put(clusterIdentityKey(cluster), logHandle);
         }
     }
 
@@ -249,7 +251,7 @@ public class RedpandaManager {
         }
 
         // Close log stream
-        Closeable logHandle = logStreams.remove(cluster.getClusterName());
+        Closeable logHandle = logStreams.remove(clusterIdentityKey(cluster));
 
         lifecycleManager.stopAndRemove(cluster.getContainerId(), logHandle);
         LOG.infov("Redpanda container {0} stopped and removed", cluster.getContainerId());
@@ -277,7 +279,40 @@ public class RedpandaManager {
     }
 
     public void removeClusterStorage(MskCluster cluster) {
-        ContainerStorageHelper.removeStorage(config, lifecycleManager,
-                "msk", cluster.getVolumeId(), cluster.getClusterName());
+        ContainerStorageHelper.removeNamedVolume(config, lifecycleManager, resolveVolumeName(cluster));
     }
+
+    private String clusterIdentityKey(MskCluster cluster) {
+        return cluster.getClusterArn() != null ? cluster.getClusterArn() : cluster.getClusterName();
+    }
+
+    private String clusterStorageId(MskCluster cluster) {
+        String account = AwsArnUtils.accountOrDefault(cluster.getClusterArn(), regionResolver.getDefaultAccountId());
+        String region = AwsArnUtils.regionOrDefault(cluster.getClusterArn(), regionResolver.getDefaultRegion());
+        return ContainerStorageHelper.dockerName(config,
+                "msk-" + account + "-" + region + "-" + cluster.getClusterName());
+    }
+
+    private Path legacyCompatibleHostPath(MskCluster cluster) {
+        Path scopedPath = ContainerStorageHelper.hostResourcePath(config, "msk", clusterStorageId(cluster));
+        Path legacyPath = ContainerStorageHelper.hostResourcePath(config, "msk", cluster.getClusterName());
+        return cluster.getResourceRegion() == null && Files.exists(legacyPath)
+                ? legacyPath
+                : scopedPath;
+    }
+
+    /**
+     * The cluster's Docker volume name, backfilled once for records written before the field existed:
+     * those predate the {@code floci-aws-} migration, so their data is in the legacy-named volume
+     * and must keep resolving there. Never use the live helper here, which would strand that data
+     * under a freshly created volume.
+     */
+    private String resolveVolumeName(MskCluster cluster) {
+        if (cluster.getDockerVolumeName() == null || cluster.getDockerVolumeName().isBlank()) {
+            cluster.setDockerVolumeName(ContainerStorageHelper.legacyResourceName(
+                    config, "msk", cluster.getVolumeId(), cluster.getClusterName()));
+        }
+        return cluster.getDockerVolumeName();
+    }
+
 }

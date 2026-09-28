@@ -16,6 +16,7 @@ import io.github.hectorvent.floci.services.kinesis.KinesisJsonHandler;
 import io.github.hectorvent.floci.services.sns.SnsJsonHandler;
 import io.github.hectorvent.floci.services.sqs.SqsJsonHandler;
 import io.github.hectorvent.floci.services.stepfunctions.StepFunctionsJsonHandler;
+import io.github.hectorvent.floci.services.marketplace.MarketplaceEntitlementController;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.*;
 import jakarta.ws.rs.core.Context;
@@ -57,6 +58,7 @@ public class AwsJsonCborController {
     private final KinesisJsonHandler kinesisJsonHandler;
     private final StepFunctionsJsonHandler sfnJsonHandler;
     private final CloudWatchMetricsJsonHandler cloudWatchMetricsJsonHandler;
+    private final MarketplaceEntitlementController marketplaceEntitlementController;
 
     @Inject
     public AwsJsonCborController(ObjectMapper objectMapper, ResolvedServiceCatalog catalog,
@@ -66,7 +68,8 @@ public class AwsJsonCborController {
                                  SqsJsonHandler sqsJsonHandler, SnsJsonHandler snsJsonHandler,
                                  KinesisJsonHandler kinesisJsonHandler,
                                  StepFunctionsJsonHandler sfnJsonHandler,
-                                 CloudWatchMetricsJsonHandler cloudWatchMetricsJsonHandler) {
+                                 CloudWatchMetricsJsonHandler cloudWatchMetricsJsonHandler,
+                                 MarketplaceEntitlementController marketplaceEntitlementController) {
         this.objectMapper = objectMapper;
         this.catalog = catalog;
         this.regionResolver = regionResolver;
@@ -77,6 +80,7 @@ public class AwsJsonCborController {
         this.kinesisJsonHandler = kinesisJsonHandler;
         this.sfnJsonHandler = sfnJsonHandler;
         this.cloudWatchMetricsJsonHandler = cloudWatchMetricsJsonHandler;
+        this.marketplaceEntitlementController = marketplaceEntitlementController;
     }
 
 
@@ -381,16 +385,15 @@ public class AwsJsonCborController {
             byte[] body) {
 
         if (target == null) {
-            return null;
+            return cborUnknownOperationError("Missing X-Amz-Target header.", httpHeaders);
         }
 
-        // Upstream CBOR behavior is to return null for targets this controller
-        // does not dispatch (JAX-RS then serves 204). The JSON 1.0/1.1
-        // controllers return UnknownOperationException instead; CBOR stays on
-        // null here to preserve pre-refactor semantics.
+        // Symmetric with the JSON 1.0/1.1 controllers: a target this controller cannot
+        // resolve is an unknown operation, not an empty 204. The 204 fallback now applies
+        // only to a resolved service whose action this handler does not dispatch.
         ServiceCatalog.TargetMatch targetMatch = catalog.matchTarget(target).orElse(null);
         if (targetMatch == null) {
-            return null;
+            return cborUnknownOperationError("Unknown operation: " + target, httpHeaders);
         }
 
         String serviceKey = targetMatch.descriptor().externalKey();
@@ -482,24 +485,19 @@ public class AwsJsonCborController {
             case "kinesis" -> kinesisJsonHandler.handle(operation, request, region);
             case "states" -> sfnJsonHandler.handle(operation, request, region);
             case "monitoring" -> cloudWatchMetricsJsonHandler.handle(operation, request, region);
+            case "marketplace" -> marketplaceEntitlementController.handle(operation, request, region);
             default -> null;
         };
     }
 
+    private Response cborUnknownOperationError(String message, HttpHeaders httpHeaders) {
+        return cborErrorResponse(
+                new AwsException("UnknownOperationException", message, 404),
+                "smithy-protocol", responseContentType(httpHeaders));
+    }
+
     private Response cborErrorResponse(AwsException e, String protocolHeader, String mediaType) {
-        try {
-            byte[] errBytes = CBOR_MAPPER.writeValueAsBytes(
-                    new AwsErrorResponse(e.jsonType(), e.getMessage()));
-            String queryErrorFault = (e.getHttpStatus() < 500) ? "Sender" : "Receiver";
-            return Response.status(e.getHttpStatus())
-                    .header(protocolHeader, "rpc-v2-cbor")
-                    .header("x-amzn-query-error", e.getErrorCode() + ";" + queryErrorFault)
-                    .type(mediaType)
-                    .entity(errBytes)
-                    .build();
-        } catch (Exception ex) {
-            return Response.status(e.getHttpStatus()).build();
-        }
+        return CborErrorResponses.of(e, mediaType);
     }
 
     private String responseContentType(HttpHeaders httpHeaders) {

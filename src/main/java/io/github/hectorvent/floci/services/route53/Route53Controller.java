@@ -23,10 +23,8 @@ import jakarta.ws.rs.PathParam;
 import jakarta.ws.rs.QueryParam;
 import jakarta.ws.rs.core.Response;
 
-import javax.xml.stream.XMLInputFactory;
 import javax.xml.stream.XMLStreamConstants;
 import javax.xml.stream.XMLStreamReader;
-import java.io.StringReader;
 import java.net.URI;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -41,36 +39,7 @@ public class Route53Controller {
     private static final String NS = AwsNamespaces.ROUTE53;
     private static final String XML = "application/xml";
 
-    /**
-     * The {@code VPCRegion} enum, verbatim from the Route 53 model. Deliberately not
-     * {@code AwsRegions.KNOWN_IDS}: the enum admits the ISO and European Sovereign
-     * partitions that this emulator never advertises, and rejecting those would refuse
-     * requests AWS accepts.
-     */
-    private static final Set<String> VPC_REGIONS = Set.of(
-            "us-east-1", "us-east-2", "us-west-1", "us-west-2",
-            "eu-west-1", "eu-west-2", "eu-west-3", "eu-central-1", "eu-central-2",
-            "ap-east-1", "ap-east-2", "me-south-1", "me-central-1",
-            "us-gov-west-1", "us-gov-east-1",
-            "us-iso-east-1", "us-iso-west-1", "us-isob-east-1", "us-isob-west-1",
-            "us-isof-south-1", "us-isof-east-1", "eu-isoe-west-1", "eusc-de-east-1",
-            "ap-southeast-1", "ap-southeast-2", "ap-southeast-3", "ap-southeast-4",
-            "ap-southeast-5", "ap-southeast-6", "ap-southeast-7",
-            "ap-south-1", "ap-south-2",
-            "ap-northeast-1", "ap-northeast-2", "ap-northeast-3",
-            "eu-north-1", "sa-east-1", "ca-central-1", "ca-west-1",
-            "cn-north-1", "cn-northwest-1",
-            "af-south-1", "eu-south-1", "eu-south-2",
-            "il-central-1", "mx-central-1");
-
-    private static final XMLInputFactory XML_FACTORY;
-
-    static {
-        XML_FACTORY = XMLInputFactory.newInstance();
-        XML_FACTORY.setProperty(XMLInputFactory.IS_NAMESPACE_AWARE, true);
-        XML_FACTORY.setProperty(XMLInputFactory.IS_SUPPORTING_EXTERNAL_ENTITIES, false);
-        XML_FACTORY.setProperty(XMLInputFactory.SUPPORT_DTD, false);
-    }
+    private static final Set<String> CHANGE_ACTIONS = Set.of("CREATE", "DELETE", "UPSERT");
 
     @Inject
     Route53Service service;
@@ -124,6 +93,28 @@ public class Route53Controller {
                     .raw(xmlDelegationSet())
                     .raw(xmlVpcAssociations(zone.getVpcAssociations()))
                     .end("GetHostedZoneResponse")
+                    .build();
+            return Response.ok(xml, XML).build();
+        } catch (AwsException e) {
+            return xmlErrorResponse(e);
+        }
+    }
+
+    @POST
+    @Path("/hostedzone/{Id}")
+    public Response updateHostedZoneComment(@PathParam("Id") String id, String body) {
+        try {
+            if (body != null && !body.isBlank()
+                    && !"UpdateHostedZoneCommentRequest".equals(XmlParser.rootElementName(body))) {
+                throw new AwsException("InvalidInput",
+                        "The request body must be an UpdateHostedZoneCommentRequest document.", 400);
+            }
+            String comment = XmlParser.extractFirst(body, "Comment", null);
+            HostedZone zone = service.updateHostedZoneComment(id, comment);
+            String xml = new XmlBuilder()
+                    .start("UpdateHostedZoneCommentResponse", NS)
+                    .raw(xmlHostedZone(zone))
+                    .end("UpdateHostedZoneCommentResponse")
                     .build();
             return Response.ok(xml, XML).build();
         } catch (AwsException e) {
@@ -643,7 +634,7 @@ public class Route53Controller {
                     .start("HealthCheckObservations")
                     .start("HealthCheckObservation")
                     .elem("IPAddress", "1.2.3.4")
-                    .elem("Region", "us-east-1")
+                    .elem("Region", "us-east-1") // partition-literal: health-check observation fixture
                     .start("StatusReport")
                     .elem("Status", "Success: HTTP Status Code 200, OK")
                     .elem("CheckedTime", now)
@@ -897,11 +888,29 @@ public class Route53Controller {
      * the later disassociate and ListHostedZonesByVPC silently miss it.
      */
     private static void requireModelledVpcRegion(String vpcRegion) {
-        if (!VPC_REGIONS.contains(vpcRegion)) {
+        if (!Route53VpcRegions.VPC_REGIONS.contains(vpcRegion)) {
             throw new AwsException("InvalidInput",
                     "Invalid value '" + vpcRegion + "' at 'VPCRegion' failed to satisfy constraint: "
                             + "Member must satisfy enum value set.", 400);
         }
+    }
+
+    private static void requireExactlyOneRecordShape(String action, ResourceRecordSet rrs, boolean hasRecords) {
+        boolean hasAlias = rrs.getAliasTarget() != null;
+        boolean hasTtl = rrs.getTtl() != null;
+        String found;
+        if (hasAlias && (hasTtl || hasRecords)) {
+            found = "more than one";
+        } else if (!hasAlias && !(hasTtl && hasRecords)) {
+            found = "none";
+        } else {
+            return;
+        }
+        throw new AwsException("InvalidInput",
+                "Invalid request: Expected exactly one of [AliasTarget, all of [TTL, and ResourceRecords], "
+                        + "or TrafficPolicyInstanceId], but found " + found + " in Change with [Action=" + action
+                        + ", Name=" + rrs.getName() + ", Type=" + rrs.getType()
+                        + ", SetIdentifier=" + rrs.getSetIdentifier() + "]", 400);
     }
 
     /**
@@ -910,10 +919,20 @@ public class Route53Controller {
      */
     private List<Map<String, Object>> parseChangeBatch(String body) {
         List<Map<String, Object>> result = new ArrayList<>();
-        if (body == null || body.isEmpty()) return result;
+        if (body != null && !body.isEmpty()) {
+            parseChangeBatchInto(body, result);
+        }
+        if (result.isEmpty()) {
+            throw new AwsException("InvalidInput",
+                    "Invalid XML ; cvc-complex-type.2.4.b: The content of element 'Changes' is not complete. "
+                            + "One of '{\"" + NS + "\":Change}' is expected.", 400);
+        }
+        return result;
+    }
 
+    private void parseChangeBatchInto(String body, List<Map<String, Object>> result) {
         try {
-            XMLStreamReader r = XML_FACTORY.createXMLStreamReader(new StringReader(body));
+            XMLStreamReader r = XmlParser.newStreamReader(body);
             String currentAction = null;
             ResourceRecordSet currentRrs = null;
             List<ResourceRecord> currentRecords = null;
@@ -941,7 +960,14 @@ public class Route53Controller {
                             }
                         }
                         case "Action" -> {
-                            if (inChange && !inRrs) currentAction = r.getElementText();
+                            if (inChange && !inRrs) {
+                                currentAction = r.getElementText();
+                                if (!CHANGE_ACTIONS.contains(currentAction)) {
+                                    throw new AwsException("InvalidInput",
+                                            "Invalid value '" + currentAction + "' at 'Action' failed to satisfy "
+                                                    + "constraint: Member must satisfy enum value set.", 400);
+                                }
+                            }
                         }
                         case "ResourceRecordSet" -> {
                             if (inChange) {
@@ -971,8 +997,14 @@ public class Route53Controller {
                         }
                         case "TTL" -> {
                             if (inRrs && currentRrs != null) {
-                                try { currentRrs.setTtl(Long.parseLong(r.getElementText())); }
-                                catch (NumberFormatException ignored) {}
+                                String ttl = r.getElementText();
+                                try {
+                                    currentRrs.setTtl(Long.parseLong(ttl));
+                                } catch (NumberFormatException e) {
+                                    throw new AwsException("InvalidInput",
+                                            "Invalid value '" + ttl + "' at 'TTL' failed to satisfy constraint: "
+                                                    + "Member must be a valid long.", 400);
+                                }
                             }
                         }
                         case "Value" -> {
@@ -985,8 +1017,14 @@ public class Route53Controller {
                         }
                         case "Weight" -> {
                             if (inRrs && currentRrs != null) {
-                                try { currentRrs.setWeight(Long.parseLong(r.getElementText())); }
-                                catch (NumberFormatException ignored) {}
+                                String weight = r.getElementText();
+                                try {
+                                    currentRrs.setWeight(Long.parseLong(weight));
+                                } catch (NumberFormatException e) {
+                                    throw new AwsException("InvalidInput",
+                                            "Invalid value '" + weight + "' at 'Weight' failed to satisfy "
+                                                    + "constraint: Member must be a valid long.", 400);
+                                }
                             }
                         }
                         case "Region" -> {
@@ -1024,13 +1062,26 @@ public class Route53Controller {
                             currentAlias = null;
                         }
                         case "ResourceRecordSet" -> {
-                            if (inRrs && currentRrs != null && currentRecords != null) {
-                                if (!currentRecords.isEmpty()) currentRrs.setRecords(currentRecords);
+                            if (inRrs && currentRrs != null) {
+                                if (currentRrs.getName() == null || currentRrs.getType() == null) {
+                                    throw new AwsException("InvalidInput",
+                                            "ResourceRecordSet is missing a required Name or Type element.", 400);
+                                }
+                                boolean hasRecords = currentRecords != null && !currentRecords.isEmpty();
+                                if (hasRecords) {
+                                    currentRrs.setRecords(currentRecords);
+                                }
+                                requireExactlyOneRecordShape(currentAction, currentRrs, hasRecords);
                             }
                             inRrs = false;
                         }
                         case "Change" -> {
-                            if (inChange && currentAction != null && currentRrs != null) {
+                            if (inChange) {
+                                if (currentAction == null || currentRrs == null) {
+                                    throw new AwsException("InvalidInput",
+                                            "Change is missing a required Action or ResourceRecordSet element.",
+                                            400);
+                                }
                                 Map<String, Object> change = new HashMap<>();
                                 change.put("action", currentAction);
                                 change.put("rrs", currentRrs);
@@ -1045,8 +1096,11 @@ public class Route53Controller {
                 }
             }
             r.close();
-        } catch (Exception ignored) {}
-        return result;
+        } catch (AwsException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new AwsException("InvalidInput", "The XML you provided was not well-formed.", 400);
+        }
     }
 
     private HealthCheckConfig parseHealthCheckConfig(String body) {
@@ -1078,7 +1132,7 @@ public class Route53Controller {
         List<String> keys = new ArrayList<>();
         if (body == null || body.isEmpty()) return keys;
         try {
-            XMLStreamReader r = XML_FACTORY.createXMLStreamReader(new StringReader(body));
+            XMLStreamReader r = XmlParser.newStreamReader(body);
             boolean inRemove = false;
             while (r.hasNext()) {
                 int event = r.next();

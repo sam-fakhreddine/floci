@@ -2,6 +2,9 @@ name: Compatibility Tests
 
 on:
   pull_request:
+    # ready_for_review is not a default type: without it, marking a draft ready
+    # would not start the run the draft skipped.
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - 'src/**'
       - 'pom.xml'
@@ -10,12 +13,15 @@ on:
       - 'docker/entrypoint.sh'
       - 'docker/localstack-parity.sh'
       - 'docker/healthcheck.sh'
+      - 'docker/run-docker-tests.sh'
+      - 'docker/test-run-docker-tests.sh'
       - 'compatibility-tests/**'
       - '.github/ci/compat-timing-report.py'
       - '.github/ci/compat-opentofu-drift-check.py'
       - '.github/ci/compat-opentofu-allowlist-tf-only.txt'
       - '.github/ci/compat-opentofu-allowlist-otf-only.txt'
       - '.github/workflows/compatibility.yml'
+      - '.github/workflows/pr-draft-gate.yml'
 
 permissions:
   contents: read
@@ -25,10 +31,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Drafts skip the suite to spare runners; it runs once the PR is ready for review.
+  draft-gate:
+    uses: ./.github/workflows/pr-draft-gate.yml
+
+  docker-runner-regression:
+    name: compat / Docker runner failure aggregation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    needs: draft-gate
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Test Docker runner failure aggregation
+        run: bash docker/test-run-docker-tests.sh
+
   compat-aws-cli-shim:
     name: compat / aws CLI endpoint resolution
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 10
+    needs: draft-gate
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -107,6 +129,7 @@ jobs:
     name: compat / opentofu resource parity
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 5
+    needs: draft-gate
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -121,6 +144,7 @@ jobs:
     name: Build native floci image (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    needs: draft-gate
     # Both published architectures. The native image is the only place an
     # arch-specific resource can go missing (snappy-java's JNI library is
     # registered per platform), and one arch cannot prove the other.
@@ -167,7 +191,9 @@ jobs:
         # single call site of a very large method; inlined, the method outgrows the aarch64
         # conditional-branch range and the build dies with BranchTargetOutOfBoundsException.
         # The flag only exists on Mandrel, so it is passed here rather than in application.yml.
-        run: mvn clean package -Dnative -DskipTests -B -Dquarkus.native.additional-build-args-append="-Ob,-H:-AOTSingleCallsiteInline"
+        # maven.test.skip rather than skipTests: skipTests only stops surefire, so the build still
+        # compiled all of src/test (about 25s per arch) for a native image that never uses it.
+        run: mvn clean package -Dnative -Dmaven.test.skip=true -B -Dquarkus.native.additional-build-args-append="-Ob,-H:-AOTSingleCallsiteInline"
 
       # Quarkus always writes GraalVM's build-output JSON next to the native source jar. Surfacing
       # it here gives every PR a size record for both architectures: code area, image heap, total
@@ -298,6 +324,8 @@ jobs:
             -e FLOCI_TLS_ENABLED=true \
             -e FLOCI_SERVICES_EC2_MOCK=true \
             -e FLOCI_SERVICES_REDSHIFT_ENDPOINT_HOST=floci \
+            -e FLOCI_SERVICES_RDS_ENDPOINT_HOST=floci \
+            -e FLOCI_SERVICES_SSOOIDC_LOCAL_PRINCIPAL_ID=11111111-2222-3333-4444-555555555555 \
             floci:test-native
 
       # Waits on Docker's health status rather than curling the port so the image's
@@ -405,5 +433,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Dump floci logs
-        if: failure()
+        # A job cancelled at timeout-minutes is not a failure, but a hung suite is the case
+        # where the server log matters most.
+        if: failure() || cancelled()
         run: docker logs floci

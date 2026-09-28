@@ -1,15 +1,17 @@
 package io.github.hectorvent.floci.lifecycle;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.JsonNode;
+import io.restassured.response.ValidatableResponse;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
-import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.UUID;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.*;
@@ -132,6 +134,53 @@ class EmulatorInfoControllerIntegrationTest {
                 .statusCode(200)
                 .contentType("application/json")
                 .body("status", equalTo("OK"));
+    }
+
+    @Test
+    void stateReset_keepsBootstrapStateOfServicesThatReseedOnClear() {
+        // IAM Identity Center recreates its bootstrap instance in clear(). A reset that wiped
+        // storage after that step left every SCIM call answering 401 until a restart.
+        given()
+            .when().post("/_floci/state/reset")
+            .then()
+                .statusCode(200);
+
+        given()
+            .header("Authorization", "Bearer floci-scim-token")
+        .when()
+            .get("/9067f2a3c1-00000000-0000-0000-0000-000000000000/scim/v2/ServiceProviderConfig")
+        .then()
+            .statusCode(200)
+            .body("schemas[0]", equalTo("urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig"));
+    }
+
+    @Test
+    void stateResetClearsDynamoDbStreams() {
+        String tableName = "reset-streams-" + UUID.randomUUID();
+        dynamoDb("DynamoDB_20120810.CreateTable", """
+                {"TableName": "%s",
+                 "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}],
+                 "AttributeDefinitions": [{"AttributeName": "id", "AttributeType": "S"}],
+                 "BillingMode": "PAY_PER_REQUEST",
+                 "StreamSpecification": {"StreamEnabled": true, "StreamViewType": "KEYS_ONLY"}}
+                """.formatted(tableName))
+            .statusCode(200);
+        String listStreams = "{\"TableName\": \"" + tableName + "\"}";
+        dynamoDb("DynamoDBStreams_20120810.ListStreams", listStreams).body("Streams", hasSize(1));
+
+        given().when().post("/_floci/state/reset").then().statusCode(200);
+
+        dynamoDb("DynamoDBStreams_20120810.ListStreams", listStreams).statusCode(200).body("Streams", hasSize(0));
+    }
+
+    private static ValidatableResponse dynamoDb(String target, String body) {
+        return given()
+            .header("X-Amz-Target", target)
+            .contentType("application/x-amz-json-1.0")
+            .body(body)
+        .when()
+            .post("/")
+        .then();
     }
 
     @Test

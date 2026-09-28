@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.cloudformation;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
@@ -15,9 +16,12 @@ import io.github.hectorvent.floci.services.cloudformation.model.Stack;
 import io.github.hectorvent.floci.services.cloudformation.model.StackEvent;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.cloudformation.model.TemplateSummary;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnDynamicReferences;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnResourceDispatcher;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnRollback;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.UpdateCleanupResult;
 import io.github.hectorvent.floci.services.s3.S3Service;
+import io.github.hectorvent.floci.services.s3.model.S3Object;
 import io.github.hectorvent.floci.services.ssm.SsmService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -36,10 +40,12 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
 import io.github.hectorvent.floci.core.resource.ResourceProvider;
 import io.github.hectorvent.floci.core.resource.SupportedResourceType;
@@ -56,15 +62,26 @@ public class CloudFormationService implements ResourceProvider {
 
     private static final Logger LOG = Logger.getLogger(CloudFormationService.class);
 
+    private static final int MAX_OPERATION_THREADS = 16;
+    private static final int MAX_QUEUED_OPERATIONS = 128;
+
     private final ConcurrentHashMap<String, Stack> stacks = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, DeletedStackEntry> deletedStacks = new ConcurrentHashMap<>();
     // Account-scoped exports registry: account:region:exportName -> exportValue
     private final ConcurrentHashMap<String, String> exports = new ConcurrentHashMap<>();
-    private final ExecutorService executor = Executors.newCachedThreadPool();
+    private final ExecutorService executor = newOperationExecutor();
 
-    private final CloudFormationResourceProvisioner provisioner;
+    static ThreadPoolExecutor newOperationExecutor() {
+        return new ThreadPoolExecutor(
+                MAX_OPERATION_THREADS, MAX_OPERATION_THREADS, 0L, TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<>(MAX_QUEUED_OPERATIONS),
+                new ThreadPoolExecutor.AbortPolicy());
+    }
+
+    private final CfnResourceDispatcher dispatcher;
     private final S3Service s3Service;
     private final SsmService ssmService;
+    private final CfnDynamicReferences dynamicReferences;
     private final ObjectMapper objectMapper;
     private final EmulatorConfig config;
     private final RegionResolver regionResolver;
@@ -80,13 +97,15 @@ public class CloudFormationService implements ResourceProvider {
 
 
     @Inject
-    public CloudFormationService(CloudFormationResourceProvisioner provisioner, S3Service s3Service,
-                                 SsmService ssmService, ObjectMapper objectMapper, EmulatorConfig config,
+    public CloudFormationService(CfnResourceDispatcher dispatcher, S3Service s3Service,
+                                 SsmService ssmService, CfnDynamicReferences dynamicReferences,
+                                 ObjectMapper objectMapper, EmulatorConfig config,
                                  RegionResolver regionResolver, Clock clock,
                                  StorageFactory storageFactory) {
-        this.provisioner = provisioner;
+        this.dispatcher = dispatcher;
         this.s3Service = s3Service;
         this.ssmService = ssmService;
+        this.dynamicReferences = dynamicReferences;
         this.objectMapper = objectMapper;
         this.config = config;
         this.regionResolver = regionResolver;
@@ -182,7 +201,7 @@ public class CloudFormationService implements ResourceProvider {
      */
     public Map<String, String> currentParameters(String stackName, String region) {
         Stack stack = resolveStack(stackName, region);
-        return stack != null ? stack.getParameters() : Map.of();
+        return stack != null ? stack.parametersSnapshot() : Map.of();
     }
 
     /**
@@ -472,13 +491,11 @@ public class CloudFormationService implements ResourceProvider {
                     ? objectMapper.createObjectNode()
                     : parseTemplate(stack.getTemplateBody()).path("Resources");
 
-            Map<String, String> oldParams = stack.getParameters() != null
-                    ? stack.getParameters() : Map.of();
+            Map<String, String> oldParams = stack.parametersSnapshot();
             // Prefer the SSM-resolved values captured by the last executeTemplate run; fall back to
             // the raw parameters for stacks persisted before resolvedParameters existed.
-            Map<String, String> oldResolvedParams = stack.getResolvedParameters() != null
-                    && !stack.getResolvedParameters().isEmpty()
-                    ? stack.getResolvedParameters() : oldParams;
+            Map<String, String> resolvedSnapshot = stack.resolvedParametersSnapshot();
+            Map<String, String> oldResolvedParams = resolvedSnapshot.isEmpty() ? oldParams : resolvedSnapshot;
             // A parameter omitted from the update falls back to the template's Default when
             // ExecuteChangeSet actually runs it, so the preview must resolve the same defaults or
             // it will under-report changes to resources that depend on that fallback value.
@@ -522,7 +539,7 @@ public class CloudFormationService implements ResourceProvider {
             // ground truth execution uses - so no separate old-conditions evaluation is needed.
             Map<String, Boolean> newConditions = resolveConditions(
                     newTemplate, newResolvedParams, null, region, regionResolver.getAccountId());
-            Set<String> deployedIds = stack.getResources().keySet();
+            Set<String> deployedIds = stack.resourcesSnapshot().keySet();
 
             List<ResourceChange> changes = new ArrayList<>();
             newResources.fields().forEachRemaining(e -> {
@@ -616,19 +633,7 @@ public class CloudFormationService implements ResourceProvider {
      * that failure surfaces on those paths, and floci must still expose it there.
      */
     public Future<?> executeChangeSetForRequest(String stackName, String changeSetName, String region) {
-        Stack stack = getStackOrThrow(stackName, region, regionResolver.getAccountId());
-        ChangeSet cs = stack.getChangeSets().get(resolveChangeSetName(
-                changeSetName, region, regionResolver.getAccountId()));
-        if (cs == null) {
-            throw new AwsException("ChangeSetNotFoundException",
-                    "ChangeSet [" + changeSetName + "] does not exist", 400);
-        }
-        if (!"AVAILABLE".equals(cs.getExecutionStatus())) {
-            throw new AwsException("InvalidChangeSetStatus",
-                    "ChangeSet [" + cs.getChangeSetId() + "] cannot be executed in its current "
-                            + "status of [" + cs.getStatus() + "]", 400);
-        }
-        return executeChangeSet(stackName, changeSetName, region, regionResolver.getAccountId());
+        return claimAndSubmitExecution(stackName, changeSetName, region, regionResolver.getAccountId(), true);
     }
 
     /**
@@ -639,33 +644,106 @@ public class CloudFormationService implements ResourceProvider {
      * are materialized under a synthetic request scope bound to {@code accountId} so a single-stack
      * deployment lands in the caller's account, and a StackSet instance lands in its target account.
      *
-     * <p>Unlike {@link #executeChangeSetForRequest}, this does not refuse a non-{@code AVAILABLE}
-     * change set: {@code CreateStack}/{@code UpdateStack} call this directly right after creating
-     * their own change set, and must still reach {@code CREATE_FAILED} (or its update equivalent)
-     * when that change set failed, for example from a failed SAM transform.
+     * <p>Unlike {@link #executeChangeSetForRequest}, this does not require the change set to be
+     * {@code AVAILABLE}: {@code CreateStack}/{@code UpdateStack} call this directly right after
+     * creating their own change set, and must still reach {@code CREATE_FAILED} (or its update
+     * equivalent) when that change set failed, for example from a failed SAM transform. It still
+     * refuses one that is already executing or has already executed.
      */
     public Future<?> executeChangeSet(String stackName, String changeSetName, String region, String accountId) {
-        Stack stack = getStackOrThrow(stackName, region, accountId);
-        ChangeSet cs = stack.getChangeSets().get(resolveChangeSetName(changeSetName, region, accountId));
-        if (cs == null) {
-            throw new AwsException("ChangeSetNotFoundException",
-                    "ChangeSet [" + changeSetName + "] does not exist", 400);
+        return claimAndSubmitExecution(stackName, changeSetName, region, accountId, false);
+    }
+
+    private record ClaimedExecution(ChangeSet changeSet, boolean isCreate) {}
+
+    private record ChangeSetState(String status, String executionStatus) {}
+
+    private record StackMutationSnapshot(String status, Instant lastUpdatedTime,
+                                         List<StackEvent> events,
+                                         Map<String, ChangeSet> changeSets,
+                                         Map<ChangeSet, ChangeSetState> changeSetStates) {}
+
+    // compute() holds the stack's per-key lock for the whole claim, so only one racing execution can win.
+    private Future<?> claimAndSubmitExecution(String stackNameOrArn, String changeSetName, String region,
+                                              String accountId, boolean requireAvailable) {
+        String canonicalStackName = getStackOrThrow(stackNameOrArn, region, accountId).getStackName();
+        String resolvedChangeSetName = resolveChangeSetName(changeSetName, region, accountId);
+
+        ClaimedExecution[] claimed = new ClaimedExecution[1];
+        StackMutationSnapshot[] snapshot = new StackMutationSnapshot[1];
+        Stack stack = stacks.compute(stackKey(accountId, canonicalStackName, region), (k, existing) -> {
+            if (existing == null) {
+                throw new AwsException("ValidationError",
+                        "Stack with id " + stackNameOrArn + " does not exist", 400);
+            }
+            ChangeSet cs = existing.getChangeSets().get(resolvedChangeSetName);
+            if (cs == null) {
+                throw new AwsException("ChangeSetNotFoundException",
+                        "ChangeSet [" + changeSetName + "] does not exist", 400);
+            }
+            String executionStatus = cs.getExecutionStatus();
+            boolean eligible = requireAvailable
+                    ? "AVAILABLE".equals(executionStatus)
+                    : executionStatus == null || !executionStatus.startsWith("EXECUTE_");
+            if (!eligible) {
+                throw invalidChangeSetStatus(cs);
+            }
+            snapshot[0] = snapshot(existing);
+            boolean isCreate = "CREATE".equalsIgnoreCase(cs.getChangeSetType()) ||
+                    "CREATE_IN_PROGRESS".equals(existing.getStatus());
+            cs.setExecutionStatus("EXECUTE_IN_PROGRESS");
+            if (requireAvailable) {
+                // CloudFormation deletes every other change set on the stack once one of them executes.
+                synchronized (existing.getChangeSets()) {
+                    existing.getChangeSets().values().removeIf(other -> other != cs);
+                }
+            } else {
+                for (ChangeSet other : existing.changeSetsSnapshot().values()) {
+                    if (other != cs && "AVAILABLE".equals(other.getExecutionStatus())) {
+                        other.setExecutionStatus("OBSOLETE");
+                    }
+                }
+            }
+            existing.setStatus(isCreate ? "CREATE_IN_PROGRESS" : "UPDATE_IN_PROGRESS");
+            existing.setLastUpdatedTime(now());
+            addEvent(existing, existing.getStackName(), existing.getStackId(),
+                    "AWS::CloudFormation::Stack", isCreate ? "CREATE_IN_PROGRESS" : "UPDATE_IN_PROGRESS", null);
+            claimed[0] = new ClaimedExecution(cs, isCreate);
+            return existing;
+        });
+        try {
+            persistStack(stack);
+            return submitExecution(stack, claimed[0].changeSet(), claimed[0].isCreate(), region, accountId);
+        } catch (AwsException e) {
+            if ("LimitExceededException".equals(e.getErrorCode())) {
+                Stack restored = restoreStack(accountId, canonicalStackName, region, snapshot[0]);
+                if (restored != null) {
+                    persistStack(restored);
+                }
+            }
+            throw e;
         }
+    }
 
-        boolean isCreate = "CREATE".equalsIgnoreCase(cs.getChangeSetType()) ||
-                "CREATE_IN_PROGRESS".equals(stack.getStatus());
+    private AwsException invalidChangeSetStatus(ChangeSet cs) {
+        String detail = "FAILED".equals(cs.getStatus())
+                ? "status of [" + cs.getStatus() + "]"
+                : "execution status of [" + cs.getExecutionStatus() + "]";
+        return new AwsException("InvalidChangeSetStatus",
+                "ChangeSet [" + cs.getChangeSetId() + "] cannot be executed in its current " + detail, 400);
+    }
 
-        stack.setStatus(isCreate ? "CREATE_IN_PROGRESS" : "UPDATE_IN_PROGRESS");
-        stack.setLastUpdatedTime(now());
-        addEvent(stack, stack.getStackName(), stack.getStackId(),
-                "AWS::CloudFormation::Stack", isCreate ? "CREATE_IN_PROGRESS" : "UPDATE_IN_PROGRESS", null);
-        persistStack(stack);
-
+    private Future<?> submitExecution(Stack stack, ChangeSet cs, boolean isCreate, String region, String accountId) {
         String templateBody = cs.getTemplateBody();
         Map<String, String> params = cs.getParameters() != null ? cs.getParameters() : Map.of();
 
-        return executor.submit(() -> runUnderAccount(accountId,
-                () -> executeTemplate(stack, templateBody, params, isCreate, region, accountId)));
+        return submitOperation(() -> runUnderAccount(accountId, () -> {
+            executeTemplate(stack, templateBody, params, isCreate, region, accountId);
+            String status = stack.getStatus();
+            cs.setExecutionStatus(status != null && (status.contains("ROLLBACK") || status.endsWith("_FAILED"))
+                ? "EXECUTE_FAILED" : "EXECUTE_COMPLETE");
+            persistStack(stack);
+        }));
     }
 
     /**
@@ -751,11 +829,69 @@ public class CloudFormationService implements ResourceProvider {
                     "Stack [" + stack.getStackId()
                             + "] cannot be deleted while TerminationProtection is enabled", 400);
         }
+        StackMutationSnapshot snapshot = snapshot(stack);
         stack.setStatus("DELETE_IN_PROGRESS");
         addEvent(stack, stack.getStackName(), stack.getStackId(),
                 "AWS::CloudFormation::Stack", "DELETE_IN_PROGRESS", null);
 
-        return executor.submit(() -> runUnderAccount(accountId, () -> deleteStackResources(stack, region)));
+        try {
+            return submitOperation(() -> runUnderAccount(accountId,
+                    () -> deleteStackResources(stack, region, accountId)));
+        } catch (AwsException e) {
+            if ("LimitExceededException".equals(e.getErrorCode())) {
+                Stack restored = restoreStack(accountId, stack.getStackName(), region, snapshot);
+                if (restored != null) {
+                    persistStack(restored);
+                }
+            }
+            throw e;
+        }
+    }
+
+    private StackMutationSnapshot snapshot(Stack stack) {
+        Map<ChangeSet, ChangeSetState> states = new IdentityHashMap<>();
+        for (ChangeSet changeSet : stack.changeSetsSnapshot().values()) {
+            states.put(changeSet, new ChangeSetState(changeSet.getStatus(), changeSet.getExecutionStatus()));
+        }
+        return new StackMutationSnapshot(stack.getStatus(), stack.getLastUpdatedTime(),
+                stack.eventsSnapshot(), stack.changeSetsSnapshot(), states);
+    }
+
+    private void restore(Stack stack, StackMutationSnapshot snapshot) {
+        if (snapshot == null) {
+            return;
+        }
+        stack.setStatus(snapshot.status());
+        stack.setLastUpdatedTime(snapshot.lastUpdatedTime());
+        stack.setEvents(new ArrayList<>(snapshot.events()));
+        stack.setChangeSets(new LinkedHashMap<>(snapshot.changeSets()));
+        snapshot.changeSetStates().forEach((changeSet, state) -> {
+            changeSet.setStatus(state.status());
+            changeSet.setExecutionStatus(state.executionStatus());
+        });
+    }
+
+    private Stack restoreStack(String accountId, String stackName, String region,
+                               StackMutationSnapshot snapshot) {
+        return stacks.compute(stackKey(accountId, stackName, region), (key, current) -> {
+            if (current != null) {
+                restore(current, snapshot);
+            }
+            return current;
+        });
+    }
+
+    private Future<?> submitOperation(Runnable operation) {
+        try {
+            return executor.submit(operation);
+        } catch (RejectedExecutionException e) {
+            throw operationLimitExceeded();
+        }
+    }
+
+    static AwsException operationLimitExceeded() {
+        return new AwsException("LimitExceededException",
+                "Too many CloudFormation operations are in progress.", 400);
     }
 
     // ── GetTemplate ───────────────────────────────────────────────────────────
@@ -932,13 +1068,21 @@ public class CloudFormationService implements ResourceProvider {
 
     // ── DescribeStackEvents ───────────────────────────────────────────────────
 
+    /**
+     * The missing-stack message is the one AWS uses for this operation, {@code Stack [name] does
+     * not exist}, which differs from DescribeStacks' {@code Stack with id name does not exist}.
+     * Clients tell the two apart by text: the CDK's stack-event poller swallows exactly the
+     * bracketed form once a stack it is watching has been deleted (its stack lookup swallows the
+     * other), so any other wording escapes the poller and fails {@code cdk destroy --all} after
+     * the first stack.
+     */
     public List<StackEvent> describeStackEvents(String stackName, String region) {
         Stack stack = resolveStackForDescribe(stackName, region);
         if (stack == null) {
             throw new AwsException("ValidationError",
-                    "Stack with id " + stackName + " does not exist", 400);
+                    "Stack [" + stackName + "] does not exist", 400);
         }
-        List<StackEvent> events = new ArrayList<>(stack.getEvents());
+        List<StackEvent> events = stack.eventsSnapshot();
         Collections.reverse(events);
         return events;
     }
@@ -947,15 +1091,43 @@ public class CloudFormationService implements ResourceProvider {
 
     public List<StackResource> describeStackResources(String stackName, String region) {
         Stack stack = getStackOrThrow(stackName, region);
-        return new ArrayList<>(stack.getResources().values());
+        return new ArrayList<>(stack.resourcesSnapshot().values());
     }
 
     // ── ListStacks ────────────────────────────────────────────────────────────
 
+    /**
+     * Summaries for the region's stacks, the ones still within the deleted-stack retention window
+     * included. AWS keeps a deleted stack in ListStacks as {@code DELETE_COMPLETE} long after
+     * DescribeStacks has stopped answering for it by name, which is how a client reconciles what
+     * it deployed against what is left. A name reused after a delete lists twice, once per stack
+     * id, as it does on AWS.
+     *
+     * <p>Reduced by stack id, because a stack being deleted is briefly in both maps: it is
+     * retained before it is removed from the live one, so that it is never in neither.
+     *
+     * <p>The maps are read one after the other, the live one first and in full, rather than as one
+     * concatenated pipeline. A delete retains before it removes, so reading in that order leaves a
+     * stack mid-handover in at least one of the two views. Building both views up front breaks
+     * that: a {@link ConcurrentHashMap} view reflects the table at some point at or since its own
+     * creation and is not guaranteed to reflect a modification made after it, so a retained view
+     * created before the retain need never show the stack, while a live view created after it can
+     * already miss it. Traversing the retained view second does not rescue this, because it is
+     * creation and not traversal that bounds the guarantee.
+     */
     public List<Stack> listStacks(String region) {
         String accountId = currentAccount();
-        return stacks.values().stream()
+        Instant current = now();
+        Map<String, Stack> byStackId = new LinkedHashMap<>();
+        stacks.values().stream()
                 .filter(s -> accountId.equals(ownerAccount(s)) && region.equals(s.getRegion()))
+                .forEach(s -> byStackId.putIfAbsent(s.getStackId(), s));
+        deletedStacks.values().stream()
+                .filter(entry -> !entry.isExpired(current))
+                .map(DeletedStackEntry::stack)
+                .filter(s -> accountId.equals(ownerAccount(s)) && region.equals(s.getRegion()))
+                .forEach(s -> byStackId.putIfAbsent(s.getStackId(), s));
+        return byStackId.values().stream()
                 .sorted(Comparator.comparing(Stack::getCreationTime))
                 .toList();
     }
@@ -969,7 +1141,7 @@ public class CloudFormationService implements ResourceProvider {
             if (!accountId.equals(ownerAccount(stack)) || !region.equals(stack.getRegion())) {
                 continue;
             }
-            for (var entry : stack.getExports().entrySet()) {
+            for (var entry : stack.exportsSnapshot().entrySet()) {
                 result.put(entry.getKey(), new ExportEntry(entry.getKey(), entry.getValue(), stack.getStackId()));
             }
         }
@@ -982,7 +1154,7 @@ public class CloudFormationService implements ResourceProvider {
 
     private void removeStackExports(Stack stack, String region) {
         String accountId = ownerAccount(stack);
-        for (String exportName : stack.getExports().keySet()) {
+        for (String exportName : stack.exportsSnapshot().keySet()) {
             String logicalKey = exportKey(region, exportName);
             exports.remove(accountExportKey(accountId, logicalKey));
             exportBackend.deleteForAccount(accountId, logicalKey);
@@ -1097,8 +1269,7 @@ public class CloudFormationService implements ResourceProvider {
 
             // Merge default parameter values from the template with caller-supplied params
             Map<String, String> givenParams = resolveDefaultParameters(template, params);
-            stack.getParameters().clear();
-            stack.getParameters().putAll(givenParams);
+            stack.replaceParameters(givenParams);
             Map<String, String> resolvedParams = resolveSsmParameters(template, givenParams, region);
             stack.setResolvedParameters(new LinkedHashMap<>(resolvedParams));
 
@@ -1115,7 +1286,7 @@ public class CloudFormationService implements ResourceProvider {
             Map<String, Map<String, String>> resourceAttrs = new LinkedHashMap<>();
 
             // First pass: collect existing physicalIds
-            for (var r : stack.getResources().values()) {
+            for (var r : stack.resourcesSnapshot().values()) {
                 if (r.getPhysicalId() != null) {
                     physicalIds.put(r.getLogicalId(), r.getPhysicalId());
                     resourceAttrs.put(r.getLogicalId(), r.getAttributes());
@@ -1135,7 +1306,8 @@ public class CloudFormationService implements ResourceProvider {
                     CloudFormationTemplateEngine engine = new CloudFormationTemplateEngine(
                             accountId, region, stack.getStackName(),
                             stack.getStackId(), resolvedParams, physicalIds, resourceAttrs, conditions, mappings, objectMapper,
-                            name -> exports.get(accountExportKey(accountId, exportKey(region, name))));
+                            name -> exports.get(accountExportKey(accountId, exportKey(region, name))),
+                            value -> dynamicReferences.resolveDynamicReferences(value, region, false));
 
                     StackResource resource = stack.getResources().get(logicalId);
                     StackResource previousResource = resource;
@@ -1160,11 +1332,13 @@ public class CloudFormationService implements ResourceProvider {
                     if ("AWS::CloudFormation::Stack".equals(type)) {
                         resource = executeNestedStack(stack, logicalId,
                                 props.isMissingNode() ? null : props,
-                                engine, region, accountId, isCreate);
+                                engine, region, accountId, isCreate, previousResource);
                     } else {
-                        resource = provisioner.provision(logicalId, type, props.isMissingNode() ? null : props,
+                        resource = dispatcher.provision(logicalId, type, props.isMissingNode() ? null : props,
                                 engine, region, accountId, stack.getStackName(),
-                                resource.getPhysicalId(), resource.getAttributes());
+                                resource.getPhysicalId(), resource.getAttributes(),
+                                event -> addEvent(stack, logicalId, event.getPhysicalResourceId(), type,
+                                        event.getResourceStatus(), event.getResourceStatusReason()));
                     }
                     resource.setUpdateReplacePolicy(
                             resDef.path("UpdateReplacePolicy").asText(null));
@@ -1189,21 +1363,24 @@ public class CloudFormationService implements ResourceProvider {
                     if ("CREATE_FAILED".equals(resource.getStatus())
                             || "UPDATE_FAILED".equals(resource.getStatus())) {
                         failedResource = resource;
-                        if (!isCreate && previousResource != null) {
+                        // A provisioner that keeps the failed attempt's identity and tracking for
+                        // its own rollback is not restored here; the rollback walker owns it.
+                        if (!isCreate && previousResource != null
+                                && !dispatcher.retainsFailedUpdateState(resource)) {
                             // Provisioners work on a copy of the stored resource metadata. Keep the
                             // last known-good identity and status when an update attempt fails so a
                             // later retry or stack deletion still manages the original resource.
                             // Preserve any additional resources that the failed attempt could not
                             // clean up, otherwise restoring this object would orphan them.
-                            provisioner.mergeFailedUpdateResourceTracking(previousResource, resource);
+                            dispatcher.mergeFailedUpdateResourceTracking(previousResource, resource);
                             String rollbackFailure = resource.getAttributes().get(
-                                    CloudFormationResourceProvisioner.UPDATE_ROLLBACK_FAILURE_ATTR);
+                                    CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR);
                             if (rollbackFailure == null) {
                                 // The rollback walker must know this resource is already restored;
                                 // otherwise an earlier UPDATE_COMPLETE status looks like an
                                 // unhandled mutation and incorrectly becomes ROLLBACK_FAILED.
                                 previousResource.getAttributes().put(
-                                        CloudFormationResourceProvisioner.UPDATE_ROLLBACK_RESTORED_ATTR,
+                                        CfnRollback.UPDATE_ROLLBACK_RESTORED_ATTR,
                                         "true");
                             } else {
                                 // Restoration was attempted eagerly by the provisioner but did not
@@ -1211,7 +1388,7 @@ public class CloudFormationService implements ResourceProvider {
                                 // rollback walker reports UPDATE_ROLLBACK_FAILED rather than claiming
                                 // the stale snapshot is live.
                                 previousResource.getAttributes().put(
-                                        CloudFormationResourceProvisioner.UPDATE_ROLLBACK_FAILURE_ATTR,
+                                        CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR,
                                         rollbackFailure);
                             }
                             stack.getResources().put(logicalId, previousResource);
@@ -1233,11 +1410,12 @@ public class CloudFormationService implements ResourceProvider {
             CloudFormationTemplateEngine finalEngine = new CloudFormationTemplateEngine(
                     accountId, region, stack.getStackName(),
                     stack.getStackId(), resolvedParams, physicalIds, resourceAttrs, conditions, mappings, objectMapper,
-                    name -> exports.get(accountExportKey(accountId, exportKey(region, name))));
+                    name -> exports.get(accountExportKey(accountId, exportKey(region, name))),
+                    value -> dynamicReferences.resolveDynamicReferences(value, region, false));
 
             // Resolve outputs before mutating stack/global export state, so failed updates do not
             // leave stale or partially registered exports behind.
-            Map<String, String> oldExports = new LinkedHashMap<>(stack.getExports());
+            Map<String, String> oldExports = stack.exportsSnapshot();
             Map<String, String> newOutputs = new LinkedHashMap<>();
             Map<String, String> newExports = new LinkedHashMap<>();
             Map<String, String> newOutputExportNames = new LinkedHashMap<>();
@@ -1260,12 +1438,9 @@ public class CloudFormationService implements ResourceProvider {
             }
 
             removeStackExports(stack, region);
-            stack.getOutputs().clear();
-            stack.getOutputs().putAll(newOutputs);
-            stack.getExports().clear();
-            stack.getExports().putAll(newExports);
-            stack.getOutputExportNames().clear();
-            stack.getOutputExportNames().putAll(newOutputExportNames);
+            stack.replaceOutputs(newOutputs);
+            stack.replaceExports(newExports);
+            stack.replaceOutputExportNames(newOutputExportNames);
             newExports.forEach((exportName, value) -> {
                 String logicalKey = region + ":" + exportName;
                 String exportKey = accountExportKey(accountId, logicalKey);
@@ -1392,7 +1567,7 @@ public class CloudFormationService implements ResourceProvider {
         List<StackResource> resources = resourcesInCreationOrder(stack, region);
         Collections.reverse(resources);
         for (StackResource resource : resources) {
-            String cleanupPhysicalId = provisioner.updateCleanupPhysicalId(resource);
+            String cleanupPhysicalId = dispatcher.updateCleanupPhysicalId(resource);
             if (cleanupPhysicalId != null) {
                 addEvent(
                         stack,
@@ -1403,7 +1578,7 @@ public class CloudFormationService implements ResourceProvider {
                         null);
             }
             while (true) {
-                UpdateCleanupResult result = provisioner.completeUpdate(resource);
+                UpdateCleanupResult result = dispatcher.completeUpdate(resource);
                 if (!result.applicable()) {
                     break;
                 }
@@ -1417,7 +1592,7 @@ public class CloudFormationService implements ResourceProvider {
                                 "DELETE_COMPLETE",
                                 null);
                     }
-                    provisioner.clearUpdate(resource);
+                    dispatcher.clearUpdate(resource);
                     break;
                 }
                 if (result.attempts() < 3) {
@@ -1436,7 +1611,7 @@ public class CloudFormationService implements ResourceProvider {
                         resource.getResourceType(),
                         "DELETE_FAILED",
                         reason);
-                provisioner.clearUpdate(resource);
+                dispatcher.clearUpdate(resource);
                 break;
             }
         }
@@ -1464,15 +1639,15 @@ public class CloudFormationService implements ResourceProvider {
     }
 
     private boolean hasReplacementUpdates(Stack stack) {
-        return stack.getResources().values().stream()
-                .anyMatch(provisioner::hasReplacementUpdate);
+        return stack.resourcesSnapshot().values().stream()
+                .anyMatch(dispatcher::hasReplacementUpdate);
     }
 
     private boolean hasRemovedOrConditionFalseResources(Stack stack, JsonNode resources, Map<String, Boolean> conditions) {
         if (!resources.isObject()) {
             return false;
         }
-        for (StackResource resource : stack.getResources().values()) {
+        for (StackResource resource : stack.resourcesSnapshot().values()) {
             JsonNode resDef = resources.get(resource.getLogicalId());
             if (resDef == null) {
                 return true;
@@ -1485,32 +1660,24 @@ public class CloudFormationService implements ResourceProvider {
         return false;
     }
 
-    private void deleteResourcePhysically(StackResource resource, String region) throws Exception {
+    private void deleteResourcePhysically(StackResource resource, String region, String accountId)
+            throws Exception {
         if ("AWS::CloudFormation::Stack".equals(resource.getResourceType())) {
-            Future<?> future = deleteStack(resource.getPhysicalId(), region, regionResolver.getAccountId());
-            if (future != null) {
-                try {
-                    future.get();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    throw e;
-                } catch (ExecutionException e) {
-                    Throwable cause = e.getCause();
-                    if (cause instanceof Exception ex) {
-                        throw ex;
-                    }
-                    throw e;
-                }
+            Stack child = resolveStack(resource.getPhysicalId(), region, accountId);
+            if (child == null) {
+                return;
             }
-            Stack child = resolveStack(resource.getPhysicalId(), region);
-            if (child != null && "DELETE_FAILED".equals(child.getStatus())) {
-                String reason = child.getStatusReason() != null
-                        ? child.getStatusReason()
-                        : "Nested stack deletion failed";
-                throw new IllegalStateException(reason);
+            if (child.isEnableTerminationProtection()) {
+                throw new AwsException("ValidationError",
+                        "Stack [" + child.getStackId()
+                                + "] cannot be deleted while TerminationProtection is enabled", 400);
             }
+            child.setStatus("DELETE_IN_PROGRESS");
+            addEvent(child, child.getStackName(), child.getStackId(),
+                    "AWS::CloudFormation::Stack", "DELETE_IN_PROGRESS", null);
+            deleteStackResources(child, region, accountId);
         } else {
-            provisioner.delete(resource, region);
+            dispatcher.delete(resource, region);
         }
     }
 
@@ -1531,10 +1698,8 @@ public class CloudFormationService implements ResourceProvider {
         // successfully deployed values, even when resource rollback itself fails and the stack lands
         // in UPDATE_ROLLBACK_FAILED, so DescribeStacks and later change-set previews don't keep
         // serving the failed update's attempted values.
-        stack.getParameters().clear();
-        stack.getParameters().putAll(previousState.parameters());
-        stack.getResolvedParameters().clear();
-        stack.getResolvedParameters().putAll(previousState.resolvedParameters());
+        stack.replaceParameters(previousState.parameters());
+        stack.replaceResolvedParameters(previousState.resolvedParameters());
         if (rollbackFailures.isEmpty()) {
             stack.setTemplateBody(previousState.templateBody());
             // GetTemplate reads originalTemplateBody for TemplateStage=Original and templateBody
@@ -1576,7 +1741,7 @@ public class CloudFormationService implements ResourceProvider {
             Map<String, StackResource> previousResources,
             Set<String> attemptedResourceIds,
             String region) {
-        List<StackResource> resources = new ArrayList<>(stack.getResources().values());
+        List<StackResource> resources = new ArrayList<>(stack.resourcesSnapshot().values());
         Collections.reverse(resources);
         List<String> failures = new ArrayList<>();
         List<String> removedResources = new ArrayList<>();
@@ -1593,24 +1758,26 @@ public class CloudFormationService implements ResourceProvider {
                         addEvent(stack, resource.getLogicalId(), resource.getPhysicalId(),
                                 resource.getResourceType(), "DELETE_IN_PROGRESS",
                                 "Resource creation cancelled during update rollback");
-                        deleteResourcePhysically(resource, region);
+                        deleteResourcePhysically(resource, region, ownerAccount(stack));
                     }
                     addEvent(stack, resource.getLogicalId(), resource.getPhysicalId(),
                             resource.getResourceType(), "DELETE_COMPLETE",
                             "Resource creation cancelled during update rollback");
                     removedResources.add(resource.getLogicalId());
                 } else if (resource.getAttributes().containsKey(
-                        CloudFormationResourceProvisioner.UPDATE_ROLLBACK_FAILURE_ATTR)) {
+                        CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR)) {
                     String reason = resource.getAttributes().remove(
-                            CloudFormationResourceProvisioner.UPDATE_ROLLBACK_FAILURE_ATTR);
+                            CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR);
                     failures.add(resource.getLogicalId());
                     resource.setStatus("UPDATE_FAILED");
                     resource.setStatusReason(reason);
                     addEvent(stack, resource.getLogicalId(), resource.getPhysicalId(),
                             resource.getResourceType(), "UPDATE_FAILED", reason);
                 } else if ("true".equals(resource.getAttributes().remove(
-                        CloudFormationResourceProvisioner.UPDATE_ROLLBACK_RESTORED_ATTR))
-                        || provisioner.rollbackUpdate(resource)) {
+                        CfnRollback.UPDATE_ROLLBACK_RESTORED_ATTR))
+                        || dispatcher.rollbackUpdate(resource,
+                                event -> addEvent(stack, resource.getLogicalId(), event.getPhysicalResourceId(),
+                                        resource.getResourceType(), event.getResourceStatus(), event.getResourceStatusReason()))) {
                     resource.setStatus(previous.getStatus());
                     resource.setStatusReason(previous.getStatusReason());
                     addEvent(stack, resource.getLogicalId(), resource.getPhysicalId(),
@@ -1643,7 +1810,7 @@ public class CloudFormationService implements ResourceProvider {
     private void restoreOutputAndExportState(
             Stack stack, String region, StackUpdateSnapshot previousState) {
         RuntimeException storageFailure = null;
-        for (String exportName : new ArrayList<>(stack.getExports().keySet())) {
+        for (String exportName : stack.exportsSnapshot().keySet()) {
             String logicalKey = exportKey(region, exportName);
             String key = accountExportKey(ownerAccount(stack), logicalKey);
             exports.remove(key);
@@ -1654,12 +1821,9 @@ public class CloudFormationService implements ResourceProvider {
             }
         }
 
-        stack.getOutputs().clear();
-        stack.getOutputs().putAll(previousState.outputs());
-        stack.getExports().clear();
-        stack.getExports().putAll(previousState.exports());
-        stack.getOutputExportNames().clear();
-        stack.getOutputExportNames().putAll(previousState.outputExportNames());
+        stack.replaceOutputs(previousState.outputs());
+        stack.replaceExports(previousState.exports());
+        stack.replaceOutputExportNames(previousState.outputExportNames());
 
         for (Map.Entry<String, String> entry : previousState.exports().entrySet()) {
             String logicalKey = exportKey(region, entry.getKey());
@@ -1689,12 +1853,12 @@ public class CloudFormationService implements ResourceProvider {
         return new StackUpdateSnapshot(
                 stack.getTemplateBody(),
                 stack.getOriginalTemplateBody(),
-                new LinkedHashMap<>(stack.getParameters()),
-                new LinkedHashMap<>(stack.getResolvedParameters()),
-                new LinkedHashMap<>(stack.getOutputs()),
-                new LinkedHashMap<>(stack.getExports()),
-                new LinkedHashMap<>(stack.getOutputExportNames()),
-                copyResources(stack.getResources()));
+                stack.parametersSnapshot(),
+                stack.resolvedParametersSnapshot(),
+                stack.outputsSnapshot(),
+                stack.exportsSnapshot(),
+                stack.outputExportNamesSnapshot(),
+                copyResources(stack.resourcesSnapshot()));
     }
 
     private Map<String, StackResource> copyResources(
@@ -1736,7 +1900,7 @@ public class CloudFormationService implements ResourceProvider {
 
     /** Deletes every resource created in this execution, in reverse order. */
     private List<String> rollbackCreatedResources(Stack stack, String region) {
-        List<StackResource> resources = new ArrayList<>(stack.getResources().values());
+        List<StackResource> resources = new ArrayList<>(stack.resourcesSnapshot().values());
         Collections.reverse(resources);
         List<String> failedResources = new ArrayList<>();
         for (StackResource resource : resources) {
@@ -1753,7 +1917,7 @@ public class CloudFormationService implements ResourceProvider {
             addEvent(stack, resource.getLogicalId(), resource.getPhysicalId(),
                     resource.getResourceType(), "DELETE_IN_PROGRESS", null);
             try {
-                deleteResourcePhysically(resource, region);
+                deleteResourcePhysically(resource, region, ownerAccount(stack));
                 completeResourceDeletion(stack, resource);
             } catch (Exception e) {
                 if (isAlreadyDeleted(e)) {
@@ -1792,7 +1956,7 @@ public class CloudFormationService implements ResourceProvider {
         }
 
         List<UpdateCleanupFailure> failures = new ArrayList<>();
-        List<StackResource> ordered = new ArrayList<>(stack.getResources().values());
+        List<StackResource> ordered = new ArrayList<>(stack.resourcesSnapshot().values());
         Collections.reverse(ordered);
         for (StackResource resource : ordered) {
             JsonNode resDef = resources.get(resource.getLogicalId());
@@ -1811,7 +1975,7 @@ public class CloudFormationService implements ResourceProvider {
             addEvent(stack, resource.getLogicalId(), resource.getPhysicalId(),
                     resource.getResourceType(), "DELETE_IN_PROGRESS", null);
             try {
-                deleteResourcePhysically(resource, region);
+                deleteResourcePhysically(resource, region, ownerAccount(stack));
                 addEvent(stack, resource.getLogicalId(), resource.getPhysicalId(),
                         resource.getResourceType(), "DELETE_COMPLETE", null);
                 stack.getResources().remove(resource.getLogicalId());
@@ -1847,7 +2011,7 @@ public class CloudFormationService implements ResourceProvider {
      * cannot be read.
      */
     private List<StackResource> resourcesInCreationOrder(Stack stack, String region) {
-        List<StackResource> ordered = new ArrayList<>(stack.getResources().values());
+        List<StackResource> ordered = new ArrayList<>(stack.resourcesSnapshot().values());
         try {
             JsonNode template = parseTemplate(stack.getTemplateBody());
             JsonNode resources = template.path("Resources");
@@ -1855,7 +2019,7 @@ public class CloudFormationService implements ResourceProvider {
                 return ordered;
             }
             Map<String, Boolean> conditions = resolveConditions(
-                    template, stack.getParameters(), stack, region, regionResolver.getAccountId());
+                    template, stack.parametersSnapshot(), stack, region, regionResolver.getAccountId());
             List<String> creationOrder = topologicalSort(resources, conditions);
             Map<String, Integer> rank = new HashMap<>();
             for (int i = 0; i < creationOrder.size(); i++) {
@@ -1869,7 +2033,7 @@ public class CloudFormationService implements ResourceProvider {
         return ordered;
     }
 
-    private void deleteStackResources(Stack stack, String region) {
+    void deleteStackResources(Stack stack, String region, String accountId) {
         try {
             List<StackResource> resources = resourcesInCreationOrder(stack, region);
             Collections.reverse(resources); // Dependents go before what they depend on
@@ -1883,13 +2047,7 @@ public class CloudFormationService implements ResourceProvider {
                 failedResources.add(displacedFailure.logicalId());
             }
             for (StackResource resource : resources) {
-                // CREATE_COMPLETE/UPDATE_COMPLETE: first delete attempt. DELETE_FAILED: a previous
-                // delete left the resource behind (e.g. the bucket was non-empty); AWS re-attempts
-                // it on retry.
-                boolean deletable = "CREATE_COMPLETE".equals(resource.getStatus())
-                        || "UPDATE_COMPLETE".equals(resource.getStatus())
-                        || "DELETE_FAILED".equals(resource.getStatus());
-                if (resource.getPhysicalId() == null || !deletable) {
+                if (resource.getPhysicalId() == null || !isDeletableOnStackDelete(resource)) {
                     continue;
                 }
                 if (skipRetainedResource(stack, resource, false)) {
@@ -1898,7 +2056,7 @@ public class CloudFormationService implements ResourceProvider {
                 addEvent(stack, resource.getLogicalId(), resource.getPhysicalId(),
                         resource.getResourceType(), "DELETE_IN_PROGRESS", null);
                 try {
-                    deleteResourcePhysically(resource, region);
+                    deleteResourcePhysically(resource, region, accountId);
                     completeResourceDeletion(stack, resource);
                 } catch (Exception e) {
                     if (isAlreadyDeleted(e)) {
@@ -1934,15 +2092,24 @@ public class CloudFormationService implements ResourceProvider {
                 throw new IllegalStateException(reason);
             }
 
+            // Before the status, never after. Status is the volatile publishing write, so a reader
+            // that observes DELETE_COMPLETE is guaranteed to observe every write that preceded it.
+            // Assigned afterwards, a concurrent DescribeStacks can report the terminal status with
+            // no DeletionTime at all.
+            stack.setDeletionTime(now());
             stack.setStatus("DELETE_COMPLETE");
             addEvent(stack, stack.getStackName(), stack.getStackId(),
                     "AWS::CloudFormation::Stack", "DELETE_COMPLETE", null);
             removeStackExports(stack, region);
-            stacks.remove(stackKey(ownerAccount(stack), stack.getStackName(), region));
-            unpersistStack(ownerAccount(stack), stack.getStackName(), region);
+            // Retained before it leaves the live map, never after: the other order leaves a window
+            // in which the stack is in neither, and a ListStacks landing there loses it entirely.
+            // Overlapping instead is harmless, since both maps hold this same Stack and listStacks
+            // reduces by stack id.
             deletedStacks.put(stack.getStackId(), new DeletedStackEntry(
                     stack,
                     now().plusSeconds(config.services().cloudformation().deletedStackRetentionSeconds())));
+            stacks.remove(stackKey(ownerAccount(stack), stack.getStackName(), region));
+            unpersistStack(ownerAccount(stack), stack.getStackName(), region);
             LOG.infov("Stack {0} deleted", stack.getStackName());
 
         } catch (Exception e) {
@@ -1952,6 +2119,25 @@ public class CloudFormationService implements ResourceProvider {
             persistStack(stack);
             throw (e instanceof RuntimeException re ? re : new RuntimeException(e));
         }
+    }
+
+    /**
+     * Whether {@code DeleteStack} owes a delete to a resource that has a physical id. AWS deletes
+     * everything the stack manages, whatever status the last operation left it in.
+     *
+     * <p>{@code UPDATE_FAILED} is what a failed update rollback leaves on a resource it could not
+     * restore; its physical id names the committed entity, or an entity a cancelled create made
+     * and the rollback already tried to delete. {@code DELETE_FAILED} is a delete to retry.
+     * {@code CREATE_FAILED} is deleted only when the provisioner marked the entity as created by
+     * this stack, as the create rollback does: a failed create can carry the physical id of an
+     * entity that already existed, which the stack must not delete.
+     */
+    private static boolean isDeletableOnStackDelete(StackResource resource) {
+        return switch (resource.getStatus() == null ? "" : resource.getStatus()) {
+            case "CREATE_COMPLETE", "UPDATE_COMPLETE", "UPDATE_FAILED", "DELETE_FAILED" -> true;
+            case "CREATE_FAILED" -> "true".equals(resource.getAttributes().get(CfnRollback.ROLLBACK_OWNED_ATTR));
+            default -> false;
+        };
     }
 
     /**
@@ -2159,40 +2345,9 @@ public class CloudFormationService implements ResourceProvider {
     }
 
     private String fetchTemplateFromS3(String url) {
-        // Parse S3 URL — three forms:
-        //   Virtual-hosted AWS:   https://bucket.s3[.region].amazonaws.com/key
-        //   Virtual-hosted local: http://bucket.localhost:4566/key  (or configured/default hostname)
-        //   Path-style (both):    https://s3[.region].amazonaws.com/bucket/key
-        //                         http://host:port/bucket/key
-        //
-        // The old condition matched host.endsWith(".amazonaws.com") for virtual-hosted, which
-        // incorrectly caught path-style AWS URLs like s3.us-east-1.amazonaws.com and extracted
-        // "s3" as the bucket name. Virtual-hosted URLs always have a bucket label before ".s3.".
-        String bucket;
-        String key;
-
-        URI uri = URI.create(url);
-        String host = uri.getHost();
-        String path = uri.getRawPath();
-
-        boolean isVirtualHosted = host != null && (
-                host.contains(".s3.")
-                || isConfiguredVirtualHostedS3Host(host)
-                || host.endsWith(".localhost"));
-
-        if (isVirtualHosted) {
-            bucket = host.split("\\.")[0];
-            key = path.startsWith("/") ? path.substring(1) : path;
-        } else {
-            // Path-style: /bucket/key
-            String rawPath = path.startsWith("/") ? path.substring(1) : path;
-            int slash = rawPath.indexOf('/');
-            bucket = slash > 0 ? rawPath.substring(0, slash) : rawPath;
-            key = slash > 0 ? rawPath.substring(slash + 1) : "";
-        }
-
+        S3TemplateRef ref = parseTemplateUrl(url, config.hostname().orElse(EmbeddedDnsServer.DEFAULT_SUFFIX));
         try {
-            var obj = s3Service.getObject(bucket, key);
+            S3Object obj = s3Service.getObject(ref.bucket(), ref.key());
             return new String(obj.getData());
         } catch (Exception e) {
             LOG.errorv("Failed to fetch CloudFormation template from {0}: {1}", url, e.getMessage());
@@ -2200,9 +2355,108 @@ public class CloudFormationService implements ResourceProvider {
         }
     }
 
-    private boolean isConfiguredVirtualHostedS3Host(String host) {
-        String suffix = config.hostname().orElse(EmbeddedDnsServer.DEFAULT_SUFFIX);
-        return hasBucketPrefixForSuffix(host, suffix);
+    /** The bucket and key a {@code TemplateURL} addresses. */
+    record S3TemplateRef(String bucket, String key) {}
+
+    /**
+     * Splits a {@code TemplateURL} into the bucket and key it addresses. Three forms:
+     * <pre>
+     *   Virtual-hosted AWS:   https://bucket.s3[.region].amazonaws.com/key
+     *   Virtual-hosted local: http://bucket.localhost:4566/key  (or configured/default hostname)
+     *   Path-style (both):    https://s3[.region].amazonaws.com/bucket/key
+     *                         http://host:port/bucket/key
+     * </pre>
+     *
+     * <p>The oldest condition matched host.endsWith(".amazonaws.com") for virtual-hosted, which
+     * incorrectly caught path-style AWS URLs like s3.us-east-1.amazonaws.com and extracted
+     * "s3" as the bucket name. Virtual-hosted URLs always have a bucket label before ".s3.".
+     * The local hostnames kept that same misreading for longer, because ending with the
+     * configured suffix was on its own enough to call a host virtual-hosted: see
+     * {@link #isS3ServiceEndpointHost}, which now rules the service endpoint out first.
+     *
+     * @param hostnameSuffix the configured {@code floci.hostname}, or the default DNS suffix
+     */
+    static S3TemplateRef parseTemplateUrl(String url, String hostnameSuffix) {
+        URI uri = URI.create(url);
+        String host = uri.getHost();
+        String path = uri.getRawPath();
+
+        boolean isVirtualHosted = host != null
+                && !isS3ServiceEndpointHost(host, hostnameSuffix)
+                && (host.contains(".s3.")
+                    || hasBucketPrefixForSuffix(host, hostnameSuffix)
+                    || host.endsWith(".localhost"));
+
+        if (isVirtualHosted) {
+            return new S3TemplateRef(host.split("\\.")[0],
+                    path.startsWith("/") ? path.substring(1) : path);
+        }
+        // Path-style: /bucket/key
+        String rawPath = path.startsWith("/") ? path.substring(1) : path;
+        int slash = rawPath.indexOf('/');
+        return new S3TemplateRef(slash > 0 ? rawPath.substring(0, slash) : rawPath,
+                slash > 0 ? rawPath.substring(slash + 1) : "");
+    }
+
+    /**
+     * Whether the host is the S3 <em>service</em> endpoint rather than a bucket-qualified one:
+     * {@code s3.<suffix>} and the regional {@code s3.<region>.<suffix>}, for a local hostname as
+     * much as for {@code amazonaws.com}. A URL against the service endpoint is path-style, so its
+     * bucket is the first path segment.
+     *
+     * <p>The first label alone does not decide it, because a bucket may legally be named
+     * {@code s3}: that makes {@code s3.s3.us-east-1.amazonaws.com} and {@code s3.s3.<suffix>}
+     * virtual-hosted URLs for that bucket. What separates the two is what follows the first
+     * label, so this strips an optional region label and requires the remainder to be an
+     * endpoint suffix.
+     *
+     * <p>{@code S3VirtualHostFilter.extractBucket} draws the same line for the request path, in
+     * more detail than a TemplateURL needs.
+     */
+    private static boolean isS3ServiceEndpointHost(String host, String hostnameSuffix) {
+        String normalizedHost = host.toLowerCase(Locale.ROOT);
+        if (normalizedHost.equals("s3")) {
+            return true;
+        }
+        int firstDot = normalizedHost.indexOf('.');
+        if (firstDot <= 0 || !isS3ServiceLabel(normalizedHost.substring(0, firstDot))) {
+            return false;
+        }
+        String remainder = stripLeadingLabel(normalizedHost.substring(firstDot + 1), "dualstack");
+        int dot = remainder.indexOf('.');
+        if (dot > 0 && AwsRegions.isRegionId(remainder.substring(0, dot))) {
+            remainder = remainder.substring(dot + 1);
+        }
+        return isEndpointSuffix(remainder, hostnameSuffix);
+    }
+
+    /**
+     * The first label of an S3 service endpoint, in the forms
+     * {@code S3VirtualHostFilter} recognizes: {@code s3}, {@code s3-fips},
+     * {@code s3-accelerate}, {@code s3-website} and {@code s3-website-<region>}, and the
+     * legacy {@code s3-<region>}.
+     */
+    private static boolean isS3ServiceLabel(String label) {
+        if (label.equals("s3") || label.equals("s3-fips")
+                || label.equals("s3-accelerate") || label.equals("s3-website")) {
+            return true;
+        }
+        if (label.startsWith("s3-website-")) {
+            return AwsRegions.isRegionId(label.substring("s3-website-".length()));
+        }
+        return label.startsWith("s3-") && AwsRegions.isRegionId(label.substring("s3-".length()));
+    }
+
+    private static String stripLeadingLabel(String host, String label) {
+        return host.startsWith(label + ".") ? host.substring(label.length() + 1) : host;
+    }
+
+    private static boolean isEndpointSuffix(String candidate, String hostnameSuffix) {
+        if (candidate.equals("amazonaws.com") || candidate.equals("localhost")) {
+            return true;
+        }
+        return hostnameSuffix != null && !hostnameSuffix.isBlank()
+                && candidate.equals(hostnameSuffix.toLowerCase(Locale.ROOT));
     }
 
     private static boolean hasBucketPrefixForSuffix(String host, String suffix) {
@@ -2215,9 +2469,29 @@ public class CloudFormationService implements ResourceProvider {
                 && normalizedHost.endsWith("." + normalizedSuffix);
     }
 
+    /**
+     * Terminal statuses under which {@link #executeTemplate} actually finished creating or
+     * updating a stack's resources and computed its Outputs, including the two "committed but
+     * still tidying up" statuses, which still mean Outputs were resolved successfully.
+     *
+     * <p>Every other terminal status ({@code ROLLBACK_COMPLETE}, {@code ROLLBACK_FAILED},
+     * {@code UPDATE_ROLLBACK_COMPLETE}, {@code UPDATE_ROLLBACK_FAILED}, {@code CREATE_FAILED},
+     * {@code UPDATE_FAILED}) means the resource loop failed and rolled back before Outputs were
+     * ever computed: see {@link #executeTemplate}, which only reaches its Outputs block once the
+     * whole resource loop has succeeded. This is deliberately an allow-list rather than a
+     * deny-list of failure strings: a nested stack's own {@code rollbackFailedExecution} rewrites
+     * its status past {@code CREATE_FAILED}/{@code UPDATE_FAILED} into one of the ROLLBACK_*
+     * statuses before this method ever inspects it, so checking for the FAILED strings here can
+     * never match on a create and silently reports a stack that rolled back to nothing as
+     * CREATE_COMPLETE.
+     */
+    private static final Set<String> NESTED_STACK_SUCCESS_STATUSES = Set.of(
+            "CREATE_COMPLETE", "UPDATE_COMPLETE", "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS");
+
     private StackResource executeNestedStack(Stack parentStack, String logicalId, JsonNode props,
                                              CloudFormationTemplateEngine engine, String region,
-                                             String accountId, boolean isCreate) {
+                                             String accountId, boolean isCreate,
+                                             StackResource previousResource) {
         StackResource resource = new StackResource();
         resource.setLogicalId(logicalId);
         resource.setResourceType("AWS::CloudFormation::Stack");
@@ -2232,9 +2506,18 @@ public class CloudFormationService implements ResourceProvider {
         String childTemplate = fetchTemplateFromS3(templateUrl);
         String childStackName = parentStack.getStackName() + "-" + logicalId;
 
-        Stack childStack = newStack(childStackName, region, accountId);
-        childStack.setStatus("CREATE_IN_PROGRESS");
-        stacks.put(stackKey(accountId, childStackName, region), childStack);
+        Stack childStack = null;
+        boolean childCreate = isCreate || previousResource == null
+                || previousResource.getPhysicalId() == null;
+        if (!childCreate) {
+            childStack = resolveStack(previousResource.getPhysicalId(), region, accountId);
+            childCreate = childStack == null;
+        }
+        if (childCreate) {
+            childStack = newStack(childStackName, region, accountId);
+            childStack.setStatus("CREATE_IN_PROGRESS");
+            stacks.put(stackKey(accountId, childStackName, region), childStack);
+        }
 
         Map<String, String> childParams = new LinkedHashMap<>();
         if (props != null && props.has("Parameters") && props.get("Parameters").isObject()) {
@@ -2242,17 +2525,28 @@ public class CloudFormationService implements ResourceProvider {
                     childParams.put(e.getKey(), engine.resolve(e.getValue())));
         }
 
-        executeTemplate(childStack, childTemplate, childParams, isCreate, region, accountId);
+        executeTemplate(childStack, childTemplate, childParams, childCreate, region, accountId);
 
         resource.setPhysicalId(childStack.getStackId());
         resource.getAttributes().put("Arn", childStack.getStackId());
         childStack.getOutputs().forEach((k, v) -> resource.getAttributes().put("Outputs." + k, v));
 
-        if ("CREATE_FAILED".equals(childStack.getStatus()) || "UPDATE_FAILED".equals(childStack.getStatus())) {
-            resource.setStatus("CREATE_FAILED");
-            resource.setStatusReason("Nested stack " + childStackName + " failed: " + childStack.getStatusReason());
-        } else {
+        if (NESTED_STACK_SUCCESS_STATUSES.contains(childStack.getStatus())) {
             resource.setStatus("CREATE_COMPLETE");
+        } else {
+            resource.setStatus("CREATE_FAILED");
+            if (childCreate) {
+                // This operation created the child, so rolling back or deleting the parent owes it
+                // a delete; a child an update only re-applied stays tracked by the prior resource.
+                resource.getAttributes().put(CfnRollback.ROLLBACK_OWNED_ATTR, "true");
+            }
+            String reason = childStack.getStatusReason();
+            if (reason == null || reason.isBlank()) {
+                reason = "Nested stack " + childStackName + " rolled back or failed with status " + childStack.getStatus();
+            } else {
+                reason = "Nested stack " + childStackName + " failed: " + reason;
+            }
+            resource.setStatusReason(reason);
         }
 
         return resource;
@@ -2643,7 +2937,7 @@ public class CloudFormationService implements ResourceProvider {
                     arn, "cloudformation:stack", "cloudformation",
                     parsed.region(), parsed.accountId(),
                     stack.getCreationTime() != null ? stack.getCreationTime() : Instant.now(),
-                    stack.getTags() != null ? stack.getTags() : Map.of()));
+                    stack.tagsSnapshot()));
         }
         return resources;
     }

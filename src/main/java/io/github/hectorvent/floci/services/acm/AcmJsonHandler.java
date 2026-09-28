@@ -1,17 +1,31 @@
 package io.github.hectorvent.floci.services.acm;
 
-import io.github.hectorvent.floci.core.common.AwsErrorResponse;
-import io.github.hectorvent.floci.services.acm.model.*;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.core.common.AwsErrorResponse;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.services.acm.model.Certificate;
+import io.github.hectorvent.floci.services.acm.model.CertificateOptions;
+import io.github.hectorvent.floci.services.acm.model.CertificateStatus;
+import io.github.hectorvent.floci.services.acm.model.DomainValidation;
+import io.github.hectorvent.floci.services.acm.model.KeyAlgorithm;
+import io.github.hectorvent.floci.services.acm.model.ListResult;
+import io.github.hectorvent.floci.services.acm.model.ResourceRecord;
+import io.github.hectorvent.floci.services.acm.model.RevocationReason;
+import io.github.hectorvent.floci.services.acm.model.ValidationMethod;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 
 /**
  * JSON handler for AWS Certificate Manager (ACM) API operations.
@@ -69,9 +83,7 @@ public class AcmJsonHandler {
         Certificate cert = service.describeCertificate(certificateArn, region);
         boolean domainMatchesCertificate = domain.equalsIgnoreCase(cert.getDomainName())
             || cert.getSubjectAlternativeNames().stream().anyMatch(domain::equalsIgnoreCase);
-        boolean validationDomainIsSuperdomain = domain.equalsIgnoreCase(validationDomain)
-            || domain.toLowerCase(java.util.Locale.ROOT).endsWith("." + validationDomain.toLowerCase(java.util.Locale.ROOT));
-        if (!domainMatchesCertificate || !validationDomainIsSuperdomain) {
+        if (!domainMatchesCertificate || !AcmService.isValidationDomainOf(domain, validationDomain)) {
             return Response.status(400)
                 .entity(new AwsErrorResponse("InvalidDomainValidationOptionsException",
                     "One or more values in the DomainValidationOption structure is incorrect."))
@@ -95,9 +107,10 @@ public class AcmJsonHandler {
         String certAuthorityArn = request.path("CertificateAuthorityArn").asText(null);
         CertificateOptions options = parseOptions(request.path("Options"));
         Map<String, String> tags = parseTags(request.path("Tags"));
+        Map<String, String> validationDomains = parseDomainValidationOptions(request.path("DomainValidationOptions"));
 
         Certificate cert = service.requestCertificate(domainName, sans, validationMethod,
-            idempotencyToken, keyAlgorithm, certAuthorityArn, options, tags, region);
+            idempotencyToken, keyAlgorithm, certAuthorityArn, options, tags, validationDomains, region);
 
         ObjectNode response = objectMapper.createObjectNode();
         response.put("CertificateArn", cert.getArn());
@@ -119,7 +132,7 @@ public class AcmJsonHandler {
 
         // AWS returns RequestInProgressException for certificates still pending validation
         if (cert.getStatus() == CertificateStatus.PENDING_VALIDATION) {
-            throw new io.github.hectorvent.floci.core.common.AwsException(
+            throw new AwsException(
                 "RequestInProgressException",
                 "The certificate request is in progress. The certificate body is not yet available.",
                 400);
@@ -323,7 +336,7 @@ public class AcmJsonHandler {
         }
         String value = optionsNode.path(field).asText();
         if (!"ENABLED".equals(value) && !"DISABLED".equals(value)) {
-            throw new io.github.hectorvent.floci.core.common.AwsException(
+            throw new AwsException(
                 "ValidationException", field + " must be ENABLED or DISABLED", 400);
         }
         return value;
@@ -399,6 +412,11 @@ public class AcmJsonHandler {
                     rrNode.put("Type", dv.resourceRecord().type());
                     rrNode.put("Value", dv.resourceRecord().value());
                     dvNode.set("ResourceRecord", rrNode);
+                }
+                if (dv.validationEmails() != null && !dv.validationEmails().isEmpty()) {
+                    ArrayNode emails = objectMapper.createArrayNode();
+                    dv.validationEmails().forEach(emails::add);
+                    dvNode.set("ValidationEmails", emails);
                 }
                 validations.add(dvNode);
             }
@@ -507,12 +525,36 @@ public class AcmJsonHandler {
         return tags;
     }
 
+    /**
+     * Reads the requested {@code DomainValidationOptions} into a {@code ValidationDomain} per
+     * {@code DomainName}. Both members are required, so an entry missing either is rejected rather
+     * than dropped back to the default of validating the domain against itself.
+     */
+    private Map<String, String> parseDomainValidationOptions(JsonNode optionsNode) {
+        if (!optionsNode.isArray()) {
+            return Map.of();
+        }
+        Map<String, String> validationDomains = new LinkedHashMap<>();
+        for (JsonNode option : optionsNode) {
+            String domainName = option.path("DomainName").asText(null);
+            String validationDomain = option.path("ValidationDomain").asText(null);
+            if (domainName == null || domainName.isBlank() || validationDomain == null || validationDomain.isBlank()) {
+                throw new AwsException(
+                    "InvalidDomainValidationOptionsException",
+                    "One or more values in the DomainValidationOption structure is incorrect.",
+                    400);
+            }
+            validationDomains.put(domainName, validationDomain);
+        }
+        return validationDomains;
+    }
+
     private ValidationMethod parseValidationMethod(String method) {
         if (method == null) return ValidationMethod.DNS;
         try {
             return ValidationMethod.valueOf(method.toUpperCase());
         } catch (IllegalArgumentException e) {
-            throw new io.github.hectorvent.floci.core.common.AwsException(
+            throw new AwsException(
                 "ValidationException",
                 "Invalid validation method: " + method + ". Must be DNS or EMAIL.",
                 400);

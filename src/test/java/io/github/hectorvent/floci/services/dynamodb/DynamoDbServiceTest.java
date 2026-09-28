@@ -20,6 +20,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.function.Executable;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -30,11 +31,18 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.zip.GZIPOutputStream;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -429,6 +437,30 @@ class DynamoDbServiceTest {
     }
 
     @Test
+    void addingAReplicaMarksTheTableGlobalHomedInTheUpdateRegion() {
+        createUsersTable("us-east-1");
+        assertNull(service.describeTable("Users", "us-east-1").getGlobalTableHomeRegion());
+
+        service.applyReplicaUpdates("Users", List.of("eu-west-1"), List.of(), "us-east-1");
+
+        assertEquals("us-east-1", service.describeTable("Users", "us-east-1").getGlobalTableHomeRegion());
+        // The home region stays a global table even after the last replica is removed.
+        service.applyReplicaUpdates("Users", List.of(), List.of("eu-west-1"), "us-east-1");
+        assertEquals("us-east-1", service.describeTable("Users", "us-east-1").getGlobalTableHomeRegion());
+    }
+
+    @Test
+    void ensureGlobalTableMarksTheHomeRegionAndIsIdempotent() {
+        createUsersTable("us-east-1");
+
+        service.ensureGlobalTable("Users", "us-east-1");
+        service.ensureGlobalTable("Users", "us-east-1");
+
+        assertEquals("us-east-1", service.describeTable("Users", "us-east-1").getGlobalTableHomeRegion());
+        assertTrue(service.describeTable("Users", "us-east-1").getReplicaRegions().isEmpty());
+    }
+
+    @Test
     void invalidReplicaUpdateLeavesExistingReplicasUnchanged() {
         createUsersTable("us-east-1");
         service.applyReplicaUpdates(
@@ -622,6 +654,23 @@ class DynamoDbServiceTest {
         DynamoDbService.QueryResult results = service.query("Orders", null, exprValues,
                 "customerId = :pk", null, null, region);
         assertEquals(2, results.items().size());
+    }
+
+    @Test
+    void queryWithTheSortKeyValueOnTheLeft() {
+        var region = "eu-west-1";
+        createOrdersTable(region);
+        service.putItem("Orders", item("customerId", "c1", "orderId", "o1"), region);
+        service.putItem("Orders", item("customerId", "c1", "orderId", "o3"), region);
+
+        var exprValues = mapper.createObjectNode();
+        exprValues.set(":pk", mapper.createObjectNode().put("S", "c1"));
+        exprValues.set(":lo", mapper.createObjectNode().put("S", "o2"));
+
+        DynamoDbService.QueryResult results = service.query("Orders", null, exprValues,
+                "customerId = :pk AND :lo <= orderId", null, null, region);
+        assertEquals(1, results.items().size());
+        assertEquals("o3", results.items().getFirst().get("orderId").get("S").asText());
     }
 
     @Test
@@ -2608,6 +2657,50 @@ class DynamoDbServiceTest {
                 + "The AttributeValue for a key attribute cannot contain an empty string value.", ex.getMessage());
     }
 
+    private void createBinaryIndexedTable(String region) {
+        var gsi = new GlobalSecondaryIndex("gsib",
+                List.of(new KeySchemaElement("bidx", "HASH")), null, "ALL", null);
+        service.createTable("BinaryIndexed",
+                List.of(new KeySchemaElement("pk", "HASH")),
+                List.of(
+                        new AttributeDefinition("pk", "S"),
+                        new AttributeDefinition("bidx", "B")),
+                5L, 5L, List.of(gsi), region);
+    }
+
+    @Test
+    void putItemEmptyBinaryGsiKeyThrowsValidationException() {
+        var region = "eu-west-1";
+        createBinaryIndexedTable(region);
+
+        var item = item("pk", "p1");
+        item.set("bidx", attributeValue("B", ""));
+
+        var ex = assertThrows(AwsException.class, () ->
+                service.putItem("BinaryIndexed", item, region));
+        assertEquals("ValidationException", ex.getErrorCode());
+        assertEquals("One or more parameter values are not valid. A value specified for a secondary "
+                + "index key is not supported. The AttributeValue for a key attribute cannot "
+                + "contain an empty binary value. IndexName: gsib, IndexKey: bidx", ex.getMessage());
+    }
+
+    @Test
+    void updateItemSettingEmptyBinaryGsiKeyThrowsValidationException() {
+        var region = "eu-west-1";
+        createBinaryIndexedTable(region);
+
+        var exprValues = mapper.createObjectNode();
+        exprValues.set(":v", attributeValue("B", ""));
+
+        var ex = assertThrows(AwsException.class, () ->
+                service.updateItem("BinaryIndexed", item("pk", "p1"), null,
+                        "SET bidx = :v", null, exprValues, null, region));
+        assertEquals("ValidationException", ex.getErrorCode());
+        assertEquals("One or more parameter values are not valid. The update expression attempted to "
+                + "update a secondary index key to a value that is not supported. "
+                + "The AttributeValue for a key attribute cannot contain an empty binary value.", ex.getMessage());
+    }
+
     @Test
     void updateItemNullPartitionKeyThrowsValidationException() {
         String region = "eu-west-1";
@@ -3017,9 +3110,118 @@ class DynamoDbServiceTest {
     }
 
     @Test
+    void batchWriteItemReportsAKeySchemaMismatchTheWayAwsDoes() {
+        createUsersTable("us-east-1");
+        var wrongType = mapper.createObjectNode();
+        wrongType.set("userId", attributeValue("N", "5"));
+
+        var error = assertThrows(AwsException.class, () -> service.batchWriteItem(
+                Map.of("Users", List.of(putRequest(wrongType))), "us-east-1"));
+        assertEquals("The provided key element does not match the schema", error.getMessage());
+    }
+
+    @Test
+    void batchWriteItemReportsAMissingKeyAsASchemaMismatch() {
+        createUsersTable("us-east-1");
+        var noKey = mapper.createObjectNode();
+        noKey.set("name", attributeValue("S", "x"));
+
+        var putError = assertThrows(AwsException.class, () -> service.batchWriteItem(
+                Map.of("Users", List.of(putRequest(noKey))), "us-east-1"));
+        assertEquals("The provided key element does not match the schema", putError.getMessage());
+
+        var deleteError = assertThrows(AwsException.class, () -> service.batchWriteItem(
+                Map.of("Users", List.of(deleteRequest(noKey))), "us-east-1"));
+        assertEquals("The provided key element does not match the schema", deleteError.getMessage());
+    }
+
+    @Test
+    void putItemStillNamesTheMismatchedKeyTypes() {
+        createUsersTable("us-east-1");
+        var wrongType = mapper.createObjectNode();
+        wrongType.set("userId", attributeValue("N", "5"));
+
+        var error = assertThrows(AwsException.class,
+                () -> service.putItem("Users", wrongType, "us-east-1"));
+        assertEquals("One or more parameter values were invalid: Type mismatch for key userId "
+                + "expected: S actual: N", error.getMessage());
+    }
+
+    @Test
+    void everySurfaceUsesTheSameEmptyStringKeyWording() {
+        createUsersTable("us-east-1");
+        ObjectNode emptyKey = mapper.createObjectNode();
+        emptyKey.set("userId", attributeValue("S", ""));
+        String expected = "One or more parameter values are not valid. The AttributeValue for a key "
+                + "attribute cannot contain an empty string value. Key: userId";
+
+        AwsException batchError = assertThrows(AwsException.class, () -> service.batchWriteItem(
+                Map.of("Users", List.of(putRequest(emptyKey))), "us-east-1"));
+        assertEquals(expected, batchError.getMessage());
+
+        AwsException putError = assertThrows(AwsException.class,
+                () -> service.putItem("Users", emptyKey, "us-east-1"));
+        assertEquals(expected, putError.getMessage());
+
+        AwsException getError = assertThrows(AwsException.class,
+                () -> service.getItem("Users", emptyKey, "us-east-1"));
+        assertEquals(expected, getError.getMessage());
+    }
+
+    @Test
+    void rejectsAnEmptyBinaryKeyValue() {
+        service.createTable("Binaries",
+                List.of(new KeySchemaElement("pk", "HASH")),
+                List.of(new AttributeDefinition("pk", "B")),
+                5L, 5L, "us-east-1");
+        ObjectNode emptyBinary = mapper.createObjectNode();
+        emptyBinary.set("pk", attributeValue("B", ""));
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.putItem("Binaries", emptyBinary, "us-east-1"));
+        assertEquals("One or more parameter values are not valid. The AttributeValue for a key "
+                + "attribute cannot contain an empty binary value. Key: pk", error.getMessage());
+    }
+
+    private JsonNode putRequest(ObjectNode item) {
+        ObjectNode request = mapper.createObjectNode();
+        request.set("PutRequest", mapper.createObjectNode().set("Item", item));
+        return request;
+    }
+
+    private JsonNode deleteRequest(ObjectNode key) {
+        ObjectNode request = mapper.createObjectNode();
+        request.set("DeleteRequest", mapper.createObjectNode().set("Key", key));
+        return request;
+    }
+
+    @Test
+    void updateItemRejectsSetThroughMissingIntermediateMapPath() {
+        createOrdersTable("us-east-1");
+        service.putItem("Orders", item("customerId", "c9", "orderId", "o9"), "us-east-1");
+
+        ObjectNode exprNames = mapper.createObjectNode();
+        exprNames.put("#missing", "missing");
+        ObjectNode exprValues = mapper.createObjectNode();
+        exprValues.set(":val", attributeValue("S", "x"));
+
+        ObjectNode key = mapper.createObjectNode();
+        key.set("customerId", attributeValue("S", "c9"));
+        key.set("orderId", attributeValue("S", "o9"));
+
+        var ex = assertThrows(AwsException.class, () -> service.updateItem("Orders", key, null,
+                "SET #missing.subkey = :val", exprNames, exprValues, "NONE", null, "us-east-1", "NONE"));
+        assertEquals("The document path provided in the update expression is invalid for update", ex.getMessage());
+    }
+
+    @Test
     void updateItemWithNestedDottedPathSetAndRemove() {
         createOrdersTable("us-east-1");
-        service.putItem("Orders", item("customerId", "c1", "orderId", "o1"), "us-east-1");
+        // AWS requires every intermediate of a document path to already exist,
+        // so the details map is seeded before SET #details.subkey runs.
+        ObjectNode initialItem = item("customerId", "c1", "orderId", "o1");
+        initialItem.set("details", mapAttributeValue(mapper.createObjectNode()));
+        service.putItem("Orders", initialItem, "us-east-1");
 
         ObjectNode exprNames = mapper.createObjectNode();
         exprNames.put("#details", "details");
@@ -3326,6 +3528,41 @@ class DynamoDbServiceTest {
     }
 
     @Test
+    void updateItemSetArithmeticOverflowThrowsValidationException() {
+        var region = "eu-west-1";
+        createUsersTable(region);
+        var exprValues = mapper.createObjectNode();
+        exprValues.set(":a", attributeValue("N", "9.9e125"));
+        exprValues.set(":b", attributeValue("N", "9.9e125"));
+
+        var ex = assertThrows(AwsException.class, () ->
+                service.updateItem("Users", item("userId", "u1"), null,
+                        "SET n = :a + :b", null, exprValues, null, region));
+        assertEquals("ValidationException", ex.getErrorCode());
+        assertEquals("Number overflow. Attempting to store a number with magnitude larger than supported range",
+                ex.getMessage());
+        assertNull(service.getItem("Users", item("userId", "u1"), region));
+    }
+
+    @Test
+    void updateItemAddOverflowThrowsValidationException() {
+        var region = "eu-west-1";
+        createUsersTable(region);
+        var existing = item("userId", "u1");
+        existing.set("n", attributeValue("N", "9.9e125"));
+        service.putItem("Users", existing, region);
+        var exprValues = mapper.createObjectNode();
+        exprValues.set(":a", attributeValue("N", "9.9e125"));
+
+        var ex = assertThrows(AwsException.class, () ->
+                service.updateItem("Users", item("userId", "u1"), null,
+                        "ADD n :a", null, exprValues, null, region));
+        assertEquals("ValidationException", ex.getErrorCode());
+        assertEquals("Number overflow. Attempting to store a number with magnitude larger than supported range",
+                ex.getMessage());
+    }
+
+    @Test
     void updateItemSetParenthesizedArithmeticAppliesSubtraction() {
         String region = "eu-west-1";
         // "SET c = (c - :v)" must subtract identically to the unwrapped form.
@@ -3533,6 +3770,70 @@ class DynamoDbServiceTest {
 
         JsonNode stored = service.getItem("Users", item("userId", "u1"), "us-east-1");
         assertEquals("2", stored.get("counter").get("N").asText());
+    }
+
+    @Test
+    void transactWriteItemsReplayDuringTheFirstCallWaitsForItsCapacity() throws Exception {
+        @SuppressWarnings("unchecked")
+        StorageBackend<String, Map<String, JsonNode>> itemStore = mock(StorageBackend.class);
+        DynamoDbService svc = new DynamoDbService(
+                new InMemoryStorage<>(), itemStore, new RegionResolver("us-east-1", "000000000000"));
+        svc.createTable("Users",
+                List.of(new KeySchemaElement("userId", "HASH")),
+                List.of(new AttributeDefinition("userId", "S")),
+                5L, 5L, "us-east-1");
+        CountDownLatch committing = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            committing.countDown();
+            release.await();
+            return null;
+        }).when(itemStore).put(any(), any());
+        JsonNode put = mapper.readTree("""
+                {"Put":{"TableName":"Users","Item":{"userId":{"S":"u1"}}}}
+                """);
+        JsonNode rawRequest = mapper.readTree("""
+                {"ClientRequestToken":"tok-wait","TransactItems":[{"Put":{"TableName":"Users","Item":{"userId":{"S":"u1"}}}}]}
+                """);
+
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<DynamoDbService.TransactWriteResult> first = executor.submit(() ->
+                    svc.transactWriteItems(List.of(put), "us-east-1", "tok-wait", rawRequest));
+            assertTrue(committing.await(5, TimeUnit.SECONDS));
+            Future<DynamoDbService.TransactWriteResult> replay = executor.submit(() ->
+                    svc.transactWriteItems(List.of(put), "us-east-1", "tok-wait", rawRequest));
+            assertThrows(TimeoutException.class, () -> replay.get(200, TimeUnit.MILLISECONDS));
+            release.countDown();
+
+            assertFalse(first.get(5, TimeUnit.SECONDS).replayed());
+            DynamoDbService.TransactWriteResult replayed = replay.get(5, TimeUnit.SECONDS);
+            assertTrue(replayed.replayed());
+            assertEquals(2.0, replayed.capacity().get("Users").table());
+        } finally {
+            release.countDown();
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void transactWriteItemsCancelledCallDoesNotKeepItsToken() throws Exception {
+        createUsersTable("us-east-1");
+        JsonNode put = mapper.readTree("""
+                {"Put":{"TableName":"Users","Item":{"userId":{"S":"u1"}},"ConditionExpression":"attribute_exists(userId)"}}
+                """);
+        ObjectNode rawRequest = mapper.createObjectNode();
+        rawRequest.putArray("TransactItems").add(put);
+        rawRequest.put("ClientRequestToken", "tok-cancel");
+
+        assertThrows(TransactionCanceledException.class, () ->
+                service.transactWriteItems(List.of(put), "us-east-1", "tok-cancel", rawRequest));
+        assertThrows(TransactionCanceledException.class, () ->
+                service.transactWriteItems(List.of(put), "us-east-1", "tok-cancel", rawRequest));
+
+        service.putItem("Users", item("userId", "u1"), "us-east-1");
+        assertFalse(service.transactWriteItems(List.of(put), "us-east-1", "tok-cancel", rawRequest).replayed());
+        assertTrue(service.transactWriteItems(List.of(put), "us-east-1", "tok-cancel", rawRequest).replayed());
     }
 
     @Test
@@ -3812,13 +4113,49 @@ class DynamoDbServiceTest {
 
     private static S3Service s3With(S3Object... objects) {
         var s3 = mock(S3Service.class);
-        when(s3.listObjects("bucket", "imp/", null, 0)).thenReturn(List.of(objects));
+        when(s3.listObjects("bucket", "imp/", null, Integer.MAX_VALUE)).thenReturn(List.of(objects));
         for (var object : objects) {
             when(s3.getObjectMetadata("bucket", object.getKey(), null)).thenReturn(object);
             when(s3.openObjectStream("bucket", object.getKey(), null))
                     .thenAnswer(invocation -> new ByteArrayInputStream(object.getData()));
         }
         return s3;
+    }
+
+    /** DescribeTable names the missing table, an item call does not. */
+    @Test
+    void itemCalls_missingTable_returnResourceNotFoundWithoutTableName() {
+        DynamoDbService svc = serviceWithS3(mock(S3Service.class), new InMemoryStorage<>());
+        String region = "us-east-1";
+        ObjectNode key = item("userId", "u1");
+        ObjectNode keys = mapper.createObjectNode();
+        keys.set("Keys", mapper.createArrayNode().add(key));
+        ObjectNode putRequest = mapper.createObjectNode();
+        putRequest.putObject("PutRequest").set("Item", key);
+        ObjectNode transactPut = mapper.createObjectNode();
+        transactPut.putObject("Put").put("TableName", "Users").set("Item", key);
+        ObjectNode transactGet = mapper.createObjectNode();
+        transactGet.putObject("Get").put("TableName", "Users").set("Key", key);
+
+        List<Executable> itemCalls = List.of(
+                () -> svc.getItem("Users", key, region),
+                () -> svc.putItem("Users", key, null, null, null, region, "NONE"),
+                () -> svc.updateItem("Users", key, null, "SET x = :v", null, item("v", "1"), "NONE", region),
+                () -> svc.deleteItem("Users", key, region),
+                () -> svc.query("Users", null, item("pk", "u1"), "userId = :pk", null, null, region),
+                () -> svc.scan("Users", null, null, null, null, null, null, null, region),
+                () -> svc.batchGetItem(Map.of("Users", keys), region),
+                () -> svc.batchWriteItem(Map.of("Users", List.of(putRequest)), region),
+                () -> svc.transactWriteItems(List.of(transactPut), region, null, null),
+                () -> svc.transactGetItems(List.of(transactGet), region));
+        for (Executable call : itemCalls) {
+            AwsException e = assertThrows(AwsException.class, call);
+            assertEquals("ResourceNotFoundException", e.getErrorCode());
+            assertEquals("Requested resource not found", e.getMessage());
+        }
+
+        AwsException describe = assertThrows(AwsException.class, () -> svc.describeTable("Users", region));
+        assertEquals("Requested resource not found: Table: Users not found", describe.getMessage());
     }
 
     /** Checked against real DynamoDB: every item call on a CREATING table fails this way, DescribeTable still works. */
@@ -3960,7 +4297,7 @@ class DynamoDbServiceTest {
     @Test
     void runImport_missingBucket_failsWithS3NoSuchBucket() {
         var s3 = mock(S3Service.class);
-        when(s3.listObjects("missing", "imp/", null, 0))
+        when(s3.listObjects("missing", "imp/", null, Integer.MAX_VALUE))
                 .thenThrow(new AwsException("NoSuchBucket", "The specified bucket does not exist.", 404));
         var svc = serviceWithS3(s3, new InMemoryStorage<>());
         createUsersTableInCreating(svc);
@@ -3977,7 +4314,7 @@ class DynamoDbServiceTest {
     @Test
     void runImport_otherS3Error_reportsAnS3FailureCode() {
         var s3 = mock(S3Service.class);
-        when(s3.listObjects("bucket", "imp/", null, 0))
+        when(s3.listObjects("bucket", "imp/", null, Integer.MAX_VALUE))
                 .thenThrow(new AwsException("AccessDenied", "Access Denied", 403));
         var svc = serviceWithS3(s3, new InMemoryStorage<>());
         createUsersTableInCreating(svc);

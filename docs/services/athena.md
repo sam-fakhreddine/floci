@@ -18,11 +18,18 @@ Floci emulates Amazon Athena with **real SQL execution** powered by a [floci-duc
 | `GetWorkGroup` | Returns information about a workgroup |
 | `ListWorkGroups` | Lists all workgroups |
 | `CreateWorkGroup` | Creates a new workgroup |
-| `ListDataCatalogs` | - |
-| `GetDataCatalog` | - |
+| `UpdateWorkGroup` | Updates a workgroup's description, state and configuration |
+| `ListDataCatalogs` | Lists the built-in `AwsDataCatalog` plus every registered data catalog |
+| `GetDataCatalog` | Returns one data catalog, or `InvalidRequestException` when it does not exist |
+| `CreateDataCatalog` | Registers a `LAMBDA`, `GLUE`, `HIVE` or `FEDERATED` data catalog |
+| `UpdateDataCatalog` | Replaces the type, description and parameters of a data catalog |
+| `DeleteDataCatalog` | Deletes a data catalog and returns the record it removed |
+| `TagResource` | Adds tags to a workgroup or data catalog ARN |
+| `UntagResource` | Removes tags from a workgroup or data catalog ARN |
 | `ListDatabases` | - |
 | `ListTableMetadata` | - |
 | `GetTableMetadata` | - |
+| `ListTagsForResource` | Returns the tags on a workgroup or data catalog |
 | `DeleteWorkGroup` | Deletes a workgroup |
 <!-- floci:actions:end -->
 
@@ -35,7 +42,9 @@ Floci emulates Amazon Athena with **real SQL execution** powered by a [floci-duc
 
 ## Format inference
 
-The DuckDB read function is chosen from the Glue table's `StorageDescriptor`:
+**Iceberg tables are checked first**, ahead of the `StorageDescriptor` heuristic below: a table whose `Parameters.table_type` is `ICEBERG` (case-insensitive), as set by `pyiceberg`'s `GlueCatalog` and AWS's own Glue-Iceberg integration, is read via `iceberg_scan('<metadata_location>')`, using `Parameters.metadata_location` from the same Glue table. Iceberg tables never populate `InputFormat`/`SerializationLibrary` (they aren't read via a Hive input format), so without this check they always fell through to `read_csv_auto` and failed on the table's binary Parquet data files. `iceberg_scan` resolves the table through its real manifest list, so multi-snapshot tables (after updates, deletes, or repeated appends) read correctly instead of a naive glob picking up every data file ever written under the table's location. The `iceberg` DuckDB extension is installed and loaded once when the generated DDL contains at least one Iceberg table. A table flagged `ICEBERG` but missing `metadata_location` falls back to the format-sniffed heuristic below instead of emitting an unusable `iceberg_scan('')`.
+
+For every other table, the DuckDB read function is chosen from the Glue table's `StorageDescriptor`:
 
 | Condition | Read function |
 |---|---|

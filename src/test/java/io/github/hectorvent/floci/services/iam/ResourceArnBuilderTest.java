@@ -71,6 +71,29 @@ class ResourceArnBuilderTest {
         assertEquals("arn:aws:dynamodb:us-east-1:000000000000:table/FgacTable", arn);
     }
 
+    /**
+     * Pass-through used to be a {@code startsWith("arn:aws:dynamodb:")} probe, so a table ARN from
+     * any other partition was not recognised as an ARN at all and got rebuilt as
+     * {@code table/arn:aws-cn:dynamodb:...}, a resource name that matches no policy.
+     */
+    @Test
+    void dynamoDbReturnsExactArnForAnyPartition() {
+        for (String fullArn : List.of(
+                "arn:aws-us-gov:dynamodb:us-gov-west-1:000000000000:table/FgacTable",
+                "arn:aws-cn:dynamodb:cn-north-1:000000000000:table/FgacTable")) {
+            setJsonBody("{\"TableName\":\"" + fullArn + "\"}");
+            assertEquals(fullArn, builder.build("dynamodb", ctx, "us-east-1", "000000000000"));
+        }
+    }
+
+    /** A bare name that merely looks ARN-ish is still a name, not an ARN. */
+    @Test
+    void dynamoDbTreatsAnIncompleteArnAsATableName() {
+        setJsonBody("{\"TableName\":\"arn:aws:dynamodb:us-east-1\"}");
+        assertEquals("arn:aws:dynamodb:us-east-1:000000000000:table/arn:aws:dynamodb:us-east-1",
+                builder.build("dynamodb", ctx, "us-east-1", "000000000000"));
+    }
+
     @Test
     void dynamoDbReturnsExactArnIfTableNameIsAlreadyArn() {
         String fullArn = "arn:aws:dynamodb:us-east-1:000000000000:table/FgacTable";
@@ -302,10 +325,39 @@ class ResourceArnBuilderTest {
     }
 
     @Test
+    void s3BuildsArnsInTheRequestRegionsPartition() {
+        when(uriInfo.getPath()).thenReturn("/my-bucket/key.txt");
+        assertEquals("arn:aws-cn:s3:::my-bucket/key.txt",
+                builder.build("s3", ctx, "cn-north-1", "000000000000"));
+        when(uriInfo.getPath()).thenReturn("/");
+        assertEquals("arn:aws-us-gov:s3:::*", builder.build("s3", ctx, "us-gov-west-1", "000000000000"));
+    }
+
+    @Test
     void s3BuildsObjectArn() {
         when(uriInfo.getPath()).thenReturn("/my-bucket/folder/file.json");
         String arn = builder.build("s3", ctx, "us-east-1", "000000000000");
         assertEquals("arn:aws:s3:::my-bucket/folder/file.json", arn);
+    }
+
+    /**
+     * S3VirtualHostFilter rewrites a virtual-hosted bucket-level request (GET /) to
+     * /bucket/. The resource is still the bucket, so the ARN must carry no trailing
+     * slash or a policy naming arn:aws:s3:::bucket stops matching and an allowed
+     * ListBucket is denied for every SDK that defaults to virtual-hosted addressing.
+     */
+    @Test
+    void s3BuildsBucketArnForVirtualHostedRewrittenPath() {
+        when(uriInfo.getPath()).thenReturn("/my-bucket/");
+        String arn = builder.build("s3", ctx, "us-east-1", "000000000000");
+        assertEquals("arn:aws:s3:::my-bucket", arn);
+    }
+
+    @Test
+    void s3KeepsTrailingSlashOfAFolderMarkerKey() {
+        when(uriInfo.getPath()).thenReturn("/my-bucket/folder/");
+        String arn = builder.build("s3", ctx, "us-east-1", "000000000000");
+        assertEquals("arn:aws:s3:::my-bucket/folder/", arn);
     }
 
     // ── Lambda ──────────────────────────────────────────────────────────────────

@@ -3,6 +3,7 @@ package com.floci.test;
 import org.junit.jupiter.api.*;
 import software.amazon.awssdk.services.ec2.Ec2Client;
 import software.amazon.awssdk.services.ec2.model.*;
+import software.amazon.awssdk.services.ec2.model.Tag;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
@@ -33,6 +34,62 @@ class Ec2Tests {
     static void setup() {
         ec2 = TestFixtures.ec2Client();
         keyName = "sdk-test-key";
+    }
+
+    @Test
+    @Order(0)
+    @DisplayName("DescribeVpnGateways - empty when none exist")
+    void describeVpnGatewaysEmpty() {
+        assertThat(ec2.describeVpnGateways().vpnGateways()).isEmpty();
+        assertThat(ec2.describeVpnGateways(DescribeVpnGatewaysRequest.builder()
+                .filters(Filter.builder()
+                        .name("attachment.vpc-id")
+                        .values("vpc-0123456789abcdef0")
+                        .build())
+                .build()).vpnGateways()).isEmpty();
+        assertThat(ec2.describeVpnGateways(DescribeVpnGatewaysRequest.builder()
+                .filters(Filter.builder().name("tag-value").values("TeamA").build())
+                .build()).vpnGateways()).isEmpty();
+
+        assertThatThrownBy(() -> ec2.describeVpnGateways(DescribeVpnGatewaysRequest.builder()
+                .vpnGatewayIds("vgw-0123456789abcdef0")
+                .build()))
+                .isInstanceOfSatisfying(Ec2Exception.class, error -> {
+                    assertThat(error.statusCode()).isEqualTo(400);
+                    assertThat(error.awsErrorDetails().errorCode())
+                            .isEqualTo("InvalidVpnGatewayID.NotFound");
+                    assertThat(error.awsErrorDetails().errorMessage())
+                            .isEqualTo("The vpnGateway ID 'vgw-0123456789abcdef0' does not exist");
+                    assertThat(error.requestId()).isNotBlank();
+                });
+    }
+
+    @Test
+    @Order(0)
+    @DisplayName("DescribeEgressOnlyInternetGateways - empty when none exist")
+    void describeEgressOnlyInternetGatewaysEmpty() {
+        assertThat(ec2.describeEgressOnlyInternetGateways().egressOnlyInternetGateways()).isEmpty();
+        assertThat(ec2.describeEgressOnlyInternetGateways(
+                DescribeEgressOnlyInternetGatewaysRequest.builder()
+                        .filters(Filter.builder()
+                                .name("tag:Owner")
+                                .values("TeamA")
+                                .build())
+                        .build()).egressOnlyInternetGateways()).isEmpty();
+        assertThat(ec2.describeEgressOnlyInternetGateways(
+                DescribeEgressOnlyInternetGatewaysRequest.builder()
+                        .filters(Filter.builder().name("tag-value").values("TeamA").build())
+                        .build()).egressOnlyInternetGateways()).isEmpty();
+        DescribeEgressOnlyInternetGatewaysResponse paged =
+                ec2.describeEgressOnlyInternetGateways(
+                        DescribeEgressOnlyInternetGatewaysRequest.builder().maxResults(5).build());
+        assertThat(paged.egressOnlyInternetGateways()).isEmpty();
+        assertThat(paged.nextToken()).isNull();
+
+        assertThat(ec2.describeEgressOnlyInternetGateways(
+                DescribeEgressOnlyInternetGatewaysRequest.builder()
+                        .egressOnlyInternetGatewayIds("eigw-0123456789abcdef0")
+                        .build()).egressOnlyInternetGateways()).isEmpty();
     }
 
     @AfterAll
@@ -278,6 +335,22 @@ class Ec2Tests {
                 .containsExactly("arm64");
     }
 
+    /** Regression coverage for the Karpenter instance-type compatibility contract. */
+    @Test
+    @Order(7)
+    @DisplayName("DescribeInstanceTypes - supported usage classes")
+    void describeInstanceTypeSupportedUsageClasses() {
+        DescribeInstanceTypesResponse resp = ec2.describeInstanceTypes(DescribeInstanceTypesRequest.builder()
+                .instanceTypes(InstanceType.M5_LARGE, InstanceType.fromValue("t4g.medium"),
+                        InstanceType.fromValue("m6gd.large"))
+                .build());
+
+        assertThat(resp.instanceTypes()).hasSize(3);
+        assertThat(resp.instanceTypes()).allSatisfy(instanceType ->
+                assertThat(instanceType.supportedUsageClassesAsStrings())
+                        .containsExactlyInAnyOrder("on-demand", "spot"));
+    }
+
     @Test
     @Order(7)
     @DisplayName("CreateFleet - dry-run and instant on-demand launch")
@@ -375,12 +448,30 @@ class Ec2Tests {
                 .vpcId(vpcId)
                 .cidrBlock("10.0.1.0/24")
                 .availabilityZone("us-east-1a")
+                .tagSpecifications(
+                        TagSpecification.builder()
+                                .resourceType(ResourceType.SUBNET)
+                                .tags(Tag.builder().key("example.io:managed-by").value("sdk-test").build())
+                                .build(),
+                        TagSpecification.builder()
+                                .resourceType(ResourceType.SUBNET)
+                                .tags(
+                                        Tag.builder().key("Name").value("sdk-test-subnet").build(),
+                                        Tag.builder().key("omitted-value").build(),
+                                        Tag.builder().key("explicit-empty-value").value("").build())
+                                .build())
                 .build());
         subnetId = resp.subnet().subnetId();
 
         assertThat(subnetId).isNotNull().startsWith("subnet-");
         assertThat(resp.subnet().vpcId()).isEqualTo(vpcId);
         assertThat(resp.subnet().cidrBlock()).isEqualTo("10.0.1.0/24");
+        assertThat(resp.subnet().tags()).extracting(Tag::key, Tag::value)
+                .containsExactlyInAnyOrder(
+                        tuple("example.io:managed-by", "sdk-test"),
+                        tuple("Name", "sdk-test-subnet"),
+                        tuple("omitted-value", ""),
+                        tuple("explicit-empty-value", ""));
     }
 
     @Test
@@ -392,6 +483,21 @@ class Ec2Tests {
 
         assertThat(resp.subnets()).hasSize(1);
         assertThat(resp.subnets().get(0).subnetId()).isEqualTo(subnetId);
+        assertThat(resp.subnets().get(0).tags()).extracting(Tag::key, Tag::value)
+                .containsExactlyInAnyOrder(
+                        tuple("example.io:managed-by", "sdk-test"),
+                        tuple("Name", "sdk-test-subnet"),
+                        tuple("omitted-value", ""),
+                        tuple("explicit-empty-value", ""));
+        assertThat(ec2.describeTags(DescribeTagsRequest.builder()
+                        .filters(Filter.builder().name("resource-id").values(subnetId).build())
+                        .build()).tags())
+                .extracting(TagDescription::key, TagDescription::value)
+                .containsExactlyInAnyOrder(
+                        tuple("example.io:managed-by", "sdk-test"),
+                        tuple("Name", "sdk-test-subnet"),
+                        tuple("omitted-value", ""),
+                        tuple("explicit-empty-value", ""));
     }
 
     @Test
@@ -469,6 +575,19 @@ class Ec2Tests {
                 .satisfies(e -> {
                     Ec2Exception ec2Ex = (Ec2Exception) e;
                     assertThat(ec2Ex.awsErrorDetails().errorCode()).isEqualTo("InvalidKeyPair.Duplicate");
+                });
+    }
+
+    @Test
+    @Order(18)
+    @DisplayName("CreateKeyPair - missing KeyName returns MissingParameter")
+    void createKeyPairWithoutNameIsRejected() {
+        assertThatThrownBy(() -> ec2.createKeyPair(CreateKeyPairRequest.builder().build()))
+                .isInstanceOf(Ec2Exception.class)
+                .satisfies(e -> {
+                    Ec2Exception ec2Ex = (Ec2Exception) e;
+                    assertThat(ec2Ex.awsErrorDetails().errorCode()).isEqualTo("MissingParameter");
+                    assertThat(ec2Ex.statusCode()).isEqualTo(400);
                 });
     }
 
@@ -796,7 +915,9 @@ class Ec2Tests {
     @Order(46)
     @DisplayName("DeleteKeyPair - delete key pair")
     void deleteKeyPair() {
-        ec2.deleteKeyPair(DeleteKeyPairRequest.builder().keyName(keyName).build());
+        DeleteKeyPairResponse resp = ec2.deleteKeyPair(DeleteKeyPairRequest.builder().keyName(keyName).build());
+        assertThat(resp.returnValue()).isTrue();
+        assertThat(resp.keyPairId()).isNotNull().startsWith("key-");
     }
 
     @Test

@@ -13,6 +13,8 @@ import io.github.hectorvent.floci.services.lambda.zip.CodeStore;
 import io.github.hectorvent.floci.services.lambda.zip.ZipExtractor;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
@@ -538,7 +540,7 @@ class LambdaServiceTest {
     }
 
     @Test
-    void createFunctionWithMissingHandler() throws Exception {
+    void createFunctionDoesNotValidateHandlerAtDeployTime() throws Exception {
         Map<String, Object> req = new java.util.HashMap<>(Map.of(
                 "FunctionName", "missing-handler-fn",
                 "Runtime", "nodejs20.x",
@@ -546,22 +548,24 @@ class LambdaServiceTest {
                 "Handler", "src/index.handler",
                 "Code", Map.of("ZipFile", createZipBase64("other.js"))
         ));
-        AwsException ex = assertThrows(AwsException.class, () -> service.createFunction(REGION, req));
-        assertEquals("InvalidParameterValueException", ex.getErrorCode());
+        LambdaFunction fn = service.createFunction(REGION, req);
+        assertEquals("src/index.handler", fn.getHandler());
     }
 
     @Test
-    void createFunctionWithMissingNestedPythonModuleHandler() throws Exception {
+    void updateFunctionCodeDoesNotValidateHandlerAtDeployTime() throws Exception {
         Map<String, Object> req = new java.util.HashMap<>(Map.of(
                 "FunctionName", "missing-nested-python-handler-fn",
                 "Runtime", "python3.11",
                 "Role", "arn:aws:iam::000000000000:role/test-role",
                 "Handler", "apps.foo.src.lambda_handler.lambda_handler",
-                "Code", Map.of("ZipFile", createZipBase64("apps/foo/src/other.py"))
+                "Code", Map.of("ZipFile", createZipBase64("apps/foo/src/lambda_handler.py"))
         ));
-        AwsException ex = assertThrows(AwsException.class, () -> service.createFunction(REGION, req));
-        assertEquals("InvalidParameterValueException", ex.getErrorCode());
-        assertTrue(ex.getMessage().contains("apps/foo/src/lambda_handler"));
+        service.createFunction(REGION, req);
+
+        LambdaFunction fn = service.updateFunctionCode(REGION, "missing-nested-python-handler-fn",
+                Map.of("ZipFile", createZipBase64("apps/foo/src/other.py")));
+        assertEquals("apps.foo.src.lambda_handler.lambda_handler", fn.getHandler());
     }
 
     @Test
@@ -954,6 +958,126 @@ class LambdaServiceTest {
         AwsException ex = assertThrows(AwsException.class, () -> svc.createFunction(REGION, req));
         assertEquals("InvalidParameterValueException", ex.getErrorCode());
         assertTrue(ex.getMessage().contains("allowed"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "/home/ci/code/../../",
+            "/home/ci/code/../../../etc",
+            "/home/ci/code/sub/../../..",
+            "/home/ci/code/./../secrets",
+            "/home/ci/code-evil",
+            "/home/ci/codex/my-fn",
+            "/home/ci"
+    })
+    void hotReload_allowListRejectsTraversalAndSiblingPrefixes(String s3Key) {
+        LambdaService svc = serviceWithHotReload(true, List.of("/home/ci/code"));
+        Map<String, Object> req = baseRequest("hr-escape");
+        req.put("Code", Map.of("S3Bucket", "hot-reload", "S3Key", s3Key));
+
+        AwsException ex = assertThrows(AwsException.class, () -> svc.createFunction(REGION, req), s3Key);
+
+        assertEquals("InvalidParameterValueException", ex.getErrorCode());
+    }
+
+    @Test
+    void hotReload_rejectsAColonInThePath() {
+        LambdaService svc = serviceWithHotReload(true, null);
+        Map<String, Object> req = baseRequest("hr-colon");
+        req.put("Code", Map.of("S3Bucket", "hot-reload", "S3Key", "/home/ci/code:/etc"));
+
+        AwsException ex = assertThrows(AwsException.class, () -> svc.createFunction(REGION, req));
+
+        assertEquals("InvalidParameterValueException", ex.getErrorCode());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "/",
+            "/var",
+            "/var/run",
+            "/var/run/docker.sock",
+            "/run",
+            "/run/user/1000",
+            "/run/../var/run",
+            "/home/ci/code/../../../var/run",
+            "/proc",
+            "/proc/1/root/var/run",
+            "/proc/self/root/var/run/docker.sock"
+    })
+    void hotReload_withoutAllowListRejectsDirectoriesThatCanHoldTheDockerSocket(String s3Key) {
+        LambdaService svc = serviceWithHotReload(true, null);
+        Map<String, Object> req = baseRequest("hr-socket");
+        req.put("Code", Map.of("S3Bucket", "hot-reload", "S3Key", s3Key));
+
+        AwsException ex = assertThrows(AwsException.class, () -> svc.createFunction(REGION, req), s3Key);
+
+        assertEquals("InvalidParameterValueException", ex.getErrorCode());
+        assertTrue(ex.getMessage().contains("Docker socket"), ex.getMessage());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"/var/lib/app", "/varnish", "/running", "/process/code", "/tmp/my-fn", "/home/ci/code"})
+    void hotReload_withoutAllowListStillAcceptsOrdinaryCodeDirectories(String s3Key) {
+        LambdaService svc = serviceWithHotReload(true, null);
+        Map<String, Object> req = baseRequest("hr-ordinary");
+        req.put("Code", Map.of("S3Bucket", "hot-reload", "S3Key", s3Key));
+
+        assertEquals(s3Key, svc.createFunction(REGION, req).getHotReloadHostPath());
+    }
+
+    @Test
+    void hotReload_anExplicitAllowListIsTheOperatorsChoiceAndOverridesTheSocketGuard() {
+        LambdaService svc = serviceWithHotReload(true, List.of("/run/my-code"));
+        Map<String, Object> req = baseRequest("hr-explicit");
+        req.put("Code", Map.of("S3Bucket", "hot-reload", "S3Key", "/run/my-code/app"));
+
+        assertEquals("/run/my-code/app", svc.createFunction(REGION, req).getHotReloadHostPath());
+    }
+
+    @Test
+    void hotReload_dockerHostPathIsAlwaysPosixSeparated() {
+        assertEquals("/home/ci/code/lib", LambdaService.toDockerHostPath(Path.of("/home/ci/code/lib")));
+        assertEquals("/home", LambdaService.toDockerHostPath(Path.of("/home")));
+        assertEquals("/", LambdaService.toDockerHostPath(Path.of("/")));
+    }
+
+    @Test
+    void hotReload_allowListAcceptsThePrefixItselfAndItsChildren() {
+        LambdaService svc = serviceWithHotReload(true, List.of("/home/ci/code"));
+
+        Map<String, Object> exact = baseRequest("hr-exact");
+        exact.put("Code", Map.of("S3Bucket", "hot-reload", "S3Key", "/home/ci/code"));
+        assertEquals("/home/ci/code", svc.createFunction(REGION, exact).getHotReloadHostPath());
+
+        Map<String, Object> child = baseRequest("hr-child");
+        child.put("Code", Map.of("S3Bucket", "hot-reload", "S3Key", "/home/ci/code/app"));
+        assertEquals("/home/ci/code/app", svc.createFunction(REGION, child).getHotReloadHostPath());
+    }
+
+    @Test
+    void hotReload_storesTheNormalizedPathHandedToDocker() {
+        LambdaService svc = serviceWithHotReload(true, List.of("/home/ci/code"));
+        Map<String, Object> req = baseRequest("hr-normalized");
+        req.put("Code", Map.of("S3Bucket", "hot-reload", "S3Key", "/home/ci/code/app/../lib/"));
+
+        assertEquals("/home/ci/code/lib", svc.createFunction(REGION, req).getHotReloadHostPath());
+    }
+
+    @Test
+    void hotReload_traversalIsRejectedOnUpdateFunctionCodeToo() {
+        LambdaService svc = serviceWithHotReload(true, List.of("/home/ci/code"));
+        Map<String, Object> create = baseRequest("hr-update");
+        create.put("Code", Map.of("S3Bucket", "hot-reload", "S3Key", "/home/ci/code/app"));
+        svc.createFunction(REGION, create);
+
+        Map<String, Object> update = new HashMap<>();
+        update.put("S3Bucket", "hot-reload");
+        update.put("S3Key", "/home/ci/code/../../");
+        AwsException ex = assertThrows(AwsException.class,
+                () -> svc.updateFunctionCode(REGION, "hr-update", update));
+
+        assertEquals("InvalidParameterValueException", ex.getErrorCode());
     }
 
     @Test

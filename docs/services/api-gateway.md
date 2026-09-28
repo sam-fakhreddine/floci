@@ -2,6 +2,19 @@
 
 Floci supports both API Gateway v1 (REST APIs) and API Gateway v2 (HTTP APIs).
 
+## JWT issuer network policy
+
+HTTP API JWT authorizers fetch the configured issuer's OIDC discovery document and JWKS. Floci
+rejects HTTP issuers and destinations that resolve to local, link-local, private, or other
+non-public addresses by default. This prevents an authorizer configuration from turning JWT
+verification into an SSRF path.
+
+For an isolated development environment with a local fixture issuer, set
+`FLOCI_SECURITY_ALLOW_PRIVATE_JWT_TARGETS=true`. This shared JWT policy also applies to AppSync
+OIDC providers. The option permits private HTTPS targets and HTTP URLs that use a literal private
+or loopback address. It does not permit public HTTP targets. Keep it disabled when Floci can
+receive untrusted API configuration.
+
 ## Custom API IDs
 
 API IDs are generated randomly, which means endpoint URLs change every time you recreate an API. To pin
@@ -39,6 +52,12 @@ duplicate override IDs.
 **Protocol:** REST JSON
 **Endpoint:** `http://localhost:4566/restapis/...`
 
+`ImportRestApi` and `PutRestApi` return parser warnings in the REST API's `warnings` array.
+Set the lowercase query parameter `failonwarnings=true` (SDK: `failOnWarnings`) to reject
+a warning-bearing definition with `BadRequestException` before creating or overwriting
+the API. The default is `false`. A successful import with no warnings clears any prior
+warnings; malformed definitions and fatal import errors remain errors in either mode.
+
 ### Supported Operations
 
 | Category | Operations |
@@ -53,9 +72,10 @@ duplicate override IDs.
 | **Stages** | CreateStage, GetStage, GetStages, UpdateStage, DeleteStage |
 | **Authorizers** | CreateAuthorizer, GetAuthorizer, GetAuthorizers, UpdateAuthorizer, DeleteAuthorizer |
 | **API Keys** | CreateApiKey, ImportApiKeys, GetApiKey, GetApiKeys, UpdateApiKey, DeleteApiKey |
-| **Usage Plans** | CreateUsagePlan, GetUsagePlan, GetUsagePlans, UpdateUsagePlan, DeleteUsagePlan |
+| **Usage Plans** | CreateUsagePlan, GetUsagePlan, GetUsagePlans, UpdateUsagePlan, DeleteUsagePlan, GetUsage |
 | **Usage Plan Keys** | CreateUsagePlanKey, GetUsagePlanKey, GetUsagePlanKeys, DeleteUsagePlanKey |
 | **Request Validators** | CreateRequestValidator, GetRequestValidator, GetRequestValidators, UpdateRequestValidator, DeleteRequestValidator |
+| **Gateway Responses** | PutGatewayResponse, GetGatewayResponse, GetGatewayResponses, UpdateGatewayResponse, DeleteGatewayResponse |
 | **Models** | CreateModel, GetModel, GetModels, UpdateModel, DeleteModel |
 | **Domain Names** | CreateDomainName, GetDomainName, GetDomainNames, UpdateDomainName, DeleteDomainName |
 | **Base Path Mappings** | CreateBasePathMapping, GetBasePathMapping, GetBasePathMappings, UpdateBasePathMapping, DeleteBasePathMapping |
@@ -78,17 +98,11 @@ column defaults to `true`. Duplicate key values are reported in the `warnings` a
 
 #### `generateDistinctId`
 
-Controls whether the key's `id` and `value` fields are distinct. AWS's undocumented default behaviour is that they are **the same string** unless `generateDistinctId=true` is explicitly requested.
-
-| `generateDistinctId` | `id` | `value` |
-|---|---|---|
-| absent (default) | same as `value` | caller-supplied `value`, or a generated UUID-derived string |
-| `false` | same as `value` | caller-supplied `value`, or a generated UUID-derived string |
-| `true` | opaque short token (`shortId`) | caller-supplied `value`, or a generated UUID-derived string |
-
-When `generateDistinctId` is absent or `false`, a single shared string is used for both `id` and `value`. If the caller supplies a `value` in the request body, that string is used for both; otherwise a UUID-derived string is generated and assigned to both.
-
-When `generateDistinctId=true`, `id` is set to an opaque short token independent of `value`.
+API key identifiers are generated independently from their secret values when `generateDistinctId`
+is absent, matching current AWS behavior, or explicitly set to `true`. The deprecated explicit
+`generateDistinctId=false` behavior is retained for compatibility and uses the key value as its
+identifier. A caller-supplied `value` remains available only from create responses and reads that
+explicitly request values.
 
 #### Revocation
 
@@ -131,7 +145,10 @@ Templates can create domains and mappings with `AWS::ApiGateway::DomainName` and
 
 A method (v1) or route (v2) whose `authorizationType` is `AWS_IAM` requires a SigV4-signed caller.
 Before the integration runs, the signature is verified against the request as it arrived (method,
-path, query string, the headers named in `SignedHeaders`, and the SHA-256 of the body). Both
+path, query string, the headers named in `SignedHeaders`, and the SHA-256 of the body). A request
+that reaches the API through a [custom domain](#custom-domain-names) or an `execute-api` virtual
+host is verified against the path the caller signed, not the `/execute-api/...` form Floci
+rewrites it to internally. Both
 placements AWS accepts are honoured: an `Authorization` header and a presigned query string
 (`X-Amz-Algorithm=AWS4-HMAC-SHA256`). The credential must be scoped to the `execute-api` service.
 
@@ -174,19 +191,110 @@ handling; a hand-rolled signer must include it.
 > signed, known caller is let through. `principalOrgId` and `cognitoIdentity` are always null -
 > Organizations membership and identity-pool federation are not modelled.
 
+### Gateway Responses
+
+A REST API's gateway responses customise what the gateway itself answers when it, rather than
+the integration, produces the response. All 21 AWS response types are accepted, keyed by
+`responseType`; `GetGatewayResponses` lists every type, reporting the ones never customised with
+`defaultResponse: true`, their AWS default `statusCode`, and the default
+`{"message":$context.error.messageString}` template. `PutGatewayResponse` is an upsert,
+`UpdateGatewayResponse` accepts `add`/`replace`/`remove` on `/statusCode`,
+`/responseParameters/<name>` and `/responseTemplates/<content-type>` (JSON-pointer escaped, e.g.
+`application~1json`), and `DeleteGatewayResponse` restores the default. The
+`x-amazon-apigateway-gateway-responses` OpenAPI extension is imported by `ImportRestApi` and
+`PutRestApi`, and `AWS::ApiGateway::GatewayResponse` is provisioned by CloudFormation.
+
+On the execute plane every gateway-generated answer resolves the customisation for its type,
+then for `DEFAULT_4XX` / `DEFAULT_5XX`, and applies the configured `statusCode`, the
+`gatewayresponse.header.*` parameters (`'static'`, `method.request.header.*`,
+`method.request.querystring.*`, `method.request.path.*`, `context.*`, `stageVariables.*`) and the
+`responseTemplates` (selected by the request's `Accept` header, falling back to
+`application/json`), with `$context.error.message`, `$context.error.messageString`,
+`$context.error.responseType` and `$context.error.validationErrorString` available to the template.
+This is what lets a browser read a `401`/`403`/`400` as such instead of as a CORS failure once
+`DEFAULT_4XX` maps `Access-Control-Allow-Origin`, exactly as the console's "Enable CORS" does.
+
+| Gateway-generated answer | `responseType` |
+|---|---|
+| No resource matches the path, or none declares the method (`403 Missing Authentication Token`) | `MISSING_AUTHENTICATION_TOKEN` |
+| `AWS_IAM` method without a signature | `MISSING_AUTHENTICATION_TOKEN` |
+| `AWS_IAM` signature malformed or mismatching | `INVALID_SIGNATURE` |
+| `AWS_IAM` signature outside the 5-minute window, or a presigned URL past its expiry | `EXPIRED_TOKEN` |
+| `AWS_IAM` access key the emulator never issued | `ACCESS_DENIED` |
+| Lambda authorizer returns `Deny` | `ACCESS_DENIED` |
+| Lambda authorizer fails or throws | `AUTHORIZER_FAILURE` |
+| Method with `apiKeyRequired` and no usable `x-api-key` (`403 Forbidden`) | `INVALID_API_KEY` |
+| Request validator rejects a parameter / the body | `BAD_REQUEST_PARAMETERS` / `BAD_REQUEST_BODY` |
+| `passthroughBehavior` rejects the request `Content-Type` (`415`) | `UNSUPPORTED_MEDIA_TYPE` |
+| Missing or unresolvable integration or URI, MOCK template that does not render | `API_CONFIGURATION_ERROR` |
+| Lambda proxy function error, malformed proxy payload, or missing function | `INTEGRATION_FAILURE` |
+
+A customised `statusCode` overrides the status Floci would otherwise send. Throttling, quota, request size and WAF answers are not produced on the execute plane, so
+`THROTTLED`, `QUOTA_EXCEEDED`, `REQUEST_TOO_LARGE` and `WAF_FILTERED` can be configured but never
+fire, and an `HTTP`/`HTTP_PROXY` backend's own status is relayed rather than treated as a gateway
+response.
+
 ### Not Implemented
 
 These management-plane operations have no handler in v1. Calls will return `404` or an error:
 
 - Authorizer testing: `TestInvokeAuthorizer`
 - Model templates: `GetModelTemplate`
-- Gateway Responses (the entire family: `PutGatewayResponse`, `GetGatewayResponse`, etc.)
 - Documentation parts and versions (the entire family, 10 operations)
-- VPC Links (5 operations)
 - Client Certificates (5 operations)
 - `GetExport` / `ImportDocumentationParts`
 
-The execute plane (actual proxied HTTP traffic via `/restapis/{id}/{stage}/_user_request_/…`) is implemented separately and is not counted as management-plane operations. It supports `AWS_PROXY` (Lambda proxy), `AWS` (Lambda with VTL request/response templates), and `MOCK` integrations; other integration types return an error.
+The execute plane (actual proxied HTTP traffic via `/restapis/{id}/{stage}/_user_request_/…`) is implemented separately and is not counted as management-plane operations. It supports these integration types; others return an error:
+
+| Type | Support |
+| --- | --- |
+| `AWS_PROXY` (Lambda proxy) | ✅ |
+| `AWS` (Lambda / AWS service with VTL request/response templates) | ✅ |
+| `HTTP_PROXY` (passthrough to an arbitrary HTTP backend) | ✅ |
+| `HTTP` (non-proxy, with VTL request/response templates) | ✅ |
+| `MOCK` | ✅ |
+
+A `MOCK` integration renders its request template and uses the `statusCode` it produces to pick the integration response, exactly as AWS does: the first response whose `selectionPattern` matches wins, otherwise the response without a pattern (the default) answers. This is what makes CORS preflights declared with a `204` response (CDK's `addCorsPreflight`) carry their `Access-Control-*` headers.
+
+`HTTP_PROXY` forwards the request to the integration's `uri` — with `{param}` placeholders resolved from the matched resource's path parameters — and relays the backend's status, headers and body unchanged. Per AWS, no request templates and no integration-response selection apply to `HTTP_PROXY`, so a backend `4xx`/`5xx` reaches the caller verbatim rather than being remapped. `integration.request.{header,querystring,path}.*` → `method.request.*` mappings are applied. Hop-by-hop headers (including `Host`) are stripped. An unreachable or failing backend yields `502`.
+
+A backend response body larger than the 10 MB API Gateway payload quota yields `413` with `{"message":"Request Entity Too Large"}`. The same limit applies to HTTP API `HTTP_PROXY` integrations.
+
+Passthrough keeps repeated values repeated, in both directions: `?tag=a&tag=b` reaches the backend as two `tag` parameters rather than one `tag=a,b`, a header sent twice arrives twice, and a backend that returns two `Set-Cookie` headers relays two to the caller. Comma-joining them would not be reversible, since a cookie's `Expires` attribute contains a comma of its own. An explicit `integration.request.header.X` or `integration.request.querystring.X` mapping overwrites, so it replaces any repeated inbound values with the single mapped one.
+
+`HTTP` (non-proxy) transforms in both directions instead:
+
+- **Request** — the body is the rendered `requestTemplates` entry selected by the incoming `Content-Type` (falling back to the type without its charset), subject to `passthroughBehavior` (`NEVER` and `WHEN_NO_TEMPLATES` return `415`). Only headers and query parameters named by `integration.request.*` mappings are forwarded; unmapped inbound headers are **not** passed through — that passthrough is `HTTP_PROXY`'s job.
+- **Response** — the backend's reply runs through the method's integration responses. As in AWS, `selectionPattern` is matched against the backend's **HTTP status code** (for `AWS`/Lambda integrations it is matched against the error message instead), so `"5\\d{2}"` on a `502` integration response remaps any backend `5xx` to `502`. The matched response's `responseTemplates` render the body, `responseParameters` map `integration.response.header.*` (case-insensitively) or `integration.response.body.<jsonpath>` onto `method.response.header.*`, and `$context.responseOverride` assignments take precedence. With no integration responses configured, the backend's status and body are relayed as-is.
+
+### Integration Settings
+
+`PutIntegration` persists and `GetIntegration` returns the full configuration, including the mapping templates and integration responses that IaC tools diff against:
+
+| Field | Behaviour |
+| --- | --- |
+| `requestParameters` / `requestTemplates` | Applied at invoke time and returned on read-back |
+| `passthroughBehavior` | `NEVER` and `WHEN_NO_TEMPLATES` reject an unmatched Content-Type with `415` |
+| `timeoutInMillis` | Honoured; defaults to AWS's 29,000 ms. Values below 50 are rejected. The 29s ceiling is an edge-optimized limit, so Regional APIs may exceed it |
+| `tlsConfig.insecureSkipVerification` | Honoured, with AWS's semantics: it stops requiring the backend certificate to be issued by a trusted CA, so a private-CA or self-signed backend is reachable, but expiration, hostname and the presence of a root certificate authority are still checked |
+| `contentHandling` | `CONVERT_TO_TEXT` base64-encodes a binary request for mapping templates; `CONVERT_TO_BINARY` base64-decodes a text request before sending it |
+| `connectionType` / `connectionId` | `VPC_LINK` requires `connectionId` to name an existing, available VPC link; an unknown link yields `502` |
+| `cacheNamespace` / `cacheKeyParameters` | Form the response cache key (see below) |
+| `credentials` | Persisted and returned. Floci does not enforce IAM, so the role is not actually assumed |
+
+Integration responses additionally accept `contentHandling`, applied as an output conversion after response templates.
+
+### Binary Payloads
+
+Set `binaryMediaTypes` on the RestApi to mark content types as binary. Entries are matched exactly, ignoring any charset parameter; `*/*` is the one wildcard entry, and it covers every content type. A subtype wildcard such as `image/*` is not expanded, matching AWS, which documents only `*/*` and otherwise names one exact media type at a time. A binary request body reaches an `AWS_PROXY` (Lambda) integration base64-encoded with `isBase64Encoded: true`; previously it was read as a UTF-8 string, which corrupted it. For non-proxy integrations, pair `binaryMediaTypes` with `contentHandling` as above.
+
+### Caching
+
+Response caching needs both switches AWS requires: `cacheClusterEnabled` on the stage and `caching/enabled` on the method (or the `*/*` wildcard) via `UpdateStage` patch operations. Entries are keyed by the integration's `cacheNamespace` and the values of its `cacheKeyParameters`, and by nothing else: AWS lets separate resources share a `cacheNamespace` precisely so they can return the same cached data, so the method and request path are deliberately not part of the key. The namespace defaults to the resource id, which keeps resources that did not opt into sharing separate. Entries expire after `caching/ttlInSeconds` (default 300s), and only successful (`< 400`) responses are stored. There is no real cache cluster — `cacheClusterSize` is recorded and reported but has no effect on capacity.
+
+### VPC Links
+
+The five REST VPC Link operations (`CreateVpcLink`, `GetVpcLink`, `GetVpcLinks`, `UpdateVpcLink`, `DeleteVpcLink`) are emulated at `/vpclinks`. `CreateVpcLink` requires a name and at least one target ARN, answers `202`, and provisions the link as `AVAILABLE` immediately rather than transitioning through `PENDING`. Since Floci has no real VPC, a valid link routes straight to the integration URI; what is enforced is that the link exists and is available. `UpdateVpcLink` follows AWS's patch-operation table: only `replace` on `/name` and `/description` is accepted, and any other operation or path returns `BadRequestException` rather than being applied or silently ignored.
 
 ### Examples
 
@@ -241,6 +349,32 @@ aws apigateway create-deployment \
 curl http://localhost:4566/restapis/$API_ID/dev/_user_request_/users
 ```
 
+### Usage reporting
+
+`GetUsage` returns the real response envelope: a `values` map of API key id to one `[used, remaining]`
+pair per day of the inclusive range, alongside `usagePlanId`, `startDate` and `endDate`. The second
+element of each pair is the quota limit minus cumulative use on real API Gateway, not the quota
+itself.
+
+The operation pages over the API key entries with `limit` and `position`, defaulting to 25 keys a
+page and emitting `position` only when another page exists.
+
+Request acceptance and response page size are separate things here. Probed against real API
+Gateway, every `limit` from 500 up to `Integer.MAX_VALUE` is accepted without error, so none is
+rejected. That does not show the service ever returning more than 500 entries in one page, and the
+documented contract caps a page at 500, so a larger `limit` is honoured as a request while the page
+returned stays capped at 500.
+
+The lower bound is a deliberate divergence: real API Gateway answers `limit=0` and `limit=-1` with
+an `InternalFailure`, which is a fault rather than a contract, so a page size below one is rejected
+as a `BadRequestException` instead of reproducing a 500.
+
+**Both numbers are always zero.** Nothing meters requests per API key, and a usage plan stores no
+quota to subtract from, so there is no limit to report against. Throttle settings are likewise
+accepted and stored but never enforced. Storing a quota on the usage plan and counting on the
+execute path are the two pieces still missing; a caller that sums the used counts gets zero, which
+is what it already got before the action existed, without having to special-case a missing endpoint.
+
 ### Usage Plan Tags and Custom IDs
 
 Usage plans accept arbitrary tags, and the same reserved `floci:override-id` tag used for
@@ -270,6 +404,19 @@ setups, and `floci:override-id` wins when both are present. Every other tag is p
 |---|---|---|
 | `FLOCI_SERVICES_APIGATEWAY_ENABLED` | `true` | Enable or disable API Gateway v1 (REST APIs) |
 | `FLOCI_SERVICES_APIGATEWAYV2_ENABLED` | `true` | Enable or disable API Gateway v2 (HTTP and WebSocket APIs) |
+| `FLOCI_SERVICES_APIGATEWAY_VTL_MAX_LOOPS` | `10000` | Maximum `#foreach` iterations a VTL mapping template may execute |
+| `FLOCI_SERVICES_APIGATEWAY_VTL_MAX_OUTPUT_CHARS` | `1048576` | Maximum characters a VTL mapping template may render |
+| `FLOCI_SERVICES_APIGATEWAY_VTL_TIMEOUT_MILLIS` | `5000` | Maximum wall-clock time a VTL mapping template may spend evaluating |
+
+VTL (Velocity Template Language) mapping templates render inside a reflection-restricted sandbox
+(`SecureUberspector`, with `Class`, `ClassLoader`, `Runtime`, `ProcessBuilder`, `System`, `Thread`,
+`java.io.File` and related classes/packages blocked) and are subject to the three limits above.
+The loop cap truncates a `#foreach` at the configured iteration count and lets the template finish
+rendering with whatever output it produced up to that point; it does not fail the template.
+Exceeding the output-size or execution-time limit does fail the template, the same way any other
+Velocity evaluation error does; neither introduces a new error shape. This applies to both API
+Gateway v1 (`AWS`/Lambda mapping templates) and the AppSync resolver templates described in
+[appsync.md](appsync.md).
 
 ## API Gateway v2 (HTTP and WebSocket APIs) {#v2}
 

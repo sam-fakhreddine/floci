@@ -37,8 +37,13 @@ RUN set -eux; \
 
 WORKDIR /app
 
+# cli_follow_urlparam: the bundled CLI is v1 (pip ships no v2), where a parameter value that looks
+# like a URL is *fetched* and its body used as the value. An init hook putting an SSM parameter such
+# as MY_API_URL=https://example.com then fails with "Unable to retrieve https://…", and a hook that
+# backgrounds its calls loses that silently. AWS CLI v2 dropped the behaviour, so this only shows up
+# in the image, never when the same script is run from a host with v2.
 RUN mkdir -p /app/data /etc/floci/aws \
-    && printf '[default]\nendpoint_url = http://localhost:4566\n' > /etc/floci/aws/config \
+    && printf '[default]\nendpoint_url = http://localhost:4566\ncli_follow_urlparam = false\n' > /etc/floci/aws/config \
     && chown 1001:root /app \
     && chmod "g+rwX" /app \
     && chown 1001:root /app/data
@@ -81,4 +86,5 @@ HEALTHCHECK --interval=5s --timeout=3s --retries=5 \
     CMD wget -q --spider http://localhost:4566/_floci/health || exit 1
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
-CMD ["java", "--enable-native-access=ALL-UNNAMED", "-jar", "/app/quarkus-app/quarkus-run.jar"]
+# A published port needs 0.0.0.0 inside the container, which Floci only accepts with explicit consent.
+CMD ["java", "--enable-native-access=ALL-UNNAMED", "-Dquarkus.http.host=0.0.0.0", "-Dfloci.security.allow-unsafe-network-exposure=true", "-jar", "/app/quarkus-app/quarkus-run.jar"]

@@ -89,7 +89,9 @@ public class TagDispatcher {
         } catch (AwsException e) {
             throw e;
         } catch (Exception e) {
-            String code = handler.strictTagValidation() ? "ValidationException" : "BadRequestException";
+            String code = handler.strictTagValidation()
+                    ? handler.tagValidationErrorCode()
+                    : "BadRequestException";
             throw new AwsException(code, e.getMessage(), 400);
         }
     }
@@ -113,8 +115,8 @@ public class TagDispatcher {
             ArrayNode arr = root.putArray(key);
             tags.forEach((k, v) -> {
                 ObjectNode entry = arr.addObject();
-                entry.put("Key", k);
-                entry.put("Value", v);
+                entry.put(handler.tagEntryKeyName(), k);
+                entry.put(handler.tagEntryValueName(), v);
             });
         } else {
             ObjectNode tagsNode = root.putObject(key);
@@ -147,8 +149,8 @@ public class TagDispatcher {
                 return tags;
             }
             for (JsonNode entry : tagNode) {
-                JsonNode k = entry.get("Key");
-                JsonNode v = entry.get("Value");
+                JsonNode k = entry.get(handler.tagEntryKeyName());
+                JsonNode v = entry.get(handler.tagEntryValueName());
                 if (k == null || k.isNull() || v == null || v.isNull()) {
                     if (handler.strictTagValidation()) {
                         throw new AwsException("ValidationException",

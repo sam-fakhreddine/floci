@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.athena;
 
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.glue.GlueService;
+import io.github.hectorvent.floci.services.glue.model.Column;
 import io.github.hectorvent.floci.services.glue.model.Database;
 import io.github.hectorvent.floci.services.glue.model.StorageDescriptor;
 import io.github.hectorvent.floci.services.glue.model.Table;
@@ -10,6 +11,7 @@ import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -48,6 +50,82 @@ class GlueViewDdlBuilderTest {
             table.setStorageDescriptor(sd);
         }
         return table;
+    }
+
+    private static Column column(String name) {
+        Column c = new Column();
+        c.setName(name);
+        c.setType("string");
+        return c;
+    }
+
+    private Table tableWithColumns(String name, String location, List<Column> columns, List<Column> partitionKeys) {
+        Table table = createTable(name, location, "org.openx.data.jsonserde.JsonSerDe", null);
+        table.getStorageDescriptor().setColumns(columns);
+        table.setPartitionKeys(partitionKeys);
+        return table;
+    }
+
+    private String ddlFor(Table table) {
+        Database db = createDatabase("audit");
+        when(glueService.getDatabases()).thenReturn(List.of(db));
+        when(glueService.getTables("audit")).thenReturn(List.of(table));
+        return builder.build(null);
+    }
+
+    /**
+     * Athena reports the column names the catalog declares. The files here spell them camelCase, so a
+     * view built by inference alone would expose the file's spelling and a client reading the declared
+     * name would find nothing.
+     */
+    @Test
+    void testDeclaredColumnsAreProjectedInsteadOfStar() {
+        String ddl = ddlFor(tableWithColumns("audit_events", "s3://audit/",
+                List.of(column("eventid"), column("tenantid")),
+                List.of(column("tenant"), column("year"))));
+
+        assertTrue(ddl.contains("\"eventid\" AS \"eventid\""), ddl);
+        assertTrue(ddl.contains("\"tenantid\" AS \"tenantid\""), ddl);
+        assertFalse(ddl.contains("SELECT * FROM"), ddl);
+    }
+
+    /** Partition keys are part of the schema and are what partition predicates filter on. */
+    @Test
+    void testPartitionKeysAreProjectedAlongsideDataColumns() {
+        String ddl = ddlFor(tableWithColumns("audit_events", "s3://audit/",
+                List.of(column("eventid")),
+                List.of(column("tenant"), column("year"), column("month"), column("day"))));
+
+        for (String name : List.of("eventid", "tenant", "year", "month", "day")) {
+            assertTrue(ddl.contains("\"" + name + "\" AS \"" + name + "\""), name + " missing from: " + ddl);
+        }
+    }
+
+    /** A partition key repeating a data column would bind twice and make the view ambiguous. */
+    @Test
+    void testDuplicateColumnAndPartitionKeyIsProjectedOnce() {
+        String ddl = ddlFor(tableWithColumns("t", "s3://b/",
+                List.of(column("tenant")), List.of(column("TENANT"))));
+
+        int first = ddl.indexOf("AS \"tenant\"");
+        assertTrue(first >= 0, ddl);
+        assertEquals(-1, ddl.indexOf("AS \"tenant\"", first + 1), "projected twice: " + ddl);
+    }
+
+    /** A table that declares no columns leaves inference in charge, as before. */
+    @Test
+    void testTableWithoutDeclaredColumnsStillUsesStar() {
+        String ddl = ddlFor(tableWithColumns("t", "s3://b/", null, null));
+
+        assertTrue(ddl.contains("SELECT * FROM"), ddl);
+    }
+
+    /** Column identifiers go through the same quoting as table and schema names. */
+    @Test
+    void testColumnIdentifierQuotingEscapesDoubleQuotes() {
+        String ddl = ddlFor(tableWithColumns("t", "s3://b/", List.of(column("we\"ird")), null));
+
+        assertTrue(ddl.contains("\"we\"\"ird\" AS \"we\"\"ird\""), ddl);
     }
 
     @Test
@@ -237,6 +315,74 @@ class GlueViewDdlBuilderTest {
         assertTrue(ddl.contains("CREATE OR REPLACE VIEW \"shop\".\"orders\""));
         assertTrue(ddl.contains("CREATE OR REPLACE VIEW \"orders\""));
         Mockito.verify(glueService, Mockito.times(1)).getTables("shop");
+    }
+
+    private Table icebergTable(String name, String location, String metadataLocation) {
+        Table table = createTable(name, location, null, null);
+        table.setParameters(metadataLocation == null
+                ? Map.of("table_type", "ICEBERG")
+                : Map.of("table_type", "ICEBERG", "metadata_location", metadataLocation));
+        return table;
+    }
+
+    /**
+     * pyiceberg's GlueCatalog (and AWS's own Glue-Iceberg integration) never populate
+     * InputFormat/SerializationLibrary, so an Iceberg table must be detected from
+     * Parameters.table_type rather than format-sniffed like every other table kind.
+     */
+    @Test
+    void testIcebergTableUsesIcebergScanOnMetadataLocation() {
+        Table table = icebergTable("orders", "s3://bucket/warehouse/orders",
+                "s3://bucket/warehouse/orders/metadata/00001-abc.metadata.json");
+        String ddl = ddlFor(table);
+
+        assertTrue(ddl.contains(
+                "CREATE OR REPLACE VIEW \"audit\".\"orders\" AS SELECT * FROM "
+                        + "iceberg_scan('s3://bucket/warehouse/orders/metadata/00001-abc.metadata.json');\n"),
+                ddl);
+    }
+
+    /** The iceberg extension is expensive to install, so it's only requested when actually needed. */
+    @Test
+    void testIcebergExtensionSetupOnlyEmittedWhenTableIsIceberg() {
+        Table icebergTable = icebergTable("orders", "s3://bucket/orders",
+                "s3://bucket/orders/metadata/00000.metadata.json");
+        String ddlWithIceberg = ddlFor(icebergTable);
+        assertTrue(ddlWithIceberg.startsWith("INSTALL iceberg; LOAD iceberg;\n"), ddlWithIceberg);
+
+        Table plainTable = createTable("orders", "s3://bucket/orders", null, null);
+        String ddlWithoutIceberg = ddlFor(plainTable);
+        assertFalse(ddlWithoutIceberg.contains("iceberg"), ddlWithoutIceberg);
+    }
+
+    /** A malformed Iceberg table (flagged as Iceberg but missing metadata_location) falls back
+     *  to format inference rather than emitting an unusable iceberg_scan('') call. */
+    @Test
+    void testIcebergTableWithoutMetadataLocationFallsBackToFormatInference() {
+        Table table = icebergTable("orders", "s3://bucket/orders", null);
+        String ddl = ddlFor(table);
+
+        assertTrue(ddl.contains("FROM read_csv_auto('s3://bucket/orders/**');\n"), ddl);
+        assertFalse(ddl.contains("iceberg_scan"), ddl);
+    }
+
+    @Test
+    void testIsIcebergTableDetection() {
+        assertFalse(GlueViewDdlBuilder.isIcebergTable(null));
+        assertFalse(GlueViewDdlBuilder.isIcebergTable(createTable("t", "s3://b/t", null, null)));
+
+        Table table = createTable("t", "s3://b/t", null, null);
+        table.setParameters(Map.of("table_type", "iceberg"));
+        assertTrue(GlueViewDdlBuilder.isIcebergTable(table), "table_type comparison should be case-insensitive");
+
+        table.setParameters(Map.of("table_type", "EXTERNAL_TABLE"));
+        assertFalse(GlueViewDdlBuilder.isIcebergTable(table));
+    }
+
+    @Test
+    void testIcebergReadExpressionEscapesSingleQuotes() {
+        assertEquals("iceberg_scan('s3://bucket/it''s-a-table/metadata/x.json')",
+                GlueViewDdlBuilder.icebergReadExpression("s3://bucket/it's-a-table/metadata/x.json"));
     }
 }
 

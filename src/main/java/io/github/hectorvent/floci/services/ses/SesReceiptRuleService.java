@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.ses;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -27,10 +28,11 @@ import java.util.regex.Pattern;
 
 /**
  * Owns the SES inbound-mail management domain: receipt rule sets and their rules (the
- * {@code receiptRuleSetStore}) and receipt IP filters (the {@code receiptFilterStore}). Extracted from {@link SesService} in the store-based domain split and reached only through
- * that facade. Action-target validation couples this domain to {@link S3Service},
- * {@link SnsService}, and {@link LambdaService}, reproducing the checks real SES runs against the
- * account; the bounce-sender check arrives as a predicate the facade binds to
+ * {@code receiptRuleSetStore}) and receipt IP filters (the {@code receiptFilterStore}). Extracted
+ * from {@link SesService} in the store-based domain split; the v1 {@link SesQueryHandler} is its
+ * only caller and reaches it directly. Action-target validation couples this domain to
+ * {@link S3Service}, {@link SnsService}, and {@link LambdaService}, reproducing the checks real SES
+ * runs against the account; the bounce-sender check arrives as a predicate the handler binds to
  * {@code SesIdentityService}, keeping identity resolution out of this class's dependencies.
  *
  * <p>Floci has no inbound-mail endpoint, so everything here is stored inertly: stored rules
@@ -57,9 +59,9 @@ public class SesReceiptRuleService {
     // Probed: a value that is not a well-formed topic/function ARN (a bare name, or an ARN with
     // missing segments) gets the "Invalid ..." message before any existence lookup. There is no
     // recipient-count limit (101 recipients are accepted).
-    private static final Pattern SNS_TOPIC_ARN = Pattern.compile("^arn:aws[a-zA-Z-]*:sns:[a-z0-9-]+:\\d{12}:.+$");
+    private static final Pattern SNS_TOPIC_ARN = Pattern.compile("^arn:" + AwsArnUtils.PARTITION_REGEX + ":sns:[a-z0-9-]+:\\d{12}:.+$");
     private static final Pattern LAMBDA_FUNCTION_ARN =
-            Pattern.compile("^arn:aws[a-zA-Z-]*:lambda:[a-z0-9-]+:\\d{12}:function:.+$");
+            Pattern.compile("^arn:" + AwsArnUtils.PARTITION_REGEX + ":lambda:[a-z0-9-]+:\\d{12}:function:.+$");
     // RFC 5322 ftext: printable US-ASCII excluding the colon. Real SES rejects anything else with
     // "Invalid header name: <name>" (probed 2026-09).
     private static final Pattern HEADER_NAME_CHARS = Pattern.compile("^[\\x21-\\x39\\x3B-\\x7E]+$");
