@@ -689,7 +689,7 @@ class SchedulerIntegrationTest {
                 {
                     "ScheduleExpression": "rate(1 hour)",
                     "FlexibleTimeWindow": {"Mode": "OFF"},
-                    "Target": {"Arn": "arn:t", "RoleArn": "arn:r"}
+                    "Target": {"Arn": "arn:t", "RoleArn": "arn:aws:iam::123456789012:role/scheduler-role"}
                 }
                 """)
         .when()
@@ -930,7 +930,7 @@ class SchedulerIntegrationTest {
                 {
                     "ScheduleExpression": "rate(1 hour)",
                     "FlexibleTimeWindow": {"Mode": "OFF"},
-                    "Target": {"Arn": "arn:t", "RoleArn": "arn:r"}
+                    "Target": {"Arn": "arn:t", "RoleArn": "arn:aws:iam::123456789012:role/scheduler-role"}
                 }
                 """)
         .when()

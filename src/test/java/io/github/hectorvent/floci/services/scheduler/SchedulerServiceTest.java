@@ -142,12 +142,12 @@ class SchedulerServiceTest {
         service.createSchedule(
                 newRequest("s1", "cascade-grp", "rate(1 hour)",
                         new FlexibleTimeWindow("OFF", null),
-                        new Target("arn:t", "arn:r", null, null)),
+                        new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null)),
                 REGION);
         service.createSchedule(
                 newRequest("s2", "cascade-grp", "rate(1 hour)",
                         new FlexibleTimeWindow("OFF", null),
-                        new Target("arn:t", "arn:r", null, null)),
+                        new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null)),
                 REGION);
         service.deleteScheduleGroup("cascade-grp", REGION);
         assertThrows(AwsException.class, () ->
@@ -228,7 +228,7 @@ class SchedulerServiceTest {
                 service.createSchedule(
                         newRequest("s", null, null,
                                 new FlexibleTimeWindow("OFF", null),
-                                new Target("arn:t", "arn:r", null, null)),
+                                new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null)),
                         REGION));
         assertEquals("ValidationException", e.getErrorCode());
     }
@@ -238,7 +238,7 @@ class SchedulerServiceTest {
         AwsException e = assertThrows(AwsException.class, () ->
                 service.createSchedule(
                         newRequest("s", null, "rate(1 hour)", null,
-                                new Target("arn:t", "arn:r", null, null)),
+                                new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null)),
                         REGION));
         assertEquals("ValidationException", e.getErrorCode());
     }
@@ -259,7 +259,7 @@ class SchedulerServiceTest {
                 service.createSchedule(
                         newRequest("s", null, "rate(1 hour)",
                                 new FlexibleTimeWindow("OFF", null),
-                                new Target(null, "arn:r", null, null)),
+                                new Target(null, "arn:aws:iam::123456789012:role/scheduler-role", null, null)),
                         REGION));
         assertEquals("ValidationException", e.getErrorCode());
     }
@@ -281,7 +281,7 @@ class SchedulerServiceTest {
                 service.createSchedule(
                         newRequest("s", null, "rate(1 hour)",
                                 new FlexibleTimeWindow(null, null),
-                                new Target("arn:t", "arn:r", null, null)),
+                                new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null)),
                         REGION));
         assertEquals("ValidationException", e.getErrorCode());
     }
@@ -292,7 +292,7 @@ class SchedulerServiceTest {
                 service.createSchedule(
                         newRequest("s", null, "rate(1 hour)",
                                 new FlexibleTimeWindow("INVALID", null),
-                                new Target("arn:t", "arn:r", null, null)),
+                                new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null)),
                         REGION));
         assertEquals("ValidationException", e.getErrorCode());
     }
@@ -303,7 +303,7 @@ class SchedulerServiceTest {
                 service.createSchedule(
                         newRequest("s", null, "rate(1 hour)",
                                 new FlexibleTimeWindow("FLEXIBLE", null),
-                                new Target("arn:t", "arn:r", null, null)),
+                                new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null)),
                         REGION));
         assertEquals("ValidationException", e.getErrorCode());
     }
@@ -314,14 +314,14 @@ class SchedulerServiceTest {
                 service.createSchedule(
                         newRequest("s", null, "rate(1 hour)",
                                 new FlexibleTimeWindow("OFF", 10),
-                                new Target("arn:t", "arn:r", null, null)),
+                                new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null)),
                         REGION));
         assertEquals("ValidationException", e.getErrorCode());
     }
 
     @Test
     void createScheduleDeadLetterConfigMissingArnThrows() {
-        Target target = new Target("arn:t", "arn:r", null, null);
+        Target target = new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null);
         target.setDeadLetterConfig(new DeadLetterConfig(null));
         AwsException e = assertThrows(AwsException.class, () ->
                 service.createSchedule(
@@ -434,13 +434,13 @@ class SchedulerServiceTest {
         service.createSchedule(
                 newRequest("val-upd", null, "rate(1 hour)",
                         new FlexibleTimeWindow("OFF", null),
-                        new Target("arn:t", "arn:r", null, null)),
+                        new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null)),
                 REGION);
         AwsException e = assertThrows(AwsException.class, () ->
                 service.updateSchedule(
                         newRequest("val-upd", null, null,
                                 new FlexibleTimeWindow("OFF", null),
-                                new Target("arn:t", "arn:r", null, null)),
+                                new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null)),
                         REGION));
         assertEquals("ValidationException", e.getErrorCode());
     }
@@ -450,13 +450,13 @@ class SchedulerServiceTest {
         service.createSchedule(
                 newRequest("dup", null, "rate(1 hour)",
                         new FlexibleTimeWindow("OFF", null),
-                        new Target("arn:t", "arn:r", null, null)),
+                        new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null)),
                 REGION);
         AwsException e = assertThrows(AwsException.class, () ->
                 service.createSchedule(
                         newRequest("dup", null, "rate(1 hour)",
                                 new FlexibleTimeWindow("OFF", null),
-                                new Target("arn:t", "arn:r", null, null)),
+                                new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null)),
                         REGION));
         assertEquals("ConflictException", e.getErrorCode());
     }
@@ -467,7 +467,7 @@ class SchedulerServiceTest {
                 service.createSchedule(
                         newRequest("s", "no-such-group", "rate(1 hour)",
                                 new FlexibleTimeWindow("OFF", null),
-                                new Target("arn:t", "arn:r", null, null)),
+                                new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null)),
                         REGION));
         assertEquals("ResourceNotFoundException", e.getErrorCode());
     }
@@ -477,7 +477,7 @@ class SchedulerServiceTest {
         service.createSchedule(
                 newRequest("find-me", null, "rate(1 hour)",
                         new FlexibleTimeWindow("OFF", null),
-                        new Target("arn:t", "arn:r", null, null)),
+                        new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null)),
                 REGION);
         Schedule s = service.getSchedule("find-me", null, REGION);
         assertEquals("find-me", s.getName());
@@ -494,13 +494,13 @@ class SchedulerServiceTest {
     void updateSchedule() {
         ScheduleRequest createReq = newRequest("upd", null, "rate(1 hour)",
                 new FlexibleTimeWindow("OFF", null),
-                new Target("arn:t", "arn:r", null, null));
+                new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null));
         createReq.setDescription("original desc");
         service.createSchedule(createReq, REGION);
 
         ScheduleRequest updateReq = newRequest("upd", null, "rate(5 minutes)",
                 new FlexibleTimeWindow("FLEXIBLE", 10),
-                new Target("arn:t2", "arn:r2", "{}", null));
+                new Target("arn:t2", "arn:aws:iam::123456789012:role/scheduler-role-2", "{}", null));
         updateReq.setScheduleExpressionTimezone("UTC");
         updateReq.setDescription("updated desc");
         updateReq.setState("DISABLED");
@@ -514,7 +514,7 @@ class SchedulerServiceTest {
 
     @Test
     void createAndUpdatePreserveRecurringExpressionAndTimezone() {
-        Target target = new Target("arn:t", "arn:r", null, null);
+        Target target = new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null);
         FlexibleTimeWindow window = new FlexibleTimeWindow("OFF", null);
         Schedule created = service.createSchedule(
                 newRequest("recurring", null, "rate(1 day)", window, target), REGION);
@@ -539,7 +539,7 @@ class SchedulerServiceTest {
                 service.updateSchedule(
                         newRequest("missing", null, "rate(1 hour)",
                                 new FlexibleTimeWindow("OFF", null),
-                                new Target("arn:t", "arn:r", null, null)),
+                                new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null)),
                         REGION));
         assertEquals("ResourceNotFoundException", e.getErrorCode());
     }
@@ -549,7 +549,7 @@ class SchedulerServiceTest {
         service.createSchedule(
                 newRequest("to-del", null, "rate(1 hour)",
                         new FlexibleTimeWindow("OFF", null),
-                        new Target("arn:t", "arn:r", null, null)),
+                        new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null)),
                 REGION);
         service.deleteSchedule("to-del", null, REGION);
         assertThrows(AwsException.class, () ->
@@ -568,12 +568,12 @@ class SchedulerServiceTest {
         service.createSchedule(
                 newRequest("s1", null, "rate(1 hour)",
                         new FlexibleTimeWindow("OFF", null),
-                        new Target("arn:t", "arn:r", null, null)),
+                        new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null)),
                 REGION);
         service.createSchedule(
                 newRequest("s2", null, "rate(2 hours)",
                         new FlexibleTimeWindow("OFF", null),
-                        new Target("arn:t", "arn:r", null, null)),
+                        new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null)),
                 REGION);
         List<Schedule> result = service.listSchedules(null, null, null, REGION);
         assertEquals(2, result.size());
@@ -585,12 +585,12 @@ class SchedulerServiceTest {
         service.createSchedule(
                 newRequest("s-default", null, "rate(1 hour)",
                         new FlexibleTimeWindow("OFF", null),
-                        new Target("arn:t", "arn:r", null, null)),
+                        new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null)),
                 REGION);
         service.createSchedule(
                 newRequest("s-group-a", "group-a", "rate(1 hour)",
                         new FlexibleTimeWindow("OFF", null),
-                        new Target("arn:t", "arn:r", null, null)),
+                        new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null)),
                 REGION);
         List<Schedule> result = service.listSchedules(null, null, null, REGION);
         assertEquals(2, result.size());
@@ -604,12 +604,12 @@ class SchedulerServiceTest {
         service.createSchedule(
                 newRequest("s-in-default", null, "rate(1 hour)",
                         new FlexibleTimeWindow("OFF", null),
-                        new Target("arn:t", "arn:r", null, null)),
+                        new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null)),
                 REGION);
         service.createSchedule(
                 newRequest("s-in-group-b", "group-b", "rate(1 hour)",
                         new FlexibleTimeWindow("OFF", null),
-                        new Target("arn:t", "arn:r", null, null)),
+                        new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null)),
                 REGION);
         List<Schedule> result = service.listSchedules("group-b", null, null, REGION);
         assertEquals(1, result.size());
@@ -621,17 +621,17 @@ class SchedulerServiceTest {
         service.createSchedule(
                 newRequest("alpha-1", null, "rate(1 hour)",
                         new FlexibleTimeWindow("OFF", null),
-                        new Target("arn:t", "arn:r", null, null)),
+                        new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null)),
                 REGION);
         service.createSchedule(
                 newRequest("alpha-2", null, "rate(1 hour)",
                         new FlexibleTimeWindow("OFF", null),
-                        new Target("arn:t", "arn:r", null, null)),
+                        new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null)),
                 REGION);
         service.createSchedule(
                 newRequest("beta-1", null, "rate(1 hour)",
                         new FlexibleTimeWindow("OFF", null),
-                        new Target("arn:t", "arn:r", null, null)),
+                        new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null)),
                 REGION);
         List<Schedule> result = service.listSchedules(null, "alpha", null, REGION);
         assertEquals(2, result.size());
@@ -642,13 +642,13 @@ class SchedulerServiceTest {
     void listSchedulesWithStateFilter() {
         ScheduleRequest enabledReq = newRequest("enabled-1", null, "rate(1 hour)",
                 new FlexibleTimeWindow("OFF", null),
-                new Target("arn:t", "arn:r", null, null));
+                new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null));
         enabledReq.setState("ENABLED");
         service.createSchedule(enabledReq, REGION);
 
         ScheduleRequest disabledReq = newRequest("disabled-1", null, "rate(1 hour)",
                 new FlexibleTimeWindow("OFF", null),
-                new Target("arn:t", "arn:r", null, null));
+                new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null));
         disabledReq.setState("DISABLED");
         service.createSchedule(disabledReq, REGION);
 
@@ -672,14 +672,14 @@ class SchedulerServiceTest {
 
     @Test
     void updateScheduleOverwritesDeadLetterConfig() {
-        Target target = new Target("arn:t", "arn:r", null, null);
+        Target target = new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null);
         target.setDeadLetterConfig(new DeadLetterConfig("arn:aws:sqs:us-east-1:000000000000:dlq"));
         service.createSchedule(
                 newRequest("dlc-upd", null, "rate(1 hour)",
                         new FlexibleTimeWindow("OFF", null), target),
                 REGION);
 
-        Target updatedTarget = new Target("arn:t2", "arn:r2", null, null);
+        Target updatedTarget = new Target("arn:t2", "arn:aws:iam::123456789012:role/scheduler-role-2", null, null);
         updatedTarget.setDeadLetterConfig(new DeadLetterConfig("arn:aws:sqs:us-east-1:000000000000:dlq-updated"));
         ScheduleRequest updateReq = newRequest("dlc-upd", null, "rate(5 minutes)",
                 new FlexibleTimeWindow("OFF", null), updatedTarget);
@@ -690,7 +690,7 @@ class SchedulerServiceTest {
 
     @Test
     void createScheduleWithRetryPolicy() {
-        Target target = new Target("arn:t", "arn:r", null, null);
+        Target target = new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null);
         target.setRetryPolicy(new RetryPolicy(3600, 5));
         ScheduleRequest req = newRequest("retry-schedule", null, "rate(1 hour)",
                 new FlexibleTimeWindow("OFF", null), target);
@@ -706,7 +706,7 @@ class SchedulerServiceTest {
         Instant end = Instant.parse("2026-12-31T23:59:59Z");
         ScheduleRequest req = newRequest("dated-schedule", null, "rate(1 hour)",
                 new FlexibleTimeWindow("OFF", null),
-                new Target("arn:t", "arn:r", null, null));
+                new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null));
         req.setStartDate(start);
         req.setEndDate(end);
         Schedule s = service.createSchedule(req, REGION);
@@ -723,9 +723,24 @@ class SchedulerServiceTest {
         service.createSchedule(
                 newRequest("regional", null, "rate(1 hour)",
                         new FlexibleTimeWindow("OFF", null),
-                        new Target("arn:t", "arn:r", null, null)),
+                        new Target("arn:t", "arn:aws:iam::123456789012:role/scheduler-role", null, null)),
                 "us-east-1");
         assertThrows(AwsException.class, () ->
                 service.getSchedule("regional", null, "us-west-2"));
+    }
+
+    @Test
+    void createScheduleInvalidRoleArnThrows() {
+        // Catches: target.roleArn accepts non-IAM role ARNs without ValidationException
+        String invalidRoleArn = "arn:aws:iam::123456789012:user/not-a-role";
+        String expectedMessage = "1 validation error detected: Value '" + invalidRoleArn + "' at 'target.roleArn' failed to satisfy constraint: Member must satisfy regular expression pattern: ^arn:aws(-[a-z]+)?:iam::\\d{12}:role\\/[\\w+=,.@\\/-]+$";
+        AwsException e = assertThrows(AwsException.class, () ->
+                service.createSchedule(
+                        newRequest("s", null, "rate(1 hour)",
+                                new FlexibleTimeWindow("OFF", null),
+                                new Target("arn:t", invalidRoleArn, null, null)),
+                        REGION));
+        assertEquals("ValidationException", e.getErrorCode());
+        assertEquals(expectedMessage, e.getMessage());
     }
 }

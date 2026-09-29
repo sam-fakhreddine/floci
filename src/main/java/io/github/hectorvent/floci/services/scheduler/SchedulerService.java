@@ -31,6 +31,10 @@ public class SchedulerService {
 
     // AWS EventBridge Scheduler name constraints: [0-9a-zA-Z-_.]+, 1-64 chars.
     private static final Pattern NAME_PATTERN = Pattern.compile("[0-9a-zA-Z\\-_.]{1,64}");
+    // Target.RoleArn in the model: an IAM role ARN in any partition, at most 1600 characters.
+    private static final Pattern ROLE_ARN_PATTERN = Pattern.compile(
+            "^arn:" + AwsArnUtils.PARTITION_REGEX + ":iam::\\d{12}:role/[\\w+=,.@/-]+$");
+    private static final int MAX_ROLE_ARN_LENGTH = 1600;
     private static final String DEFAULT_GROUP = "default";
     // FAIL_ON_TRAILING_TOKENS matters here: without it an Input of "{} garbage" parses as the
     // leading object and the rest is silently dropped, so a value AWS rejects would be stored.
@@ -379,6 +383,15 @@ public class SchedulerService {
         if (req.getTarget().getRoleArn() == null || req.getTarget().getRoleArn().isBlank()) {
             throw new AwsException("ValidationException",
                     "1 validation error detected: Value null at 'target.roleArn' failed to satisfy constraint: Member must not be null", 400);
+        }
+        String roleArn = req.getTarget().getRoleArn();
+        if (roleArn.length() > MAX_ROLE_ARN_LENGTH) {
+            throw new AwsException("ValidationException",
+                    "1 validation error detected: Value '" + roleArn + "' at 'target.roleArn' failed to satisfy constraint: Member must have length less than or equal to 1600", 400);
+        }
+        if (!ROLE_ARN_PATTERN.matcher(roleArn).matches()) {
+            throw new AwsException("ValidationException",
+                    "1 validation error detected: Value '" + roleArn + "' at 'target.roleArn' failed to satisfy constraint: Member must satisfy regular expression pattern: ^arn:aws(-[a-z]+)?:iam::\\d{12}:role\\/[\\w+=,.@\\/-]+$", 400); // partition-literal: AWS quotes the model pattern verbatim in its ValidationException
         }
         if (req.getTarget().getDeadLetterConfig() != null
                 && (req.getTarget().getDeadLetterConfig().getArn() == null
