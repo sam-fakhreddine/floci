@@ -556,4 +556,11 @@ class IamConditionContextResolverTest {
         }
         return Decision.ALLOW;
     }
+
+    @Test
+    void withGlobalContext_returnsPrincipalIsAWSServiceKeyAndNonEmptyMap() {
+        // Catches: withGlobalContext returns null and omits aws:PrincipalIsAWSService key for empty context
+        assertEquals(Map.of("aws:PrincipalIsAWSService", List.of("false")),
+                IamConditionContextResolver.withGlobalContext(null, null, null, null, null));
+    }
 }

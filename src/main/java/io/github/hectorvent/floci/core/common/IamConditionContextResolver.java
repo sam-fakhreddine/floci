@@ -101,6 +101,7 @@ public class IamConditionContextResolver {
         putIfPresent(conditions, "aws:ResourceAccount", resourceAccount);
         putIfPresent(conditions, "aws:PrincipalAccount", accountId);
         putIfPresent(conditions, "aws:RequestedRegion", region);
+        conditions.putIfAbsent("aws:PrincipalIsAWSService", List.of("false"));
         return conditions.isEmpty() ? null : conditions;
     }
 
