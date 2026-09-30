@@ -19,6 +19,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.time.DateTimeException;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
@@ -348,6 +349,7 @@ public class SchedulerService {
             throw new AwsException("ValidationException",
                     "1 validation error detected: Value null at 'scheduleExpression' failed to satisfy constraint: Member must not be null", 400);
         }
+        validateScheduleExpression(req.getScheduleExpression(), req.getScheduleExpressionTimezone());
         if (req.getFlexibleTimeWindow() == null) {
             throw new AwsException("ValidationException",
                     "1 validation error detected: Value null at 'flexibleTimeWindow' failed to satisfy constraint: Member must not be null", 400);
@@ -447,5 +449,29 @@ public class SchedulerService {
 
     private static String scheduleKey(String region, String groupName, String name) {
         return "schedule:" + region + ":" + groupName + ":" + name;
+    }
+
+    private static void validateScheduleExpression(String expression, String timezone) {
+        SchedulerExpressionParser.Kind kind;
+        try {
+            kind = SchedulerExpressionParser.classify(expression);
+        } catch (IllegalArgumentException e) {
+            throw new AwsException("ValidationException", "Invalid Schedule Expression " + expression + ".", 400);
+        }
+        try {
+            switch (kind) {
+                case AT:
+                    SchedulerExpressionParser.parseAt(expression, timezone);
+                    break;
+                case RATE:
+                    SchedulerExpressionParser.parseRateMillis(expression);
+                    break;
+                case CRON:
+                    SchedulerExpressionParser.nextCronFire(expression, Instant.EPOCH, timezone);
+                    break;
+            }
+        } catch (IllegalArgumentException | DateTimeException e) {
+            throw new AwsException("ValidationException", "Invalid Schedule Expression " + expression + ".", 400);
+        }
     }
 }

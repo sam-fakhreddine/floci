@@ -743,4 +743,43 @@ class SchedulerServiceTest {
         assertEquals("ValidationException", e.getErrorCode());
         assertEquals(expectedMessage, e.getMessage());
     }
+
+    @Test
+    void createSchedule_cronInvalidThrowsValidationException() {
+        // Catches: scheduleExpression "cron(invalid)" bypasses validation and is stored instead of throwing ValidationException
+        AwsException e = assertThrows(AwsException.class, () ->
+                service.createSchedule(
+                        newRequest("cron-invalid-schedule", null, "cron(invalid)",
+                                new FlexibleTimeWindow("OFF", null),
+                                new Target("arn:aws:events:us-east-1:123456789012:rule/example", "arn:aws:iam::123456789012:role/scheduler-role", null, null)),
+                        REGION));
+        assertEquals("ValidationException", e.getErrorCode());
+        assertEquals(400, e.getHttpStatus());
+        assertEquals("Invalid Schedule Expression cron(invalid).", e.getMessage());
+    }
+
+    @Test
+    void createSchedule_rateZeroThrowsValidationException() {
+        // Catches: scheduleExpression "rate(0 minutes)" bypasses validation and is stored instead of throwing ValidationException
+        AwsException e = assertThrows(AwsException.class, () ->
+                service.createSchedule(
+                        newRequest("rate-zero-schedule", null, "rate(0 minutes)",
+                                new FlexibleTimeWindow("OFF", null),
+                                new Target("arn:aws:events:us-east-1:123456789012:rule/example", "arn:aws:iam::123456789012:role/scheduler-role", null, null)),
+                        REGION));
+        assertEquals("ValidationException", e.getErrorCode());
+        assertEquals(400, e.getHttpStatus());
+        assertEquals("Invalid Schedule Expression rate(0 minutes).", e.getMessage());
+    }
+
+    @Test
+    void createSchedule_validCronSucceeds() {
+        // Catches: valid six-field cron expression "cron(0 12 ? * MON *)" is incorrectly rejected or fails to persist
+        Schedule schedule = service.createSchedule(
+                newRequest("valid-cron-schedule", null, "cron(0 12 ? * MON *)",
+                        new FlexibleTimeWindow("OFF", null),
+                        new Target("arn:aws:events:us-east-1:123456789012:rule/example", "arn:aws:iam::123456789012:role/scheduler-role", null, null)),
+                REGION);
+        assertEquals("cron(0 12 ? * MON *)", schedule.getScheduleExpression());
+    }
 }
